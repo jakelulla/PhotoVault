@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>PhotoSearch</string>
+	<string>PhotoVault</string>
 	<!-- Background indexing: lets iOS wake the app (typically when idle or
 	     charging) to continue ML indexing via BGProcessingTask. -->
 	<key>UIBackgroundModes</key>
