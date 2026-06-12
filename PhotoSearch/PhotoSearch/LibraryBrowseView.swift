@@ -16,7 +16,6 @@ private struct SyncPlan {
 
 struct LibraryBrowseView: View {
     @EnvironmentObject private var indexer: Indexer
-    @EnvironmentObject private var folderStore: FolderStore
     @EnvironmentObject private var library: PhotoLibraryModel
     @ObservedObject private var store = PhotoStore.shared
     @State private var mode: LibraryMode = .all
@@ -89,7 +88,6 @@ struct LibraryBrowseView: View {
                 Text(resultMessage ?? "")
             }
         }
-        .task { await folderStore.load() }
     }
 
     // MARK: - Add from camera roll
@@ -245,11 +243,16 @@ private struct AllIndexedGrid: View {
         Group {
             if loader.results.isEmpty && loader.isLoading {
                 ProgressView()
+            } else if loader.results.isEmpty, let error = loader.errorText {
+                ContentUnavailableView(
+                    "Couldn't Load Photos", systemImage: "exclamationmark.triangle",
+                    description: Text(error))
             } else {
                 PhotoResultsGrid(
                     results: loader.results,
                     onReachEnd: { Task { await loader.loadMore() } },
-                    onDelete: { loader.remove(photoID: $0) }
+                    onDelete: { loader.remove(photoID: $0) },
+                    onLoadAll: { await loader.loadAll(); return loader.results }
                 )
             }
         }
@@ -323,10 +326,18 @@ private struct AssetPageViewer: View {
             TabView(selection: $selection) {
                 ForEach(Array(assets.enumerated()), id: \.element.localIdentifier) { idx, asset in
                     Group {
-                        if asset.mediaType == .video {
-                            VideoPage(assetID: asset.localIdentifier)
+                        // Paged TabView builds every page eagerly — keep all
+                        // pages in the ForEach (stable tags for swiping) but
+                        // only materialize content near the current selection
+                        // so opening one photo doesn't load the whole library.
+                        if abs(idx - selection) <= 1 {
+                            if asset.mediaType == .video {
+                                VideoPage(assetID: asset.localIdentifier)
+                            } else {
+                                PHFullImageView(assetID: asset.localIdentifier, isZoomed: $isZoomed)
+                            }
                         } else {
-                            PHFullImageView(assetID: asset.localIdentifier, isZoomed: $isZoomed)
+                            Color.black
                         }
                     }
                     .tag(idx)
@@ -528,13 +539,18 @@ private struct DayPhotosView: View {
         Group {
             if loader.results.isEmpty && loader.isLoading {
                 ProgressView()
+            } else if loader.results.isEmpty, let error = loader.errorText {
+                ContentUnavailableView(
+                    "Couldn't Load Photos", systemImage: "exclamationmark.triangle",
+                    description: Text(error))
             } else if loader.results.isEmpty {
                 ContentUnavailableView("No Photos", systemImage: "photo")
             } else {
                 PhotoResultsGrid(
                     results: loader.results,
                     onReachEnd: { Task { await loader.loadMore() } },
-                    onDelete: { loader.remove(photoID: $0) }
+                    onDelete: { loader.remove(photoID: $0) },
+                    onLoadAll: { await loader.loadAll(); return loader.results }
                 )
             }
         }
@@ -561,13 +577,18 @@ struct PeriodPhotosView: View {
         Group {
             if loader.results.isEmpty && loader.isLoading {
                 ProgressView()
+            } else if loader.results.isEmpty, let error = loader.errorText {
+                ContentUnavailableView(
+                    "Couldn't Load Photos", systemImage: "exclamationmark.triangle",
+                    description: Text(error))
             } else if loader.results.isEmpty {
                 ContentUnavailableView("No Photos", systemImage: "photo")
             } else {
                 PhotoResultsGrid(
                     results: loader.results,
                     onReachEnd: { Task { await loader.loadMore() } },
-                    onDelete: { loader.remove(photoID: $0) }
+                    onDelete: { loader.remove(photoID: $0) },
+                    onLoadAll: { await loader.loadAll(); return loader.results }
                 )
             }
         }

@@ -19,10 +19,21 @@ struct PhotoDetailView: View {
     }
 
     var body: some View {
+        // Paged TabView builds every page eagerly — one tap would materialize
+        // the whole result set. Keep every page in the ForEach (stable tags so
+        // swiping works) but render real content only for selection±1; the
+        // rest are black placeholders that fill in as the selection moves.
+        let currentIndex = results.firstIndex { $0.photoID == selection } ?? 0
         TabView(selection: $selection) {
-            ForEach(results) { result in
-                PhotoPage(photo: result, isZoomed: $isZoomed)
-                    .tag(result.photoID)
+            ForEach(Array(results.enumerated()), id: \.element.id) { idx, result in
+                Group {
+                    if abs(idx - currentIndex) <= 1 {
+                        PhotoPage(photo: result, isZoomed: $isZoomed)
+                    } else {
+                        Color.black
+                    }
+                }
+                .tag(result.photoID)
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))

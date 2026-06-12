@@ -5,6 +5,9 @@ import UIKit
 
 struct PhotoMLResult {
     let clipEmbedding: [Float]     // 512-dim L2-normalized CLIP image embedding
+    /// Videos only: each sampled frame's L2-normalized CLIP embedding
+    /// (`clipEmbedding` is then their L2-renormalized mean). nil for photos.
+    var clipFrameEmbeddings: [[Float]]? = nil
     let faceEmbeddings: [[Float]]  // N × 512-dim L2-normalized ArcFace embeddings
     let faceRects: [CGRect]        // N bounding boxes, normalized 0…1 in original image space
 }

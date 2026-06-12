@@ -31,30 +31,33 @@ private actor MLWorker {
         return rendered.cgImage
     }
 
-    /// Video path: CLIP-embed every sampled frame and average (L2-renormed),
-    /// collect faces from all frames. A video then matches a caption search
-    /// if any part of it does, and everyone in it lands in People.
+    /// Video path: CLIP-embed every sampled frame, keeping each frame's
+    /// embedding (per-frame search) plus their L2-renormed mean as the
+    /// primary embedding, and collect faces from all frames. A video then
+    /// matches a caption search if any part of it does, and everyone in it
+    /// lands in People. One bad frame (decode/inference failure) doesn't
+    /// sink the video — the result succeeds if any frame embedded.
     func processFrames(_ frameDatas: [Data]) throws -> PhotoMLResult {
-        var clip: [Float] = []
+        var frameClips: [[Float]] = []
         var faceEmbs: [[Float]] = []
         var rects: [CGRect] = []
         for data in frameDatas {
             guard let ui = UIImage(data: data),
-                  let cg = Self.orientedUpCGImage(ui) else { continue }
-            let r = try OnDeviceMLEngine.shared.process(cgImage: cg)
-            if clip.isEmpty {
-                clip = r.clipEmbedding
-            } else {
-                for i in 0..<min(clip.count, r.clipEmbedding.count) {
-                    clip[i] += r.clipEmbedding[i]
-                }
-            }
+                  let cg = Self.orientedUpCGImage(ui),
+                  let r = try? OnDeviceMLEngine.shared.process(cgImage: cg) else { continue }
+            frameClips.append(r.clipEmbedding)
             faceEmbs.append(contentsOf: r.faceEmbeddings)
             rects.append(contentsOf: r.faceRects)
         }
-        guard !clip.isEmpty else { throw MLWorkerError.invalidImage }
+        guard var clip = frameClips.first else { throw MLWorkerError.invalidImage }
+        for emb in frameClips.dropFirst() {
+            for i in 0..<min(clip.count, emb.count) {
+                clip[i] += emb[i]
+            }
+        }
         let norm = sqrt(clip.reduce(0) { $0 + $1 * $1 }) + 1e-10
         return PhotoMLResult(clipEmbedding: clip.map { $0 / norm },
+                             clipFrameEmbeddings: frameClips,
                              faceEmbeddings: faceEmbs,
                              faceRects: rects)
     }
@@ -81,6 +84,47 @@ final class Indexer: ObservableObject {
     /// engine's loaded models.
     private let workers  = [MLWorker(), MLWorker(), MLWorker()]
 
+    // MARK: - Failure ledger
+
+    /// Assets that keep failing (corrupt originals, undecodable frames,
+    /// permanently-stuck iCloud downloads) would otherwise be retried on
+    /// every launch forever, and `processed` could never reach `total`.
+    /// Track attempts per asset; after `maxFailureAttempts` the asset is
+    /// skipped until a manual re-index (resetTracking) clears the ledger.
+    private static let maxFailureAttempts = 3
+    private static let failuresURL: URL = {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let d = docs.appendingPathComponent("photosearch", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d.appendingPathComponent("index_failures.json")
+    }()
+    /// assetID → failed attempt count, loaded once and persisted at the end
+    /// of each index pass.
+    private lazy var failureCounts: [String: Int] = {
+        guard let data = try? Data(contentsOf: Self.failuresURL),
+              let counts = try? JSONDecoder().decode([String: Int].self, from: data)
+        else { return [:] }
+        return counts
+    }()
+    private var failuresDirty = false
+
+    private func recordFailure(_ assetID: String) {
+        failureCounts[assetID, default: 0] += 1
+        failuresDirty = true
+    }
+
+    private func clearFailure(_ assetID: String) {
+        if failureCounts.removeValue(forKey: assetID) != nil { failuresDirty = true }
+    }
+
+    private func saveFailuresIfNeeded() {
+        guard failuresDirty else { return }
+        failuresDirty = false
+        if let data = try? JSONEncoder().encode(failureCounts) {
+            try? data.write(to: Self.failuresURL, options: .atomic)
+        }
+    }
+
     /// Indexes every not-yet-indexed asset. Safe to call repeatedly (launch,
     /// library-change notifications): overlapping calls coalesce into one
     /// extra pass after the current run, so assets inserted mid-run still get
@@ -105,7 +149,11 @@ final class Indexer: ObservableObject {
         }
         let mlAvailable = ml.isAvailable
 
-        let unindexed = library.assets.filter { !store.contains(assetID: $0.localIdentifier) }
+        // Capped-failure assets count as "done" so progress can complete.
+        let unindexed = library.assets.filter {
+            !store.contains(assetID: $0.localIdentifier)
+                && failureCounts[$0.localIdentifier, default: 0] < Self.maxFailureAttempts
+        }
         total     = library.assets.count
         processed = library.assets.count - unindexed.count
 
@@ -148,16 +196,22 @@ final class Indexer: ObservableObject {
                 for await (asset, result) in group {
                     if let result {
                         store.index(
-                            assetID:        asset.localIdentifier,
-                            createdAt:      asset.creationDate,
-                            lat:            asset.location?.coordinate.latitude,
-                            lon:            asset.location?.coordinate.longitude,
-                            clipEmbedding:  result.clipEmbedding,
-                            faceEmbeddings: result.faceEmbeddings,
-                            faceRects:      result.faceRects,
-                            isVideo:        asset.mediaType == .video,
-                            duration:       asset.duration
+                            assetID:             asset.localIdentifier,
+                            createdAt:           asset.creationDate,
+                            lat:                 asset.location?.coordinate.latitude,
+                            lon:                 asset.location?.coordinate.longitude,
+                            clipEmbedding:       result.clipEmbedding,
+                            faceEmbeddings:      result.faceEmbeddings,
+                            faceRects:           result.faceRects,
+                            isVideo:             asset.mediaType == .video,
+                            duration:            asset.duration,
+                            clipFrameEmbeddings: result.clipFrameEmbeddings
                         )
+                        clearFailure(asset.localIdentifier)
+                    } else if !Task.isCancelled {
+                        // Cancellation makes in-flight fetches return nil —
+                        // don't charge the asset a strike for that.
+                        recordFailure(asset.localIdentifier)
                     }
                     processed += 1
                     // Cooperative cancellation: a BGProcessingTask's
@@ -185,7 +239,8 @@ final class Indexer: ObservableObject {
                 processed += 1
             }
         }
-        store.persist()
+        await store.persistAndWait()  // include the off-main embeddings flush
+        saveFailuresIfNeeded()
 
         // Global re-cluster after a substantial batch (mirrors the backend:
         // small increments use the live greedy assignment; big batches get
@@ -198,6 +253,11 @@ final class Indexer: ObservableObject {
 
     func resetTracking() {
         PhotoStore.shared.resetIndex()
+        // A manual re-index is the user asking for another shot at
+        // everything — including assets the failure cap had given up on.
+        failureCounts = [:]
+        failuresDirty = false
+        try? FileManager.default.removeItem(at: Self.failuresURL)
         processed = 0; total = 0
     }
 }

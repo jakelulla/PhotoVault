@@ -59,7 +59,9 @@ enum BackgroundIndexer {
             }
             let indexer = Indexer()
             await indexer.indexNewPhotos(from: library)
-            PhotoStore.shared.persist()
+            // Await the off-main embeddings flush too — the process may be
+            // suspended right after setTaskCompleted.
+            await PhotoStore.shared.persistAndWait()
             // Ask for another window only while there's still work: assets we
             // haven't indexed, or a run cut short by expiration. Rescheduling
             // unconditionally would have iOS wake the app forever once the

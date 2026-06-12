@@ -87,6 +87,14 @@ final class PhotoStore: ObservableObject {
     // CLIP embeddings stored separately (not in LocalPhoto) for efficiency
     private(set) var clipEmbeddings: [String: [Float]] = [:]
 
+    // Per-frame CLIP embeddings for videos (assetID → ≤8 sampled-frame
+    // vectors, ~2KB each). clipEmbeddings keeps the L2-renormalized mean for
+    // back-compat (photos and pre-existing videos have only that); when
+    // frames exist, search/relevance takes the max over them — a video
+    // matches if ANY part matches, instead of being diluted by the mean —
+    // and video-video duplicate checks compare best frame pairs.
+    private(set) var videoFrameEmbeddings: [String: [[Float]]] = [:]
+
     private var nextPhotoID   = 0
     private var nextClusterID = 0
     private var photoIndex: [String: Int] = [:]  // assetID → index in photos
@@ -106,6 +114,7 @@ final class PhotoStore: ObservableObject {
     private static var foldersURL:    URL { storeDir.appendingPathComponent("folders.json") }
     private static var embeddingsURL: URL { storeDir.appendingPathComponent("embeddings.json") }      // legacy JSON
     private static var clipBinURL:    URL { storeDir.appendingPathComponent("clip_embeddings.bin") }
+    private static var videoFramesURL: URL { storeDir.appendingPathComponent("videoframes.bin") }
     private static var facesLogURL:   URL { storeDir.appendingPathComponent("face_embeddings.bin") }
 
     /// Per-photo face embeddings, disk-only (read in one pass when
@@ -147,6 +156,12 @@ final class PhotoStore: ObservableObject {
             try? BinaryEmbeddingCodec.encode(dict).write(to: Self.clipBinURL, options: .atomic)
             try? FileManager.default.removeItem(at: Self.embeddingsURL)
         }
+        // Per-frame video embeddings (new store — no legacy format to
+        // migrate; videos indexed before it exists simply have no entry).
+        if let data = try? Data(contentsOf: Self.videoFramesURL),
+           let dict = BinaryFrameEmbeddingCodec.decode(data) {
+            videoFrameEmbeddings = dict
+        }
         if let data = try? Data(contentsOf: Self.geocodeCacheURL),
            let dict = try? JSONDecoder().decode([String: String].self, from: data) {
             geocodeCache = dict
@@ -165,18 +180,178 @@ final class PhotoStore: ObservableObject {
             }
         }
         startGeocodeDrain()
+        // Backfill isVideo/duration for photos whose stores predate the video
+        // fields (contains() blocks a re-index, so they'd stay nil forever).
+        // Runs after load() returns so launch isn't blocked on a PHAsset fetch.
+        let missingVideoInfo = photos.filter { $0.isVideo == nil }.map(\.assetID)
+        if !missingVideoInfo.isEmpty {
+            Task { await backfillVideoInfo(assetIDs: missingVideoInfo) }
+        }
     }
 
+    /// Resolve isVideo/duration from PHAsset metadata for photos indexed
+    /// before those fields existed. Assets missing from the fetch (deleted
+    /// from the camera roll) keep nil and are retried next launch — the
+    /// library-sync prune handles them.
+    private func backfillVideoInfo(assetIDs: [String]) async {
+        guard !assetIDs.isEmpty else { return }
+        let fetched = await Task.detached(priority: .utility) {
+            () -> [String: (isVideo: Bool, duration: Double)] in
+            var out: [String: (isVideo: Bool, duration: Double)] = [:]
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: assetIDs, options: nil)
+            result.enumerateObjects { asset, _, _ in
+                out[asset.localIdentifier] = (asset.mediaType == .video, asset.duration)
+            }
+            return out
+        }.value
+        var changed = false
+        for (assetID, info) in fetched {
+            guard let idx = photoIndex[assetID], photos[idx].isVideo == nil else { continue }
+            photos[idx].isVideo = info.isVideo
+            photos[idx].duration = info.isVideo ? info.duration : nil
+            changed = true
+        }
+        if changed { schedulePersist(.photos) }
+    }
+
+    /// Which on-disk stores have un-persisted changes. Every mutation site
+    /// marks exactly what it touched; persist() then writes only those files
+    /// instead of rewriting all of them — the embeddings binary alone is
+    /// ~100MB, and a folder rename must not pay for it.
+    struct DirtyStores: OptionSet {
+        let rawValue: Int
+        static let photos     = DirtyStores(rawValue: 1 << 0)  // photos.json
+        static let clusters   = DirtyStores(rawValue: 1 << 1)  // clusters.json
+        static let locations  = DirtyStores(rawValue: 1 << 2)  // locations.json
+        static let folders    = DirtyStores(rawValue: 1 << 3)  // folders.json
+        static let embeddings = DirtyStores(rawValue: 1 << 4)  // clip_embeddings.bin + videoframes.bin (always change together — both written at index time)
+        static let geocode    = DirtyStores(rawValue: 1 << 5)  // geocode_cache.json + geocode_pending.json
+        static let all: DirtyStores = [.photos, .clusters, .locations, .folders, .embeddings, .geocode]
+    }
+
+    private var dirty: DirtyStores = []
+
+    /// Write every dirty store to disk, then clear the flags.
+    ///
+    /// The JSON stores are written synchronously on the main actor (small and
+    /// fast). The embeddings binary is NOT: encoding ~100MB on the main actor
+    /// froze the UI, so it's snapshotted and written from a detached task —
+    /// see flushEmbeddingsAsync(). persist() therefore returns with the JSON
+    /// stores durable but the embeddings write merely *started*. Callers that
+    /// must have the embeddings on disk before the process can be suspended
+    /// (e.g. a BGProcessingTask about to call setTaskCompleted) should await
+    /// persistAndWait(); callers tearing state down synchronously (resetIndex)
+    /// use persistAll().
     func persist() {
         indexesSincePersist = 0
+        let toWrite = dirty
+        dirty = []
+        guard !toWrite.isEmpty else { return }
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        if toWrite.contains(.photos) {
+            try? enc.encode(photos).write(to: Self.photosURL, options: .atomic)
+        }
+        if toWrite.contains(.clusters) {
+            try? enc.encode(clusters).write(to: Self.clustersURL, options: .atomic)
+        }
+        if toWrite.contains(.locations) {
+            try? enc.encode(locations).write(to: Self.locationsURL, options: .atomic)
+        }
+        if toWrite.contains(.folders) {
+            try? enc.encode(folders).write(to: Self.foldersURL, options: .atomic)
+        }
+        if toWrite.contains(.geocode) {
+            try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
+            try? JSONEncoder().encode(geocodePending).write(to: Self.geocodePendingURL, options: .atomic)
+        }
+        if toWrite.contains(.embeddings) { flushEmbeddingsAsync() }
+    }
+
+    /// Synchronous full write of every store, embeddings included — the
+    /// escape hatch for callers that need completion guarantees on return
+    /// (resetIndex, or anything running right before process teardown).
+    /// Bumps the embeddings write generation so an in-flight async flush of
+    /// an older snapshot can't land on top of what's written here.
+    func persistAll() {
+        persistTask?.cancel()
+        indexesSincePersist = 0
+        dirty = []
+        embeddingFlushDirtyAgain = false
+        embeddingWriteGeneration += 1
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
         try? enc.encode(photos).write(to: Self.photosURL, options: .atomic)
         try? enc.encode(clusters).write(to: Self.clustersURL, options: .atomic)
         try? enc.encode(locations).write(to: Self.locationsURL, options: .atomic)
         try? enc.encode(folders).write(to: Self.foldersURL, options: .atomic)
         try? BinaryEmbeddingCodec.encode(clipEmbeddings).write(to: Self.clipBinURL, options: .atomic)
+        try? BinaryFrameEmbeddingCodec.encode(videoFrameEmbeddings).write(to: Self.videoFramesURL, options: .atomic)
         try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
         try? JSONEncoder().encode(geocodePending).write(to: Self.geocodePendingURL, options: .atomic)
+    }
+
+    /// persist(), then suspend until any in-flight embeddings flush — and any
+    /// re-flush queued behind it — has landed on disk. Background-indexing
+    /// callers should prefer this over bare persist() before signalling task
+    /// completion, so the big binary write can't be cut off by suspension.
+    func persistAndWait() async {
+        persist()
+        while let task = embeddingFlushTask {
+            await task.value  // finishEmbeddingFlush may chain another pass; loop
+        }
+    }
+
+    // Embeddings flush: at most one detached write at a time. If the dict is
+    // dirtied again while a write is in flight, we re-flush once it finishes
+    // rather than interleaving two ~100MB writes to the same file.
+    private var embeddingFlushTask: Task<Void, Never>?
+    private var embeddingFlushInFlight = false
+    private var embeddingFlushDirtyAgain = false
+    /// Bumped by persistAll()/resetIndex() when they touch the embeddings
+    /// file directly on the main actor; a detached flush re-checks its
+    /// generation just before writing and drops itself if stale.
+    private var embeddingWriteGeneration = 0
+
+    private func flushEmbeddingsAsync() {
+        if embeddingFlushInFlight { embeddingFlushDirtyAgain = true; return }
+        embeddingFlushInFlight = true
+        let snapshot = clipEmbeddings
+        let frameSnapshot = videoFrameEmbeddings
+        let url = Self.clipBinURL
+        let framesURL = Self.videoFramesURL
+        let gen = embeddingWriteGeneration
+        embeddingFlushTask = Task.detached(priority: .utility) {
+            let data = BinaryEmbeddingCodec.encode(snapshot)
+            let frameData = BinaryFrameEmbeddingCodec.encode(frameSnapshot)
+            if await self.embeddingGenerationIsCurrent(gen) {
+                try? data.write(to: url, options: .atomic)
+                try? frameData.write(to: framesURL, options: .atomic)
+                // The writes take seconds at scale — persistAll/resetIndex
+                // may have rewritten the files mid-write. If the generation
+                // moved, our (stale) rename landed last: re-flush current
+                // state so disk converges.
+                if await !self.embeddingGenerationIsCurrent(gen) {
+                    await self.markEmbeddingsDirtyAgain()
+                }
+            }
+            await self.finishEmbeddingFlush()
+        }
+    }
+
+    private func embeddingGenerationIsCurrent(_ gen: Int) -> Bool {
+        embeddingWriteGeneration == gen
+    }
+
+    private func markEmbeddingsDirtyAgain() {
+        embeddingFlushDirtyAgain = true
+    }
+
+    private func finishEmbeddingFlush() {
+        embeddingFlushInFlight = false
+        embeddingFlushTask = nil
+        if embeddingFlushDirtyAgain {
+            embeddingFlushDirtyAgain = false
+            flushEmbeddingsAsync()
+        }
     }
 
     private var persistTask: Task<Void, Never>?
@@ -184,7 +359,9 @@ final class PhotoStore: ObservableObject {
     /// index() (the debounce alone never fires during continuous indexing).
     private var indexesSincePersist = 0
 
-    func schedulePersist() {
+    /// Mark `stores` dirty and debounce a persist 3s out.
+    func schedulePersist(_ stores: DirtyStores) {
+        dirty.formUnion(stores)
         persistTask?.cancel()
         persistTask = Task {
             try? await Task.sleep(for: .seconds(3))
@@ -197,6 +374,10 @@ final class PhotoStore: ObservableObject {
 
     func contains(assetID: String) -> Bool { photoIndex[assetID] != nil }
 
+    /// `clipFrameEmbeddings`: per-sampled-frame CLIP vectors for videos.
+    /// `clipEmbedding` stays the L2-renormalized frame mean (photos and old
+    /// callers pass only that), so existing stores remain valid; frames are
+    /// extra signal layered on top.
     func index(
         assetID: String,
         createdAt: Date?,
@@ -205,11 +386,17 @@ final class PhotoStore: ObservableObject {
         faceEmbeddings: [[Float]],
         faceRects: [CGRect],
         isVideo: Bool = false,
-        duration: Double? = nil
+        duration: Double? = nil,
+        clipFrameEmbeddings: [[Float]]? = nil
     ) {
         guard !contains(assetID: assetID) else { return }
 
         clipEmbeddings[assetID] = clipEmbedding
+        // Stored before markDuplicateIfNeeded below, so the duplicate check
+        // sees the new video's frames.
+        if let frames = clipFrameEmbeddings, !frames.isEmpty {
+            videoFrameEmbeddings[assetID] = frames
+        }
 
         // Keep raw face embeddings on disk so the global re-cluster pass
         // (reclusterPeople) can see every face, not just cluster prototypes.
@@ -226,7 +413,7 @@ final class PhotoStore: ObservableObject {
             personClusterIDs: clusterIDs,
             dupGroupID: nil,
             isDeleted: false,
-            isVideo: isVideo ? true : nil,
+            isVideo: isVideo,
             duration: isVideo ? duration : nil
         )
         nextPhotoID += 1
@@ -246,18 +433,34 @@ final class PhotoStore: ObservableObject {
         indexesSincePersist += 1
         if indexesSincePersist >= 200 {
             persistTask?.cancel()
+            dirty.formUnion([.photos, .clusters, .embeddings])
             persist()
         } else {
-            schedulePersist()
+            schedulePersist([.photos, .clusters, .embeddings])
         }
     }
 
     // MARK: - Duplicate detection
 
     private func markDuplicateIfNeeded(_ photo: inout LocalPhoto, embedding: [Float]) {
-        for other in photos where !other.isDeleted && other.video == photo.video {
+        let newFrames = videoFrameEmbeddings[photo.assetID] ?? []
+        for other in photos where !other.isDeleted && other.video == photo.video
+            && other.assetID != photo.assetID {   // self-match guard: restore path re-checks in-place
             guard let otherEmb = clipEmbeddings[other.assetID] else { continue }
-            if dot(embedding, otherEmb) > 0.97 {
+            // Video pairs with per-frame data: best frame-pair similarity at
+            // the same 0.97 bar. Comparing frame means inflated similarity
+            // (averaging washes out the parts that differ), flagging distinct
+            // videos of the same scene; the best single-frame pair restores
+            // the still-image calibration the threshold was tuned on. Videos
+            // without frames (indexed pre-frames) keep the mean-vs-mean check.
+            let sim: Float
+            if photo.video, !newFrames.isEmpty,
+               let otherFrames = videoFrameEmbeddings[other.assetID], !otherFrames.isEmpty {
+                sim = bestPairSimilarity(newFrames, otherFrames)
+            } else {
+                sim = dot(embedding, otherEmb)
+            }
+            if sim > 0.97 {
                 let gid = other.dupGroupID ?? other.assetID
                 photo.dupGroupID = gid
                 if let idx = photoIndex[other.assetID], photos[idx].dupGroupID == nil {
@@ -266,6 +469,18 @@ final class PhotoStore: ObservableObject {
                 return
             }
         }
+    }
+
+    /// Max cosine similarity over all cross pairs of two frame sets
+    /// (≤8×8 = 64 vDSP dots — negligible).
+    private func bestPairSimilarity(_ a: [[Float]], _ b: [[Float]]) -> Float {
+        var best: Float = -1
+        for fa in a where !fa.isEmpty {
+            for fb in b where !fb.isEmpty {
+                best = max(best, dot(fa, fb))   // dot() returns 0 on dim mismatch
+            }
+        }
+        return best
     }
 
     // MARK: - Face clustering
@@ -405,6 +620,7 @@ final class PhotoStore: ObservableObject {
         for i in photos.indices {
             photos[i].personClusterIDs = result.assignments[photos[i].assetID] ?? []
         }
+        dirty.formUnion([.photos, .clusters])
         persist()
     }
 
@@ -427,6 +643,9 @@ final class PhotoStore: ObservableObject {
     private var geocodeCache:   [String: String] = [:]           // cell key → place name ("" = no result)
     private var geocodePending: [String: PendingGeocode] = [:]   // cell key → coords + waiting photos
     private var geocodeDrainTask: Task<Void, Never>?
+    /// Guards the drain handle against a stale task's cleanup clobbering a
+    /// newer drain after resetIndex cancels and restarts the queue.
+    private var geocodeDrainGeneration = 0
     private let geocoder = CLGeocoder()
 
     private static var geocodeCacheURL:   URL { storeDir.appendingPathComponent("geocode_cache.json") }
@@ -448,14 +667,19 @@ final class PhotoStore: ObservableObject {
         } else {
             geocodePending[key] = PendingGeocode(lat: lat, lon: lon, assetIDs: [assetID])
         }
+        schedulePersist(.geocode)   // queue changed — debounce a write
         startGeocodeDrain()
     }
 
     func startGeocodeDrain() {
         guard geocodeDrainTask == nil, !geocodePending.isEmpty else { return }
+        geocodeDrainGeneration += 1
+        let gen = geocodeDrainGeneration
         geocodeDrainTask = Task { [weak self] in
             await self?.drainGeocodeQueue()
-            self?.geocodeDrainTask = nil
+            // Clear only our own handle — resetIndex may have cancelled this
+            // drain and a newer one may already be running.
+            if let self, self.geocodeDrainGeneration == gen { self.geocodeDrainTask = nil }
         }
     }
 
@@ -465,6 +689,9 @@ final class PhotoStore: ObservableObject {
             do {
                 let loc = CLLocation(latitude: job.lat, longitude: job.lon)
                 let placemarks = try await geocoder.reverseGeocodeLocation(loc)
+                // resetIndex cancels the drain; a lookup resolving after the
+                // wipe must not repopulate Places from stale state.
+                if Task.isCancelled { break }
                 failureStreak = 0
                 var parts: [String] = []
                 if let p = placemarks.first {
@@ -478,12 +705,12 @@ final class PhotoStore: ObservableObject {
                     applyLocation(assetID: id, name: name)
                 }
                 geocodePending.removeValue(forKey: key)
-                schedulePersist()
+                schedulePersist(.geocode)
                 try? await Task.sleep(for: .seconds(1.5))   // stay under Apple's rate limit
             } catch let error as CLError where error.code == .geocodeFoundNoResult {
                 geocodeCache[key] = ""
                 geocodePending.removeValue(forKey: key)
-                schedulePersist()
+                schedulePersist(.geocode)
             } catch {
                 // Throttled or offline — back off; give up after a few tries
                 // (queue is persisted, the next launch or enqueue resumes it).
@@ -505,19 +732,22 @@ final class PhotoStore: ObservableObject {
             locations.append(LocalLocation(name: name, alias: nil,
                                            photoAssetIDs: [assetID], coverAssetID: assetID))
         }
-        schedulePersist()
+        schedulePersist([.photos, .locations])
     }
 
     // MARK: - Delete
 
     func deletePhoto(assetID: String) {
-        guard let idx = photoIndex[assetID] else { return }
+        guard let idx = photoIndex[assetID], !photos[idx].isDeleted else { return }
         photos[idx].isDeleted = true
         for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { $0 == assetID } }
         for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { $0 == assetID } }
-        for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { $0 == assetID } }
+        // Folder membership intentionally survives a soft delete — folder
+        // reads filter !isDeleted instead (allPhotos/searchPhotos/activeCount),
+        // so restorePhotos can bring a photo back into its folders. Stripping
+        // here was irreversible: nothing recorded which folders held it.
         membershipVersion += 1
-        schedulePersist()
+        schedulePersist([.photos, .clusters, .locations])
     }
 
     func deletePhoto(photoID: Int) {
@@ -529,9 +759,9 @@ final class PhotoStore: ObservableObject {
     /// embedding, face-log entries, metadata — so restoring is instant.
     /// Location buckets re-attach here; People membership returns on the
     /// next reclusterPeople() (deletePhoto stripped it, and the reclusterer
-    /// keys off non-deleted photos). Folder membership is NOT restored —
-    /// deletePhoto destroys it and nothing records which folders held the
-    /// photo.
+    /// keys off non-deleted photos). Folder membership survives delete and
+    /// restore: deletePhoto no longer strips it — folder reads filter out
+    /// deleted photos instead — so restored photos reappear in their folders.
     @discardableResult
     func restorePhotos(_ assetIDs: Set<String>) -> Int {
         var restored = 0
@@ -553,23 +783,32 @@ final class PhotoStore: ObservableObject {
             // deleted, the twin's dupGroupID was cleared — re-check so the
             // pair is visible to the sweep again. (Copy out/in to avoid
             // overlapping access: the check walks the photos array.)
-            if photos[idx].dupGroupID == nil,
-               let emb = clipEmbeddings[assetID], !emb.isEmpty {
+            // A photo deleted via keep-newest retains a now-dangling
+            // dupGroupID (its kept twin's was cleared) — treat a group with
+            // <2 active members as "needs re-pairing" too.
+            let gidStale: Bool = {
+                guard let gid = photos[idx].dupGroupID else { return true }
+                let active = photos.lazy.filter { !$0.isDeleted && $0.dupGroupID == gid }.count
+                return active < 2
+            }()
+            if gidStale, let emb = clipEmbeddings[assetID], !emb.isEmpty {
                 var p = photos[idx]
+                p.dupGroupID = nil
                 markDuplicateIfNeeded(&p, embedding: emb)
                 photos[idx] = p
             }
         }
         if restored > 0 {
             membershipVersion += 1
-            schedulePersist()
+            schedulePersist([.photos, .locations])
         }
         return restored
     }
 
     /// Mark assets that were deleted from the system photo library as gone
-    /// in the index too. Same bookkeeping as deletePhoto, minus the library
-    /// deletion (these assets no longer exist there).
+    /// in the index too. Like deletePhoto, minus the library deletion (these
+    /// assets no longer exist there) — and unlike deletePhoto it also strips
+    /// folder membership, because a pruned asset can never be restored.
     func pruneDeletedAssets(_ assetIDs: Set<String>) {
         var pruned = false
         for assetID in assetIDs {
@@ -580,9 +819,11 @@ final class PhotoStore: ObservableObject {
         guard pruned else { return }
         for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { assetIDs.contains($0) } }
         for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        // Unlike deletePhoto, folder membership IS stripped here: these
+        // assets are gone from the camera roll and can never be restored.
         for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { assetIDs.contains($0) } }
         membershipVersion += 1
-        schedulePersist()
+        schedulePersist([.photos, .clusters, .locations, .folders])
     }
 
     // MARK: - People
@@ -633,7 +874,7 @@ final class PhotoStore: ObservableObject {
         for i in 0..<photos.count {
             photos[i].personClusterIDs = photos[i].personClusterIDs.map { $0 == source ? target : $0 }
         }
-        schedulePersist()
+        schedulePersist([.clusters, .photos])
     }
 
     func unmergeCluster(_ memberID: Int) {
@@ -650,19 +891,19 @@ final class PhotoStore: ObservableObject {
                     .map { $0 == targetID ? memberID : $0 }
             }
         }
-        schedulePersist()
+        schedulePersist([.clusters, .photos])
     }
 
     func setClusterName(id: Int, name: String) {
         guard let ci = clusterIndex(id) else { return }
         clusters[ci].name = name.trimmingCharacters(in: .whitespaces).isEmpty ? nil : name
-        schedulePersist()
+        schedulePersist(.clusters)
     }
 
     func deleteCluster(id: Int) {
         guard let ci = clusterIndex(id) else { return }
         clusters[ci].isDeleted = true
-        schedulePersist()
+        schedulePersist(.clusters)
     }
 
     // MARK: - Locations
@@ -675,7 +916,7 @@ final class PhotoStore: ObservableObject {
     func setLocationAlias(name: String, alias: String) {
         guard let li = locations.firstIndex(where: { $0.name == name }) else { return }
         locations[li].alias = alias.trimmingCharacters(in: .whitespaces).isEmpty ? nil : alias
-        schedulePersist()
+        schedulePersist(.locations)
     }
 
     // MARK: - Folders
@@ -685,17 +926,20 @@ final class PhotoStore: ObservableObject {
         let f = LocalFolder(id: UUID().uuidString, name: name, photoAssetIDs: [],
                             query: (query?.isEmpty == true) ? nil : query)
         folders.append(f)
-        schedulePersist()
+        schedulePersist(.folders)
         return f
     }
 
     func setFolderQuery(id: String, query: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }) else { return }
         folders[fi].query = query.isEmpty ? nil : query
-        schedulePersist()
+        schedulePersist(.folders)
     }
 
-    /// Evaluate a smart folder's saved search (static folders return their list).
+    /// Evaluate a smart folder's saved search (static folders return their
+    /// list). Soft-deleted photos stay in photoAssetIDs (see deletePhoto) but
+    /// are filtered out here — both paths go through searchPhotos/allPhotos,
+    /// which drop isDeleted.
     func photosForFolder(_ folder: LocalFolder) -> [LocalPhoto] {
         if let q = folder.query, !q.isEmpty {
             return searchPhotos(query: q)
@@ -703,10 +947,33 @@ final class PhotoStore: ObservableObject {
         return allPhotos(folderID: folder.id)
     }
 
+    /// Non-deleted member count, for folder badges. Soft-deleted photos
+    /// remain in photoAssetIDs so they can be restored — don't count them.
+    /// Smart folders have no static membership (evaluating their query per
+    /// row would be O(folders × search)), so they report 0 and the UI shows
+    /// the query instead of a count.
+    func activeCount(in folder: LocalFolder) -> Int {
+        guard !folder.isSmart else { return 0 }
+        return folder.photoAssetIDs.reduce(0) { count, assetID in
+            guard let idx = photoIndex[assetID], !photos[idx].isDeleted else { return count }
+            return count + 1
+        }
+    }
+
+    /// Most recent non-deleted member, for folder cover thumbnails (folder
+    /// membership now survives soft-deletes, so .last alone may point at a
+    /// hidden photo).
+    func activeCoverAssetID(in folder: LocalFolder) -> String? {
+        folder.photoAssetIDs.last { id in
+            guard let idx = photoIndex[id] else { return false }
+            return !photos[idx].isDeleted
+        }
+    }
+
     func renameFolder(id: String, name: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }), !name.isEmpty else { return }
         folders[fi].name = name
-        schedulePersist()
+        schedulePersist(.folders)
     }
 
     func deleteFolder(id: String, deletePhotos: Bool) {
@@ -714,7 +981,7 @@ final class PhotoStore: ObservableObject {
             folders[fi].photoAssetIDs.forEach { deletePhoto(assetID: $0) }
         }
         folders.removeAll { $0.id == id }
-        schedulePersist()
+        schedulePersist(.folders)
     }
 
     func addPhotos(_ assetIDs: [String], toFolder id: String) {
@@ -722,13 +989,13 @@ final class PhotoStore: ObservableObject {
         for assetID in assetIDs where !folders[fi].photoAssetIDs.contains(assetID) {
             folders[fi].photoAssetIDs.append(assetID)
         }
-        schedulePersist()
+        schedulePersist(.folders)
     }
 
     func removePhotos(_ assetIDs: [String], fromFolder id: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }) else { return }
         let s = Set(assetIDs); folders[fi].photoAssetIDs.removeAll { s.contains($0) }
-        schedulePersist()
+        schedulePersist(.folders)
     }
 
     // MARK: - Duplicates
@@ -749,40 +1016,84 @@ final class PhotoStore: ObservableObject {
     // MARK: - Auto-categories (zero-shot CLIP)
 
     private var categoryCache: (photoCount: Int, version: Int, result: [String: [LocalPhoto]])?
+    /// Per-category prompt embeddings, encoded once per process — the
+    /// prompts are compile-time constants, so re-encoding them on every
+    /// call was pure waste. Filled on the first autoCategories() call.
+    private static var promptEmbeddingCache: [String: [[Float]]]?
 
     /// Score every photo against each category's text prompts. Prompt
-    /// embeddings are computed once per call (a few CLIPText inferences);
-    /// the scoring is vDSP over stored embeddings. Cached until the photo
-    /// count changes.
-    func autoCategories() -> [(category: AutoCategory, photos: [LocalPhoto])] {
+    /// embeddings are encoded once per process; the scoring loop (vDSP over
+    /// every stored embedding) runs detached so big libraries don't stall
+    /// the main thread. Result cached until membership changes.
+    func autoCategories() async -> [(category: AutoCategory, photos: [LocalPhoto])] {
         if let cached = categoryCache, cached.photoCount == photos.count,
            cached.version == membershipVersion {
-            return AutoCategorizer.categories.compactMap { cat in
-                guard let ps = cached.result[cat.id], !ps.isEmpty else { return nil }
-                return (cat, ps)
-            }
+            return Self.assembleCategories(from: cached.result)
         }
-        let engine = OnDeviceMLEngine.shared
-        if !engine.isAvailable { try? engine.loadModels() }
-        guard engine.isAvailable else { return [] }
 
-        var result: [String: [LocalPhoto]] = [:]
-        for cat in AutoCategorizer.categories {
-            let promptEmbs = cat.prompts.compactMap { try? engine.encodeText($0) }
-            guard !promptEmbs.isEmpty else { continue }
-            var matches: [(LocalPhoto, Float)] = []
-            for p in photos where !p.isDeleted {
-                guard let emb = clipEmbeddings[p.assetID], !emb.isEmpty else { continue }
-                var best: Float = -1
-                for t in promptEmbs { best = max(best, dot(emb, t)) }
-                if best >= cat.threshold { matches.append((p, best)) }
-            }
-            result[cat.id] = matches
-                .sorted { ($0.0.createdAt ?? .distantPast) > ($1.0.createdAt ?? .distantPast) }
-                .map(\.0)
+        if Self.promptEmbeddingCache == nil {
+            let engine = OnDeviceMLEngine.shared
+            if !engine.isAvailable { try? engine.loadModels() }
+            guard engine.isAvailable else { return [] }
+            // MLModel.prediction is thread-safe, so the text encodes can run
+            // off the main actor.
+            let encoded = await Task.detached(priority: .userInitiated) {
+                () -> [String: [[Float]]] in
+                var out: [String: [[Float]]] = [:]
+                for cat in AutoCategorizer.categories {
+                    let embs = cat.prompts.compactMap { try? engine.encodeText($0) }
+                    if !embs.isEmpty { out[cat.id] = embs }
+                }
+                return out
+            }.value
+            // Don't cache a total failure — leave nil so the next call retries.
+            Self.promptEmbeddingCache = encoded.isEmpty ? nil : encoded
         }
-        categoryCache = (photos.count, membershipVersion, result)
-        return AutoCategorizer.categories.compactMap { cat in
+        guard let promptEmbs = Self.promptEmbeddingCache else { return [] }
+
+        // Snapshot store state on the main actor (post-await — the encode
+        // suspension above may have let indexing land new photos), then
+        // score detached. The cache is keyed on the snapshot, so state that
+        // changes mid-scoring just means a recompute on the next call.
+        let snapshotPhotos = photos.filter { !$0.isDeleted }
+        let snapshotCount = photos.count
+        let snapshotVersion = membershipVersion
+        let clipSnapshot = clipEmbeddings
+        let frameSnapshot = videoFrameEmbeddings
+
+        let result = await Task.detached(priority: .userInitiated) {
+            () -> [String: [LocalPhoto]] in
+            var out: [String: [LocalPhoto]] = [:]
+            for cat in AutoCategorizer.categories {
+                guard let prompts = promptEmbs[cat.id] else { continue }
+                var matches: [(LocalPhoto, Float)] = []
+                for p in snapshotPhotos {
+                    var best: Float = -1
+                    if let emb = clipSnapshot[p.assetID], !emb.isEmpty {
+                        for t in prompts { best = max(best, Self.dot(emb, t)) }
+                    }
+                    // Videos: any sampled frame can claim the category.
+                    if let frames = frameSnapshot[p.assetID] {
+                        for f in frames where !f.isEmpty {
+                            for t in prompts { best = max(best, Self.dot(f, t)) }
+                        }
+                    }
+                    if best >= cat.threshold { matches.append((p, best)) }
+                }
+                out[cat.id] = matches
+                    .sorted { ($0.0.createdAt ?? .distantPast) > ($1.0.createdAt ?? .distantPast) }
+                    .map(\.0)
+            }
+            return out
+        }.value
+
+        categoryCache = (snapshotCount, snapshotVersion, result)
+        return Self.assembleCategories(from: result)
+    }
+
+    private static func assembleCategories(from result: [String: [LocalPhoto]])
+        -> [(category: AutoCategory, photos: [LocalPhoto])] {
+        AutoCategorizer.categories.compactMap { cat in
             guard let ps = result[cat.id], !ps.isEmpty else { return nil }
             return (cat, ps)
         }
@@ -899,11 +1210,17 @@ final class PhotoStore: ObservableObject {
     /// Floor 0.55: near-identical scenes score 0.85+, same-subject/related
     /// scenes 0.6–0.8, loosely related ~0.5, unrelated below.
     func similarPhotos(to assetID: String, limit: Int = 60, floor: Float = 0.55) -> [LocalPhoto] {
-        guard let target = clipEmbeddings[assetID], !target.isEmpty else { return [] }
+        // Target = mean embedding plus any per-frame vectors (videos), so
+        // "more like this" on a video can match any part of it; candidates
+        // likewise score by their best representation via clipScore.
+        var targets: [[Float]] = []
+        if let t = clipEmbeddings[assetID], !t.isEmpty { targets.append(t) }
+        for f in videoFrameEmbeddings[assetID] ?? [] where !f.isEmpty { targets.append(f) }
+        guard !targets.isEmpty else { return [] }
         var scored: [(LocalPhoto, Float)] = []
         for p in photos where !p.isDeleted && p.assetID != assetID {
-            guard let emb = clipEmbeddings[p.assetID], !emb.isEmpty else { continue }
-            let s = dot(emb, target)
+            var s: Float = -.greatestFiniteMagnitude
+            for t in targets { s = max(s, clipScore(assetID: p.assetID, query: t) ?? s) }
             if s >= floor { scored.append((p, s)) }
         }
         return scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
@@ -922,13 +1239,36 @@ final class PhotoStore: ObservableObject {
         return duplicateGroup(for: photo.assetID)
     }
 
+    /// Non-deleted member counts per duplicate group, built lazily in one
+    /// pass. Keyed on (photos.count, membershipVersion) like categoryCache;
+    /// the dupGroupID mutators that change neither (merge/ungroup/keep) nil
+    /// it explicitly.
+    private var dupCountCache: (photoCount: Int, version: Int, counts: [String: Int])?
+
+    /// O(1) duplicate-group size for thumbnail badges — duplicateGroup() is
+    /// an O(N) scan, and grids were paying it per visible cell.
+    func duplicateCount(forGroupID groupID: String) -> Int {
+        if let cached = dupCountCache, cached.photoCount == photos.count,
+           cached.version == membershipVersion {
+            return cached.counts[groupID] ?? 0
+        }
+        var counts: [String: Int] = [:]
+        for p in photos where !p.isDeleted {
+            if let gid = p.dupGroupID { counts[gid, default: 0] += 1 }
+        }
+        dupCountCache = (photos.count, membershipVersion, counts)
+        return counts[groupID] ?? 0
+    }
+
     func mergeDuplicates(a: Int, b: Int) {
         guard let pa = photos.first(where: { $0.photoID == a }),
               let pb = photos.first(where: { $0.photoID == b }) else { return }
         let gid = pa.dupGroupID ?? pa.assetID
         if let ia = photoIndex[pa.assetID] { photos[ia].dupGroupID = gid }
         if let ib = photoIndex[pb.assetID] { photos[ib].dupGroupID = gid }
-        schedulePersist()
+        dupCountCache = nil
+        membershipVersion += 1   // sweep list + grids key on this
+        schedulePersist(.photos)
     }
 
     func ungroupDuplicates(forPhotoID photoID: Int) {
@@ -937,7 +1277,9 @@ final class PhotoStore: ObservableObject {
         for i in 0..<photos.count where photos[i].dupGroupID == gid {
             photos[i].dupGroupID = nil
         }
-        schedulePersist()
+        dupCountCache = nil
+        membershipVersion += 1   // sweep list + grids key on this
+        schedulePersist(.photos)
     }
 
     func keepDuplicates(groupOf photoID: Int, keepIDs: [Int]) -> [Int] {
@@ -953,11 +1295,25 @@ final class PhotoStore: ObservableObject {
                 if let idx = photoIndex[p.assetID] { photos[idx].dupGroupID = nil }
             }
         }
-        schedulePersist()
+        dupCountCache = nil   // may clear dupGroupID without a count/version bump
+        schedulePersist(.photos)
         return deleted
     }
 
     // MARK: - Search
+
+    /// Best CLIP relevance of one photo against a query embedding: the
+    /// stored (mean) embedding, plus — for videos with per-frame data — the
+    /// max over sampled frames, so a video matches when ANY part of it does.
+    /// nil when the photo has no embeddings at all.
+    private func clipScore(assetID: String, query tEmb: [Float]) -> Float? {
+        var best: Float = -.greatestFiniteMagnitude
+        if let emb = clipEmbeddings[assetID], !emb.isEmpty { best = dot(emb, tEmb) }
+        if let frames = videoFrameEmbeddings[assetID] {
+            for f in frames where !f.isEmpty { best = max(best, dot(f, tEmb)) }
+        }
+        return best > -.greatestFiniteMagnitude ? best : nil
+    }
 
     func searchPhotos(query: String, folderID: String? = nil) -> [LocalPhoto] {
         let q = query.lowercased().trimmingCharacters(in: .whitespaces)
@@ -986,8 +1342,10 @@ final class PhotoStore: ObservableObject {
             }
         }
 
-        // Month+year filter e.g. "june 2023" or "2023-06"
-        if let (year, month) = parseMonthYear(q) {
+        // Month+year filter e.g. "june 2023" or "2023-06". Bare month words
+        // with no year apply no filter (and stay in the caption below).
+        let monthYear = parseMonthYear(q)
+        if let (year, month) = monthYear {
             results = results.filter { p in
                 guard let d = p.createdAt else { return false }
                 let cal = Calendar.current
@@ -996,10 +1354,14 @@ final class PhotoStore: ObservableObject {
             }
         }
 
-        // Location filter
+        // Location filter. Stored names are geocoded "City, State"/"City,
+        // Country" — match on the city part so "san francisco" finds
+        // "San Francisco, California" (a query containing the full stored
+        // name necessarily contains the city part too).
         let matchingLocs = locations.filter { loc in
-            q.contains(loc.name.lowercased()) ||
-            (loc.alias.map { q.contains($0.lowercased()) } ?? false)
+            let city = cityPart(of: loc.name)
+            if !city.isEmpty, q.contains(city) { return true }
+            return loc.alias.map { !$0.isEmpty && q.contains($0.lowercased()) } ?? false
         }
         if !matchingLocs.isEmpty {
             let nameSet = Set(matchingLocs.map(\.name))
@@ -1024,12 +1386,12 @@ final class PhotoStore: ObservableObject {
         // Mirrors the backend: CAPTION_FLOOR drops unrelated photos
         // (ViT-B/32 calibration: >0.30 strongly related, <0.22 unrelated).
         let caption = residualCaption(
-            from: q, matchedLocations: matchingLocs, matchedClusters: matchingClusters)
+            from: q, matchedLocations: matchingLocs, matchedClusters: matchingClusters,
+            monthYearMatched: monthYear != nil)
         if !caption.isEmpty, let tEmb = try? OnDeviceMLEngine.shared.encodeText(caption) {
             let floor: Float = 0.25
             let scored: [(LocalPhoto, Float)] = results.compactMap { p in
-                guard let emb = clipEmbeddings[p.assetID], !emb.isEmpty else { return nil }
-                let s = dot(emb, tEmb)
+                guard let s = clipScore(assetID: p.assetID, query: tEmb) else { return nil }
                 return s >= floor ? (p, s) : nil
             }
             return scored.sorted { $0.1 > $1.1 }.map { $0.0 }
@@ -1038,15 +1400,31 @@ final class PhotoStore: ObservableObject {
         return results.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
     }
 
+    /// "San Francisco, California" → "san francisco". Geocoded names are
+    /// "City, State" / "City, Country"; users search by the city alone, so
+    /// both location matching and caption-stripping key off the part before
+    /// the first comma.
+    private func cityPart(of name: String) -> String {
+        let head = name.split(separator: ",", maxSplits: 1,
+                              omittingEmptySubsequences: false).first ?? Substring(name)
+        return head.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
     /// Words of the query left over after removing everything the structured
-    /// filters consumed (years, month names, matched location/person names)
-    /// plus filler stopwords. What remains is the CLIP caption.
+    /// filters consumed (years, matched location/person names, and — only
+    /// when a month+year filter actually applied — month names) plus filler
+    /// stopwords. What remains is the CLIP caption. Month words are kept when
+    /// no month+year filter matched, so "may day parade" keeps "may" and a
+    /// bare "june" stays a caption instead of matching everything.
     private func residualCaption(from q: String,
                                  matchedLocations: [LocalLocation],
-                                 matchedClusters: [PersonCluster]) -> String {
+                                 matchedClusters: [PersonCluster],
+                                 monthYearMatched: Bool) -> String {
         var consumed = Set<String>()
         for loc in matchedLocations {
-            loc.name.lowercased().split(separator: " ").forEach { consumed.insert(String($0)) }
+            // The filter matched on the city part / alias, so strip those
+            // same tokens (the full stored name was never in the query).
+            cityPart(of: loc.name).split(separator: " ").forEach { consumed.insert(String($0)) }
             if let alias = loc.alias {
                 alias.lowercased().split(separator: " ").forEach { consumed.insert(String($0)) }
             }
@@ -1065,7 +1443,8 @@ final class PhotoStore: ObservableObject {
             "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
         ]
         let words = q.split(separator: " ").map(String.init).filter { w in
-            if consumed.contains(w) || stop.contains(w) || months.contains(w) { return false }
+            if consumed.contains(w) || stop.contains(w) { return false }
+            if monthYearMatched && months.contains(w) { return false }
             if w.range(of: #"^(19|20)\d{2}$"#, options: .regularExpression) != nil { return false }
             return true
         }
@@ -1075,6 +1454,9 @@ final class PhotoStore: ObservableObject {
     // MARK: - All photos (sorted, optionally filtered)
 
     func allPhotos(folderID: String? = nil) -> [LocalPhoto] {
+        // The !isDeleted filter runs before the folder intersect: folder
+        // photoAssetIDs keep soft-deleted members (so restore works), and
+        // this is where they're hidden.
         var result = photos.filter { !$0.isDeleted }
         if let fid = folderID, !fid.isEmpty,
            let folder = folders.first(where: { $0.id == fid }) {
@@ -1167,21 +1549,41 @@ final class PhotoStore: ObservableObject {
     // MARK: - Reset
 
     func resetIndex() {
+        // Stop the geocode drain first — an in-flight lookup resolving after
+        // the wipe would repopulate Places from stale state. Bump the drain
+        // generation so the cancelled task's cleanup can't clobber the handle
+        // of a drain started by post-reset indexing.
+        geocodeDrainTask?.cancel()
+        geocodeDrainTask = nil
+        geocodeDrainGeneration += 1
+        geocodePending = [:]
+
         photos = []; clusters = []; locations = []; folders = []
-        clipEmbeddings = [:]; photoIndex = [:]; nextPhotoID = 0; nextClusterID = 0
+        clipEmbeddings = [:]; videoFrameEmbeddings = [:]
+        photoIndex = [:]; nextPhotoID = 0; nextClusterID = 0
         try? FileManager.default.removeItem(at: Self.photosURL)
         try? FileManager.default.removeItem(at: Self.clustersURL)
         try? FileManager.default.removeItem(at: Self.locationsURL)
+        try? FileManager.default.removeItem(at: Self.foldersURL)
         try? FileManager.default.removeItem(at: Self.embeddingsURL)
         try? FileManager.default.removeItem(at: Self.clipBinURL)
+        try? FileManager.default.removeItem(at: Self.videoFramesURL)
         faceLog.reset()
-        geocodePending = [:]
         try? FileManager.default.removeItem(at: Self.geocodePendingURL)
+
+        // Synchronous full write of the cleared state. Without it, a pending
+        // debounced persist (or nothing at all) raced relaunch and the old
+        // stores resurrected; persistAll also cancels that debounce and bumps
+        // the embeddings generation so an in-flight async flush can't bring
+        // the old binary back.
+        persistAll()
     }
 
     // MARK: - Math
 
-    func dot(_ a: [Float], _ b: [Float]) -> Float {
+    /// nonisolated static so the detached autoCategories scoring loop can
+    /// use it; the instance method below keeps existing call sites working.
+    nonisolated static func dot(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
         // vDSP: ~10× the scalar loop. This runs against every stored photo
         // for duplicate checks and caption-search ranking, so it adds up.
@@ -1189,6 +1591,8 @@ final class PhotoStore: ObservableObject {
         vDSP_dotpr(a, 1, b, 1, &result, vDSP_Length(a.count))
         return result
     }
+
+    func dot(_ a: [Float], _ b: [Float]) -> Float { Self.dot(a, b) }
 
     func l2Normalize(_ v: [Float]) -> [Float] {
         let norm = v.map { $0 * $0 }.reduce(0, +).squareRoot() + 1e-10
@@ -1211,5 +1615,91 @@ final class PhotoStore: ObservableObject {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Per-frame video embedding codec
+
+/// Flat binary serialization for `[String: [[Float]]]` — per-video sampled-
+/// frame CLIP embeddings (videoframes.bin). A variant of
+/// BinaryEmbeddingCodec, whose format only fits one vector per key: this one
+/// count-prefixes a frame list per key instead. Distinct magic so neither
+/// file can be mis-decoded as the other.
+///
+/// Format (little-endian):
+///   [UInt32 magic][UInt32 entryCount]
+///   per entry: [UInt16 keyLen][key UTF-8][UInt16 frameCount]
+///              per frame: [UInt32 floatCount][floats]
+enum BinaryFrameEmbeddingCodec {
+    private static let magic: UInt32 = 0x5053_4632  // "PSF2"
+
+    static func encode(_ dict: [String: [[Float]]]) -> Data {
+        var data = Data()
+        data.reserveCapacity(16 + dict.count * (64 + 8 * 512 * 4))
+        data.appendLE(magic)
+        data.appendLE(UInt32(dict.count))
+        for (key, frames) in dict {
+            let kb = Data(key.utf8)
+            data.appendLE(UInt16(kb.count))
+            data.append(kb)
+            data.appendLE(UInt16(frames.count))
+            for frame in frames {
+                data.appendLE(UInt32(frame.count))
+                frame.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+            }
+        }
+        return data
+    }
+
+    static func decode(_ data: Data) -> [String: [[Float]]]? {
+        var cur = FrameDataCursor(data)
+        guard cur.readLE(UInt32.self) == magic,
+              let count = cur.readLE(UInt32.self) else { return nil }
+        var dict = [String: [[Float]]](minimumCapacity: Int(count))
+        for _ in 0..<count {
+            guard let keyLen = cur.readLE(UInt16.self),
+                  let keyData = cur.readBytes(Int(keyLen)),
+                  let key = String(data: keyData, encoding: .utf8),
+                  let frameCount = cur.readLE(UInt16.self) else { return nil }
+            var frames: [[Float]] = []
+            frames.reserveCapacity(Int(frameCount))
+            for _ in 0..<frameCount {
+                guard let floatCount = cur.readLE(UInt32.self),
+                      let values = cur.readFloats(Int(floatCount)) else { return nil }
+                frames.append(values)
+            }
+            dict[key] = frames
+        }
+        return dict
+    }
+}
+
+/// Sequential little-endian reader, nil past the end (truncated file ⇒
+/// decode fails, store starts empty). Same shape as EmbeddingStore's
+/// DataCursor, which is private to that file.
+private struct FrameDataCursor {
+    let data: Data
+    var offset: Int
+
+    init(_ data: Data) { self.data = data; offset = data.startIndex }
+
+    mutating func readLE<T: FixedWidthInteger>(_ type: T.Type) -> T? {
+        let size = MemoryLayout<T>.size
+        guard offset + size <= data.endIndex else { return nil }
+        var v: T = 0
+        _ = withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<offset + size) }
+        offset += size
+        return T(littleEndian: v)
+    }
+
+    mutating func readBytes(_ count: Int) -> Data? {
+        guard count >= 0, offset + count <= data.endIndex else { return nil }
+        defer { offset += count }
+        return data.subdata(in: offset..<offset + count)
+    }
+
+    mutating func readFloats(_ count: Int) -> [Float]? {
+        guard let raw = readBytes(count * 4) else { return nil }
+        return raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
 }

@@ -1,7 +1,6 @@
 import SwiftUI
 
 struct SearchView: View {
-    @EnvironmentObject private var folderStore: FolderStore
     @State private var query = ""
     @State private var results: [LocalPhoto] = []
     @State private var hasSearched = false
@@ -18,7 +17,6 @@ struct SearchView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     FolderFilterButton(selectedFolderID: $selectedFolderID)
-                        .environmentObject(folderStore)
                 }
             }
         }

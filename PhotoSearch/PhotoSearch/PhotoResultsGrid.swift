@@ -9,11 +9,14 @@ struct PhotoResultsGrid: View {
     /// When set (folder context), the selection bar gains a "remove from this
     /// folder" action — called with the selected assetIDs.
     var onRemoveSelected: (([String]) -> Void)? = nil
+    /// When the grid is backed by a paged loader, Select All must first load
+    /// every remaining page — otherwise it silently selects only the pages
+    /// scrolled in so far (dangerous right before a bulk delete). Returns the
+    /// full result set to select.
+    var onLoadAll: (() async -> [LocalPhoto])? = nil
 
     private let spacing: CGFloat = 2
     private let columns = 3
-
-    @EnvironmentObject private var folderStore: FolderStore
 
     @State private var selecting = false
     @State private var selected: Set<Int> = []   // photoIDs
@@ -23,6 +26,7 @@ struct PhotoResultsGrid: View {
     @State private var dropTargetID: Int?
     @State private var pendingMerge: (Int, Int)?
     @State private var merging = false
+    @State private var selectingAll = false
     @State private var showAddToFolder = false
 
     var body: some View {
@@ -64,11 +68,14 @@ struct PhotoResultsGrid: View {
         .safeAreaInset(edge: .bottom) {
             if selecting {
                 HStack {
-                    Button("Select All") { selected = Set(results.map(\.photoID)) }
-                        .font(.body)
+                    if selectingAll {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("Select All") { selectAll() }
+                            .font(.body)
+                    }
                     Spacer()
                     Button {
-                        Task { await folderStore.load() }
                         showAddToFolder = true
                     } label: {
                         Image(systemName: "folder.badge.plus").font(.body.bold())
@@ -107,7 +114,6 @@ struct PhotoResultsGrid: View {
         .sheet(isPresented: $showAddToFolder) {
             let assetIDs = results.filter { selected.contains($0.photoID) }.map(\.assetID)
             AddToFolderSheet(assetIDs: assetIDs) { exitSelection() }
-                .environmentObject(folderStore)
         }
         .confirmationDialog(
             "Delete \(selected.count) photo\(selected.count == 1 ? "" : "s")?",
@@ -130,7 +136,7 @@ struct PhotoResultsGrid: View {
         } message: {
             Text("These photos will be grouped as duplicates.")
         }
-        .allowsHitTesting(!deleting && !merging)
+        .allowsHitTesting(!deleting && !merging && !selectingAll)
         .overlay { if deleting || merging { ProgressView().controlSize(.large) } }
     }
 
@@ -174,6 +180,22 @@ struct PhotoResultsGrid: View {
 
     private func toggle(_ id: Int) {
         if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
+    }
+
+    private func selectAll() {
+        guard let onLoadAll else {
+            selected = Set(results.map(\.photoID))   // unpaged: results are complete
+            return
+        }
+        selectingAll = true
+        Task {
+            // Pull in every remaining page first so "Select All" really means
+            // the whole result set, then select the returned full list (the
+            // captured `results` is the stale pre-load snapshot).
+            let all = await onLoadAll()
+            selected = Set(all.map(\.photoID))
+            selectingAll = false
+        }
     }
 
     private func exitSelection() {
@@ -248,8 +270,8 @@ private struct Thumb: View {
         }
         .opacity(selecting && !selected ? 0.55 : 1)
         .onAppear {
-            if photo.dupGroupID != nil {
-                dupCount = PhotoStore.shared.duplicateGroup(for: photo.assetID).count
+            if let gid = photo.dupGroupID {
+                dupCount = PhotoStore.shared.duplicateCount(forGroupID: gid)
             }
         }
     }

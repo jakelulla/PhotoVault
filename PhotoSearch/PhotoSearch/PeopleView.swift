@@ -3,7 +3,6 @@ import UniformTypeIdentifiers
 
 /// Frequent faces. Tap a face to see photos, tap name to rename, drag to merge.
 struct PeopleView: View {
-    @EnvironmentObject private var folderStore: FolderStore
     @EnvironmentObject private var indexer: Indexer
     @EnvironmentObject private var library: PhotoLibraryModel
     @ObservedObject private var store = PhotoStore.shared

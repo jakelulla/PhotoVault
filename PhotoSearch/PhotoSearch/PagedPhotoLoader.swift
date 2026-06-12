@@ -27,6 +27,21 @@ final class PagedPhotoLoader: ObservableObject {
         results.removeAll { $0.photoID == photoID }
     }
 
+    /// Loads every remaining page (e.g. before Select All) so actions cover
+    /// the whole result set, not just what infinite scroll has pulled in.
+    func loadAll() async {
+        var pages = 0
+        while !reachedEnd && pages < 1000 {   // safety cap: 1000 pages ≈ 100k photos
+            // An in-flight onReachEnd loadMore makes loadMore() a guarded
+            // no-op — wait it out instead of burning cap iterations, or
+            // Select All could silently cover a partial set.
+            while isLoading { await Task.yield() }
+            let before = offset
+            await loadMore()
+            if offset > before { pages += 1 }
+        }
+    }
+
     func loadMore() async {
         guard !isLoading, !reachedEnd, let fetch else { return }
         isLoading = true

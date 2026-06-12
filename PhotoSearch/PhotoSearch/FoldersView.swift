@@ -4,17 +4,16 @@ import SwiftUI
 
 /// Toolbar button that shows the active folder and opens the picker sheet.
 struct FolderFilterButton: View {
-    @EnvironmentObject var folderStore: FolderStore
+    @ObservedObject private var store = PhotoStore.shared
     @Binding var selectedFolderID: String?
     @State private var showPicker = false
 
     var body: some View {
         Button {
-            Task { await folderStore.load() }
             showPicker = true
         } label: {
             if let id = selectedFolderID,
-               let name = folderStore.folders.first(where: { $0.id == id })?.name {
+               let name = store.folders.first(where: { $0.id == id })?.name {
                 Label(name, systemImage: "folder.fill")
                     .font(.caption.bold())
                     .lineLimit(1)
@@ -24,7 +23,6 @@ struct FolderFilterButton: View {
         }
         .sheet(isPresented: $showPicker) {
             FolderPickerSheet(selectedFolderID: $selectedFolderID)
-                .environmentObject(folderStore)
         }
     }
 }
@@ -32,7 +30,7 @@ struct FolderFilterButton: View {
 // MARK: - Picker sheet
 
 struct FolderPickerSheet: View {
-    @EnvironmentObject var folderStore: FolderStore
+    @ObservedObject private var store = PhotoStore.shared
     @Binding var selectedFolderID: String?
     @Environment(\.dismiss) private var dismiss
     @State private var showManage = false
@@ -57,15 +55,15 @@ struct FolderPickerSheet: View {
                 }
 
                 Section("Folders") {
-                    ForEach(folderStore.folders) { folder in
+                    ForEach(store.folders) { folder in
                         Button {
                             selectedFolderID = folder.id
                             dismiss()
                         } label: {
                             HStack {
-                                Label(folder.name, systemImage: "folder")
+                                Label(folder.name, systemImage: folder.isSmart ? "sparkles" : "folder")
                                 Spacer()
-                                Text("\(folder.photoAssetIDs.count)")
+                                Text(folder.isSmart ? "Smart" : "\(store.activeCount(in: folder))")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                 if selectedFolderID == folder.id {
@@ -75,7 +73,7 @@ struct FolderPickerSheet: View {
                         }
                         .foregroundStyle(.primary)
                     }
-                    if folderStore.folders.isEmpty {
+                    if store.folders.isEmpty {
                         Text("No folders yet")
                             .foregroundStyle(.secondary)
                             .font(.subheadline)
@@ -94,7 +92,6 @@ struct FolderPickerSheet: View {
             }
             .sheet(isPresented: $showManage) {
                 FolderManageSheet()
-                    .environmentObject(folderStore)
             }
         }
     }
@@ -103,26 +100,24 @@ struct FolderPickerSheet: View {
 // MARK: - Manage sheet (create / delete folders)
 
 struct FolderManageSheet: View {
-    @EnvironmentObject var folderStore: FolderStore
+    @ObservedObject private var store = PhotoStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var newFolderName = ""
+    @State private var newFolderQuery = ""
     @State private var showCreate = false
     @State private var deletingFolder: LocalFolder?
     @State private var renamingFolder: LocalFolder?
     @State private var renameText = ""
-    @State private var deleteAction: DeleteAction = .removeOnly
-
-    enum DeleteAction { case removeOnly, deletePhotos }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    ForEach(folderStore.folders) { folder in
+                    ForEach(store.folders) { folder in
                         HStack {
                             Label(folder.name, systemImage: "folder")
                             Spacer()
-                            Text("\(folder.photoAssetIDs.count) photos")
+                            Text("\(store.activeCount(in: folder)) photos")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -141,7 +136,7 @@ struct FolderManageSheet: View {
                             .tint(.blue)
                         }
                     }
-                    if folderStore.folders.isEmpty {
+                    if store.folders.isEmpty {
                         Text("No folders yet")
                             .foregroundStyle(.secondary)
                             .font(.subheadline)
@@ -162,12 +157,16 @@ struct FolderManageSheet: View {
             }
             .alert("New Folder", isPresented: $showCreate) {
                 TextField("Folder name", text: $newFolderName)
+                TextField("Smart search (optional), e.g. \"dog\"", text: $newFolderQuery)
                 Button("Create") {
                     let name = newFolderName.trimmingCharacters(in: .whitespaces)
-                    newFolderName = ""
-                    if !name.isEmpty { Task { await folderStore.create(name: name) } }
+                    let query = newFolderQuery.trimmingCharacters(in: .whitespaces)
+                    newFolderName = ""; newFolderQuery = ""
+                    if !name.isEmpty {
+                        store.createFolder(name: name, query: query.isEmpty ? nil : query)
+                    }
                 }
-                Button("Cancel", role: .cancel) { newFolderName = "" }
+                Button("Cancel", role: .cancel) { newFolderName = ""; newFolderQuery = "" }
             }
             .alert("Rename Folder", isPresented: Binding(
                 get: { renamingFolder != nil },
@@ -177,7 +176,7 @@ struct FolderManageSheet: View {
                 Button("Rename") {
                     let name = renameText.trimmingCharacters(in: .whitespaces)
                     if let f = renamingFolder, !name.isEmpty {
-                        Task { await folderStore.rename(id: f.id, name: name) }
+                        store.renameFolder(id: f.id, name: name)
                     }
                     renamingFolder = nil
                 }
@@ -188,17 +187,21 @@ struct FolderManageSheet: View {
                 isPresented: Binding(get: { deletingFolder != nil }, set: { if !$0 { deletingFolder = nil } }),
                 titleVisibility: .visible
             ) {
-                Button("Remove from Folder Only", role: .none) {
-                    if let f = deletingFolder { Task { await folderStore.delete(id: f.id, deletePhotos: false) } }
+                Button("Delete Folder, Keep Photos") {
+                    if let f = deletingFolder { store.deleteFolder(id: f.id, deletePhotos: false) }
                     deletingFolder = nil
                 }
-                Button("Delete Photos Too", role: .destructive) {
-                    if let f = deletingFolder { Task { await folderStore.delete(id: f.id, deletePhotos: true) } }
-                    deletingFolder = nil
+                if deletingFolder?.isSmart != true {
+                    Button("Delete Photos Too", role: .destructive) {
+                        if let f = deletingFolder { store.deleteFolder(id: f.id, deletePhotos: true) }
+                        deletingFolder = nil
+                    }
                 }
                 Button("Cancel", role: .cancel) { deletingFolder = nil }
             } message: {
-                Text("Remove photos from this folder, or also delete them from the index?")
+                Text(deletingFolder?.isSmart == true
+                     ? "The smart folder is deleted. Your photos stay in your library and index."
+                     : "Delete just the folder, or also delete its photos from the index?")
             }
         }
     }
@@ -207,11 +210,10 @@ struct FolderManageSheet: View {
 // MARK: - Add to folder sheet (used from batch select)
 
 struct AddToFolderSheet: View {
-    @EnvironmentObject var folderStore: FolderStore
+    @ObservedObject private var store = PhotoStore.shared
     let assetIDs: [String]
     let onDone: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var adding = false
     @State private var showCreate = false
     @State private var newFolderName = ""
 
@@ -219,28 +221,23 @@ struct AddToFolderSheet: View {
         NavigationStack {
             List {
                 Section {
-                    ForEach(folderStore.folders.filter { !$0.isSmart }) { folder in
+                    ForEach(store.folders.filter { !$0.isSmart }) { folder in
                         Button {
-                            Task {
-                                adding = true
-                                await folderStore.addPhotos(assetIDs, to: folder.id)
-                                adding = false
-                                dismiss()
-                                onDone()
-                            }
+                            store.addPhotos(assetIDs, toFolder: folder.id)
+                            dismiss()
+                            onDone()
                         } label: {
                             HStack {
-                                Label(folder.name, systemImage: "folder")
+                                Label(folder.name, systemImage: folder.isSmart ? "sparkles" : "folder")
                                 Spacer()
-                                Text("\(folder.photoAssetIDs.count)")
+                                Text(folder.isSmart ? "Smart" : "\(store.activeCount(in: folder))")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
                         }
                         .foregroundStyle(.primary)
-                        .disabled(adding)
                     }
-                    if folderStore.folders.isEmpty {
+                    if store.folders.isEmpty {
                         Text("No folders yet — create one below")
                             .foregroundStyle(.secondary)
                             .font(.subheadline)
@@ -262,21 +259,16 @@ struct AddToFolderSheet: View {
                     Button("Cancel") { dismiss() }
                 }
             }
-            .overlay { if adding { ProgressView().controlSize(.large) } }
             .alert("New Folder", isPresented: $showCreate) {
                 TextField("Folder name", text: $newFolderName)
                 Button("Create & Add") {
                     let name = newFolderName.trimmingCharacters(in: .whitespaces)
                     newFolderName = ""
                     guard !name.isEmpty else { return }
-                    Task {
-                        let folder = await folderStore.createAndReturn(name: name)
-                        adding = true
-                        await folderStore.addPhotos(assetIDs, to: folder.id)
-                        adding = false
-                        dismiss()
-                        onDone()
-                    }
+                    let folder = store.createFolder(name: name)
+                    store.addPhotos(assetIDs, toFolder: folder.id)
+                    dismiss()
+                    onDone()
                 }
                 Button("Cancel", role: .cancel) { newFolderName = "" }
             }
@@ -290,7 +282,6 @@ struct AddToFolderSheet: View {
 /// long-press to rename/delete, "+" card to create.
 struct FoldersGrid: View {
     @ObservedObject private var store = PhotoStore.shared
-    @EnvironmentObject private var folderStore: FolderStore
 
     @State private var showCreate = false
     @State private var newName = ""
@@ -384,7 +375,7 @@ struct FoldersGrid: View {
                 let query = newQuery.trimmingCharacters(in: .whitespaces)
                 newName = ""; newQuery = ""
                 if !name.isEmpty {
-                    Task { await folderStore.create(name: name, query: query.isEmpty ? nil : query) }
+                    store.createFolder(name: name, query: query.isEmpty ? nil : query)
                 }
             }
             Button("Cancel", role: .cancel) { newName = ""; newQuery = "" }
@@ -397,7 +388,7 @@ struct FoldersGrid: View {
             Button("Rename") {
                 let name = renameText.trimmingCharacters(in: .whitespaces)
                 if let f = renaming, !name.isEmpty {
-                    Task { await folderStore.rename(id: f.id, name: name) }
+                    store.renameFolder(id: f.id, name: name)
                 }
                 renaming = nil
             }
@@ -408,23 +399,26 @@ struct FoldersGrid: View {
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
             titleVisibility: .visible
         ) {
-            Button("Remove Folder Only") {
-                if let f = deleting { Task { await folderStore.delete(id: f.id, deletePhotos: false) } }
+            Button("Delete Folder, Keep Photos") {
+                if let f = deleting { store.deleteFolder(id: f.id, deletePhotos: false) }
                 deleting = nil
             }
-            Button("Delete Photos Too", role: .destructive) {
-                if let f = deleting { Task { await folderStore.delete(id: f.id, deletePhotos: true) } }
-                deleting = nil
+            if deleting?.isSmart != true {
+                Button("Delete Photos Too", role: .destructive) {
+                    if let f = deleting { store.deleteFolder(id: f.id, deletePhotos: true) }
+                    deleting = nil
+                }
             }
             Button("Cancel", role: .cancel) { deleting = nil }
         } message: {
-            Text("The photos stay in your library and index either way, unless you also delete them from the index.")
+            Text(deleting?.isSmart == true
+                 ? "The smart folder is deleted. Your photos stay in your library and index."
+                 : "Delete just the folder, or also delete its photos from the index?")
         }
         .task {
-            await folderStore.load()
             // Zero-shot CLIP categorization over stored embeddings — cached
             // in the store until the photo count changes.
-            categories = store.autoCategories()
+            categories = await store.autoCategories()
         }
     }
 }
@@ -463,8 +457,10 @@ private struct CategoryCard: View {
 
 private struct FolderCard: View {
     let folder: LocalFolder
+    @ObservedObject private var store = PhotoStore.shared
 
     var body: some View {
+        let count = store.activeCount(in: folder)
         VStack(alignment: .leading, spacing: 6) {
             Color(.secondarySystemBackground)
                 .aspectRatio(1, contentMode: .fit)
@@ -473,7 +469,7 @@ private struct FolderCard: View {
                         Image(systemName: "sparkles")
                             .font(.system(size: 40))
                             .foregroundStyle(.tint)
-                    } else if let cover = folder.photoAssetIDs.last {
+                    } else if let cover = PhotoStore.shared.activeCoverAssetID(in: folder) {
                         PHImageView(assetID: cover,
                                     targetSize: CGSize(width: 400, height: 400))
                     } else {
@@ -491,7 +487,7 @@ private struct FolderCard: View {
             // Smart folders evaluate on open — no static count to show.
             Text(folder.isSmart
                  ? "Smart · \"\(folder.query ?? "")\""
-                 : "\(folder.photoAssetIDs.count) photo\(folder.photoAssetIDs.count == 1 ? "" : "s")")
+                 : "\(count) photo\(count == 1 ? "" : "s")")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -505,7 +501,6 @@ private struct FolderCard: View {
 struct FolderPhotosView: View {
     let folderID: String
     @ObservedObject private var store = PhotoStore.shared
-    @EnvironmentObject private var folderStore: FolderStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var showRename = false
@@ -513,11 +508,25 @@ struct FolderPhotosView: View {
     @State private var showEditQuery = false
     @State private var queryText = ""
     @State private var confirmDelete = false
+    @State private var photos: [LocalPhoto] = []
 
     private var folder: LocalFolder? { store.folders.first { $0.id == folderID } }
-    private var photos: [LocalPhoto] {
-        guard let folder else { return [] }
-        return store.photosForFolder(folder)   // smart folders re-run their saved search
+
+    /// Inputs that should re-run the (CLIP-heavy for smart folders) membership
+    /// query — folder identity, its saved search, manual membership edits, and
+    /// newly indexed photos. Keying .task(id:) on this keeps the search off
+    /// every body evaluation.
+    private struct LoadKey: Hashable {
+        var folderID: String
+        var query: String?
+        var memberCount: Int
+        var photoCount: Int
+    }
+    private var loadKey: LoadKey {
+        LoadKey(folderID: folderID,
+                query: folder?.query,
+                memberCount: folder?.photoAssetIDs.count ?? 0,
+                photoCount: store.photos.count)
     }
 
     var body: some View {
@@ -531,15 +540,22 @@ struct FolderPhotosView: View {
                         : "Select photos anywhere in the app and tap the folder button to add them here."))
             } else if isSmart {
                 // Membership is the query — no manual remove.
-                PhotoResultsGrid(results: photos)
+                PhotoResultsGrid(
+                    results: photos,
+                    onDelete: { id in photos.removeAll { $0.photoID == id } }
+                )
             } else {
                 PhotoResultsGrid(
                     results: photos,
+                    onDelete: { id in photos.removeAll { $0.photoID == id } },
                     onRemoveSelected: { assetIDs in
-                        Task { await folderStore.removePhotos(assetIDs, from: folderID) }
+                        store.removePhotos(assetIDs, fromFolder: folderID)
                     }
                 )
             }
+        }
+        .task(id: loadKey) {
+            photos = folder.map { store.photosForFolder($0) } ?? []
         }
         .navigationTitle(folder?.name ?? "Folder")
         .toolbar {
@@ -571,7 +587,7 @@ struct FolderPhotosView: View {
             TextField("Folder name", text: $renameText)
             Button("Rename") {
                 let name = renameText.trimmingCharacters(in: .whitespaces)
-                if !name.isEmpty { Task { await folderStore.rename(id: folderID, name: name) } }
+                if !name.isEmpty { store.renameFolder(id: folderID, name: name) }
             }
             Button("Cancel", role: .cancel) {}
         }
@@ -579,7 +595,7 @@ struct FolderPhotosView: View {
             TextField("Search query", text: $queryText)
             Button("Save") {
                 let q = queryText.trimmingCharacters(in: .whitespaces)
-                if !q.isEmpty { Task { await folderStore.setQuery(id: folderID, query: q) } }
+                if !q.isEmpty { store.setFolderQuery(id: folderID, query: q) }
             }
             Button("Cancel", role: .cancel) {}
         }
@@ -587,17 +603,21 @@ struct FolderPhotosView: View {
             "Delete \"\(folder?.name ?? "")\"?",
             isPresented: $confirmDelete, titleVisibility: .visible
         ) {
-            Button("Remove Folder Only") {
-                Task { await folderStore.delete(id: folderID, deletePhotos: false) }
+            Button("Delete Folder, Keep Photos") {
+                store.deleteFolder(id: folderID, deletePhotos: false)
                 dismiss()
             }
-            Button("Delete Photos Too", role: .destructive) {
-                Task { await folderStore.delete(id: folderID, deletePhotos: true) }
-                dismiss()
+            if folder?.isSmart != true {
+                Button("Delete Photos Too", role: .destructive) {
+                    store.deleteFolder(id: folderID, deletePhotos: true)
+                    dismiss()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The photos stay in your library and index either way, unless you also delete them from the index.")
+            Text(folder?.isSmart == true
+                 ? "The smart folder is deleted. Your photos stay in your library and index."
+                 : "Delete just the folder, or also delete its photos from the index?")
         }
     }
 }

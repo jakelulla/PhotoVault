@@ -240,34 +240,85 @@ private extension Array {
 struct DuplicatesSweepView: View {
     @ObservedObject private var store = PhotoStore.shared
     @State private var reviewing: LocalPhoto?
+    @State private var groups: [[LocalPhoto]] = []
+    @State private var hasComputed = false
+    @State private var confirmingSweep = false
+    @State private var sweeping = false
+
+    private var removableCount: Int { groups.reduce(0) { $0 + $1.count - 1 } }
 
     var body: some View {
-        let groups = store.duplicateGroups
         Group {
-            if groups.isEmpty {
+            if !hasComputed {
+                ProgressView()
+            } else if groups.isEmpty {
                 ContentUnavailableView(
                     "No duplicates", systemImage: "checkmark.circle",
                     description: Text("Near-identical photos are grouped automatically as your library is indexed."))
             } else {
                 List {
                     Section {
-                        ForEach(groups, id: \.first!.assetID) { group in
+                        ForEach(groups, id: \.first?.assetID) { group in
                             Button { reviewing = group.first } label: {
                                 GroupRow(group: group)
                             }
                             .foregroundStyle(.primary)
                         }
                     } header: {
-                        let removable = groups.reduce(0) { $0 + $1.count - 1 }
-                        Text("\(groups.count) group\(groups.count == 1 ? "" : "s") · \(removable) photo\(removable == 1 ? "" : "s") could be removed")
+                        Text("\(groups.count) group\(groups.count == 1 ? "" : "s") · \(removableCount) photo\(removableCount == 1 ? "" : "s") could be removed")
                     }
                 }
             }
         }
         .navigationTitle("Duplicates")
+        // duplicateGroups is a full library scan — computing it in body
+        // re-ran it on every @Published change while indexing. Compute it
+        // off the render path and refresh only when membership changes.
+        .task(id: "\(store.photos.count)-\(store.membershipVersion)") {
+            groups = store.duplicateGroups
+            hasComputed = true
+        }
+        .safeAreaInset(edge: .bottom) {
+            if !groups.isEmpty {
+                Button { confirmingSweep = true } label: {
+                    Text("Keep Newest in Every Group")
+                        .bold().frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(sweeping)
+                .padding()
+                .background(.ultraThinMaterial)
+            }
+        }
+        .overlay { if sweeping { Color.black.opacity(0.2).ignoresSafeArea(); ProgressView().controlSize(.large) } }
+        .confirmationDialog(
+            "Keep newest in every group?",
+            isPresented: $confirmingSweep, titleVisibility: .visible
+        ) {
+            Button("Remove \(removableCount) Photo\(removableCount == 1 ? "" : "s")", role: .destructive) {
+                sweepKeepNewest()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\(removableCount) photo\(removableCount == 1 ? "" : "s") will be removed from Search, People, and Places — only the newest photo in each of the \(groups.count) group\(groups.count == 1 ? "" : "s") is kept. Your camera roll isn't affected.")
+        }
         .sheet(item: $reviewing) { photo in
             DuplicatesView(photoID: photo.photoID) { _ in }
         }
+    }
+
+    private func sweepKeepNewest() {
+        sweeping = true
+        for group in groups {
+            guard group.count > 1,
+                  let newest = group.max(by: {
+                      ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast)
+                  }) else { continue }
+            _ = PhotoStore.shared.keepDuplicates(groupOf: newest.photoID,
+                                                 keepIDs: [newest.photoID])
+        }
+        groups = store.duplicateGroups   // refresh now; .task(id:) also re-fires
+        sweeping = false
     }
 
     private struct GroupRow: View {

@@ -3,7 +3,6 @@ import SwiftUI
 
 /// Distinct tagged places. Tap a thumbnail to see its photos.
 struct LocationsView: View {
-    @EnvironmentObject private var folderStore: FolderStore
     @ObservedObject private var store = PhotoStore.shared
     @State private var labels: [String: String] = [:]
     @State private var openLocation: LocalLocation?

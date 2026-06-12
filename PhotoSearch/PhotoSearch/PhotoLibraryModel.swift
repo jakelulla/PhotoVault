@@ -122,10 +122,11 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
         }
     }
 
-    /// Evenly spaced frames from a video (10%/50%/90%), JPEG-encoded at
-    /// ≤1280px — the indexer CLIP-embeds each and averages so a video is
-    /// findable by anything that appears in it, and faces are picked up
-    /// from every sampled frame.
+    /// Evenly spaced frames from a video — about one per 10 seconds of
+    /// footage (1…8 frames, sampled at the midpoint of equal segments) —
+    /// JPEG-encoded at ≤1280px. The indexer CLIP-embeds each frame so a
+    /// video is findable by anything that appears in it, and faces are
+    /// picked up from every sampled frame.
     func videoFrameData(for asset: PHAsset, maxPixel: CGFloat = 1280) async -> [Data] {
         let state = PHRequestCancellationState(manager: PHImageManager.default())
         let avAsset: AVAsset? = await withTaskCancellationHandler {
@@ -149,12 +150,18 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
         gen.maximumSize = CGSize(width: maxPixel, height: maxPixel)
         let duration = asset.duration > 0 ? asset.duration
             : ((try? await avAsset.load(.duration).seconds) ?? 0)
-        let fractions: [Double] = duration > 3 ? [0.1, 0.5, 0.9] : [0.5]
+        // ~1 frame per 10s, clamped to 1 (short clips) … 8 (long videos),
+        // each taken at the midpoint of an equal segment so coverage stays
+        // even at any length (a single frame lands at 50%, as before).
+        let count = max(1, min(8, Int((duration / 10).rounded(.up))))
+        let fractions = (0..<count).map { (Double($0) + 0.5) / Double(count) }
         var frames: [Data] = []
         for f in fractions {
-            // An expiring background task cancels mid-run — return what's
-            // collected so far instead of risking a watchdog kill.
-            if Task.isCancelled { break }
+            // An expiring background task cancels mid-run. Return [] (not
+            // partial frames): a partially sampled video would be indexed
+            // permanently with reduced coverage, and contains() blocks any
+            // re-index. Failing cleanly lets the next window do it fully.
+            if Task.isCancelled { return [] }
             let t = CMTime(seconds: max(0, duration * f), preferredTimescale: 600)
             if let cg = try? await gen.image(at: t).image,
                let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.85) {

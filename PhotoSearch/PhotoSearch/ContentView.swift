@@ -4,7 +4,6 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var library = PhotoLibraryModel()
     @StateObject private var indexer = Indexer()
-    @StateObject private var folderStore = FolderStore()
 
     var body: some View {
         Group {
@@ -13,7 +12,6 @@ struct ContentView: View {
                 MainTabs()
                     .environmentObject(library)
                     .environmentObject(indexer)
-                    .environmentObject(folderStore)
                     .task {
                         await indexer.indexNewPhotos(from: library)
                     }
