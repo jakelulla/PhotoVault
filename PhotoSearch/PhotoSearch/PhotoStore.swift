@@ -333,6 +333,11 @@ final class PhotoStore: ObservableObject {
     // MARK: - Global re-clustering
 
     @Published private(set) var isReclustering = false
+    /// Bumped whenever soft-delete membership changes (delete/restore/prune).
+    /// photos.count is unchanged by those, so caches and views keyed on count
+    /// alone would go stale — key on this too.
+    @Published private(set) var membershipVersion = 0
+    private var reclusterPending = false
 
     /// Rebuild People from scratch with a global DBSCAN over every stored
     /// face embedding — the same algorithm (and thresholds) the Python
@@ -341,12 +346,24 @@ final class PhotoStore: ObservableObject {
     /// sees all faces at once. User-assigned names are carried onto the
     /// best-matching new clusters by prototype similarity.
     func reclusterPeople() async {
-        guard !isReclustering else { return }
+        // Coalesce instead of drop: a request arriving mid-recluster runs one
+        // more pass when the current one finishes (its snapshot may predate
+        // e.g. a just-restored photo — silently returning would leave that
+        // photo out of People until the next big indexing batch).
+        guard !isReclustering else { reclusterPending = true; return }
         isReclustering = true
         defer { isReclustering = false }
+        repeat {
+            reclusterPending = false
+            await reclusterPass()
+        } while reclusterPending
+    }
 
-        // Snapshots for the off-main compute.
-        let validAssets = Set(photoIndex.keys)
+    private func reclusterPass() async {
+        // Snapshots for the off-main compute. Exclude soft-deleted photos —
+        // their faces are still in the log, and including them would
+        // resurrect in-app-deleted photos into People clusters.
+        let validAssets = Set(photos.lazy.filter { !$0.isDeleted }.map(\.assetID))
         let log = faceLog
         let previousNames = clusters
             .filter { $0.mergedInto == nil && !$0.isDeleted }
@@ -499,11 +516,55 @@ final class PhotoStore: ObservableObject {
         for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { $0 == assetID } }
         for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { $0 == assetID } }
         for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { $0 == assetID } }
+        membershipVersion += 1
         schedulePersist()
     }
 
     func deletePhoto(photoID: Int) {
         if let p = photos.first(where: { $0.photoID == photoID }) { deletePhoto(assetID: p.assetID) }
+    }
+
+    /// Un-hide photos previously deleted in-app (their assets still exist in
+    /// the camera roll). Everything heavy survives soft-deletion — CLIP
+    /// embedding, face-log entries, metadata — so restoring is instant.
+    /// Location buckets re-attach here; People membership returns on the
+    /// next reclusterPeople() (deletePhoto stripped it, and the reclusterer
+    /// keys off non-deleted photos). Folder membership is NOT restored —
+    /// deletePhoto destroys it and nothing records which folders held the
+    /// photo.
+    @discardableResult
+    func restorePhotos(_ assetIDs: Set<String>) -> Int {
+        var restored = 0
+        for assetID in assetIDs {
+            guard let idx = photoIndex[assetID], photos[idx].isDeleted else { continue }
+            photos[idx].isDeleted = false
+            restored += 1
+            if let name = photos[idx].locationName {
+                if let li = locations.firstIndex(where: { $0.name == name }),
+                   !locations[li].photoAssetIDs.contains(assetID) {
+                    locations[li].photoAssetIDs.append(assetID)
+                }
+            } else if let lat = photos[idx].lat, let lon = photos[idx].lon {
+                // Deleted before its geocode resolved — re-enqueue, otherwise
+                // it would wait for the next app launch to get a place.
+                enqueueGeocode(assetID: assetID, lat: lat, lon: lon)
+            }
+            // Re-pair duplicates: if its twin was "kept" while this one was
+            // deleted, the twin's dupGroupID was cleared — re-check so the
+            // pair is visible to the sweep again. (Copy out/in to avoid
+            // overlapping access: the check walks the photos array.)
+            if photos[idx].dupGroupID == nil,
+               let emb = clipEmbeddings[assetID], !emb.isEmpty {
+                var p = photos[idx]
+                markDuplicateIfNeeded(&p, embedding: emb)
+                photos[idx] = p
+            }
+        }
+        if restored > 0 {
+            membershipVersion += 1
+            schedulePersist()
+        }
+        return restored
     }
 
     /// Mark assets that were deleted from the system photo library as gone
@@ -520,6 +581,7 @@ final class PhotoStore: ObservableObject {
         for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { assetIDs.contains($0) } }
         for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { assetIDs.contains($0) } }
         for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        membershipVersion += 1
         schedulePersist()
     }
 
@@ -686,14 +748,15 @@ final class PhotoStore: ObservableObject {
 
     // MARK: - Auto-categories (zero-shot CLIP)
 
-    private var categoryCache: (photoCount: Int, result: [String: [LocalPhoto]])?
+    private var categoryCache: (photoCount: Int, version: Int, result: [String: [LocalPhoto]])?
 
     /// Score every photo against each category's text prompts. Prompt
     /// embeddings are computed once per call (a few CLIPText inferences);
     /// the scoring is vDSP over stored embeddings. Cached until the photo
     /// count changes.
     func autoCategories() -> [(category: AutoCategory, photos: [LocalPhoto])] {
-        if let cached = categoryCache, cached.photoCount == photos.count {
+        if let cached = categoryCache, cached.photoCount == photos.count,
+           cached.version == membershipVersion {
             return AutoCategorizer.categories.compactMap { cat in
                 guard let ps = cached.result[cat.id], !ps.isEmpty else { return nil }
                 return (cat, ps)
@@ -718,7 +781,7 @@ final class PhotoStore: ObservableObject {
                 .sorted { ($0.0.createdAt ?? .distantPast) > ($1.0.createdAt ?? .distantPast) }
                 .map(\.0)
         }
-        categoryCache = (photos.count, result)
+        categoryCache = (photos.count, membershipVersion, result)
         return AutoCategorizer.categories.compactMap { cat in
             guard let ps = result[cat.id], !ps.isEmpty else { return nil }
             return (cat, ps)

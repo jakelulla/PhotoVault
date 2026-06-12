@@ -1,8 +1,17 @@
 import Photos
+import PhotosUI
 import SwiftUI
 
 private enum LibraryMode: String, CaseIterable {
     case years = "Years", months = "Months", all = "All", folders = "Folders"
+}
+
+/// Result of comparing the index against the camera roll, driving the
+/// sync confirmation dialog.
+private struct SyncPlan {
+    var newCount: Int            // in camera roll, never indexed
+    var goneIDs: Set<String>     // indexed + active, no longer in camera roll
+    var excludedIDs: Set<String> // deleted in-app, still in camera roll
 }
 
 struct LibraryBrowseView: View {
@@ -11,6 +20,11 @@ struct LibraryBrowseView: View {
     @EnvironmentObject private var library: PhotoLibraryModel
     @ObservedObject private var store = PhotoStore.shared
     @State private var mode: LibraryMode = .all
+
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var syncPlan: SyncPlan? = nil
+    @State private var showSyncDialog = false
+    @State private var resultMessage: String? = nil
 
     var body: some View {
         NavigationStack {
@@ -26,7 +40,19 @@ struct LibraryBrowseView: View {
             }
             .navigationTitle("Photos")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    // Add photos from the camera roll: new ones index, ones
+                    // deleted in-app are restored, already-present are no-ops.
+                    PhotosPicker(selection: $pickerItems,
+                                 matching: .any(of: [.images, .videos]),
+                                 photoLibrary: .shared()) {
+                        Image(systemName: "plus")
+                    }
+                    // Sync: make the app match the camera roll, with a choice
+                    // about photos previously deleted in-app.
+                    Button { Task { await prepareSync() } } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
                     NavigationLink {
                         DuplicatesSweepView()
                     } label: {
@@ -34,8 +60,145 @@ struct LibraryBrowseView: View {
                     }
                 }
             }
+            .onChange(of: pickerItems) { _, items in
+                guard !items.isEmpty else { return }
+                handlePicked(items)
+            }
+            .confirmationDialog(
+                "Sync with Camera Roll",
+                isPresented: $showSyncDialog,
+                titleVisibility: .visible,
+                presenting: syncPlan
+            ) { plan in
+                Button("Add Back \(plan.excludedIDs.count) Removed") {
+                    executeSync(plan, restoreExcluded: true)
+                }
+                Button("Keep \(plan.excludedIDs.count) Removed Out") {
+                    executeSync(plan, restoreExcluded: false)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { plan in
+                Text(syncDialogMessage(plan))
+            }
+            .alert("Library", isPresented: Binding(
+                get: { resultMessage != nil },
+                set: { if !$0 { resultMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(resultMessage ?? "")
+            }
         }
         .task { await folderStore.load() }
+    }
+
+    // MARK: - Add from camera roll
+
+    private func handlePicked(_ items: [PhotosPickerItem]) {
+        let pickedIDs = items.compactMap(\.itemIdentifier)
+        pickerItems = []
+        guard !pickedIDs.isEmpty else { return }
+
+        var deletedByID: Set<String> = []
+        var activeByID: Set<String> = []
+        for p in store.photos {
+            if p.isDeleted { deletedByID.insert(p.assetID) } else { activeByID.insert(p.assetID) }
+        }
+
+        let toRestore = Set(pickedIDs.filter { deletedByID.contains($0) })
+        let newIDs    = pickedIDs.filter { !deletedByID.contains($0) && !activeByID.contains($0) }
+        let already   = pickedIDs.count - toRestore.count - newIDs.count
+
+        let restored = store.restorePhotos(toRestore)
+
+        var parts: [String] = []
+        if !newIDs.isEmpty { parts.append("\(newIDs.count) new photo\(newIDs.count == 1 ? "" : "s") queued for indexing") }
+        if restored > 0 { parts.append("\(restored) restored") }
+        if already > 0 { parts.append("\(already) already in the app") }
+        resultMessage = parts.isEmpty ? "Nothing to add." : parts.joined(separator: ", ") + "."
+
+        Task {
+            // Recluster FIRST so a restored photo rejoins People immediately
+            // instead of waiting behind a potentially long indexing pass.
+            if restored > 0 {
+                await store.reclusterPeople()
+            }
+            if !newIDs.isEmpty {
+                // New picks arrive in library.assets via the change observer
+                // (or are already there); the indexer skips everything else.
+                await indexer.indexNewPhotos(from: library)
+            }
+        }
+    }
+
+    // MARK: - Sync with camera roll
+
+    private func prepareSync() async {
+        // Snapshot camera-roll IDs off the main thread — enumerating tens of
+        // thousands of PHAssets on tap would visibly hang the UI.
+        let rollIDs = await Task.detached(priority: .userInitiated) { () -> Set<String> in
+            var ids = Set<String>()
+            PHAsset.fetchAssets(with: PHFetchOptions()).enumerateObjects { asset, _, _ in
+                ids.insert(asset.localIdentifier)
+            }
+            return ids
+        }.value
+
+        // Under limited photo access the fetch only sees the user-selected
+        // subset — treating everything else as "gone" would mass-remove the
+        // index (and irreversibly strip folder membership). Only prune with
+        // full access.
+        let fullAccess = library.status == .authorized
+
+        var gone: Set<String> = []
+        var excluded: Set<String> = []
+        var known: Set<String> = []
+        for p in store.photos {
+            known.insert(p.assetID)
+            if p.isDeleted {
+                if rollIDs.contains(p.assetID) { excluded.insert(p.assetID) }
+            } else if fullAccess && !rollIDs.contains(p.assetID) {
+                gone.insert(p.assetID)
+            }
+        }
+        let newCount = rollIDs.subtracting(known).count
+
+        let plan = SyncPlan(newCount: newCount, goneIDs: gone, excludedIDs: excluded)
+        if plan.excludedIDs.isEmpty {
+            // Nothing to ask — just reconcile.
+            executeSync(plan, restoreExcluded: false)
+        } else {
+            syncPlan = plan
+            showSyncDialog = true
+        }
+    }
+
+    private func syncDialogMessage(_ plan: SyncPlan) -> String {
+        var lines: [String] = []
+        if plan.newCount > 0 { lines.append("\(plan.newCount) new photo\(plan.newCount == 1 ? "" : "s") will be added.") }
+        if !plan.goneIDs.isEmpty { lines.append("\(plan.goneIDs.count) no longer in your camera roll will be removed.") }
+        lines.append("You removed \(plan.excludedIDs.count) photo\(plan.excludedIDs.count == 1 ? "" : "s") in the app — add them back or keep them out?")
+        return lines.joined(separator: " ")
+    }
+
+    private func executeSync(_ plan: SyncPlan, restoreExcluded: Bool) {
+        let restored = restoreExcluded ? store.restorePhotos(plan.excludedIDs) : 0
+        if !plan.goneIDs.isEmpty { store.pruneDeletedAssets(plan.goneIDs) }
+
+        var parts: [String] = []
+        if plan.newCount > 0 { parts.append("\(plan.newCount) new queued for indexing") }
+        if restored > 0 { parts.append("\(restored) restored") }
+        if !plan.goneIDs.isEmpty { parts.append("\(plan.goneIDs.count) removed (gone from camera roll)") }
+        resultMessage = parts.isEmpty ? "Already in sync." : "Sync: " + parts.joined(separator: ", ") + "."
+
+        Task {
+            if restored > 0 {
+                await store.reclusterPeople()  // restored faces rejoin People first
+            }
+            if plan.newCount > 0 {
+                await indexer.indexNewPhotos(from: library)
+            }
+        }
     }
 
     @ViewBuilder private var content: some View {
@@ -48,7 +211,10 @@ struct LibraryBrowseView: View {
             if store.photos.isEmpty {
                 AllAssetsGrid(assets: library.assets)
             } else {
-                AllIndexedGrid()
+                // membershipVersion id: restore/delete/prune don't change
+                // photos.count, but they must refresh this grid's paged
+                // snapshot — recreate it so restored photos appear at once.
+                AllIndexedGrid().id(store.membershipVersion)
             }
         case .years:   periodContent(buckets: store.yearsIndex)
         case .months:  periodContent(buckets: store.monthsIndex)
