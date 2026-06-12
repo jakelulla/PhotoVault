@@ -1,0 +1,20 @@
+# Backend + ML pipeline dependencies. Install into a Python 3.12 venv.
+fastapi
+uvicorn[standard]
+numpy
+pillow
+opencv-python
+scikit-learn
+tqdm
+# Face pipeline (mirrors algorithm_scripting/utils.py)
+onnxruntime
+insightface
+# CLIP caption search
+torch
+torchvision
+open_clip_torch
+matplotlib
+reverse_geocoder
+piexif
+pillow-heif
+python-multipart
