@@ -243,12 +243,7 @@ private struct Thumb: View {
         }
         .overlay(alignment: .bottomLeading) {
             if photo.video {
-                Label(photo.durationText, systemImage: "play.fill")
-                    .font(.caption2.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 5).padding(.vertical, 2)
-                    .background(.black.opacity(0.55), in: Capsule())
-                    .padding(4)
+                VideoDurationBadge(duration: photo.duration ?? 0)
             }
         }
         .opacity(selecting && !selected ? 0.55 : 1)
@@ -257,5 +252,23 @@ private struct Thumb: View {
                 dupCount = PhotoStore.shared.duplicateGroup(for: photo.assetID).count
             }
         }
+    }
+}
+
+// MARK: - Video duration badge
+
+/// "▶ 0:42" capsule overlaid on video cells so they're distinguishable
+/// from stills at a glance. Shared by the search, browse, and duplicate grids.
+struct VideoDurationBadge: View {
+    let duration: TimeInterval
+
+    var body: some View {
+        let s = Int(duration)
+        Label(String(format: "%d:%02d", s / 60, s % 60), systemImage: "play.fill")
+            .font(.caption2.bold())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(.black.opacity(0.55), in: Capsule())
+            .padding(4)
     }
 }

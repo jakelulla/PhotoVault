@@ -73,17 +73,30 @@ final class Indexer: ObservableObject {
     @Published private(set) var processed  = 0
     @Published private(set) var enqueueing = false
 
-    private var hasRun   = false
+    private var isRunning    = false
+    private var pendingRerun = false
     /// One worker per pipeline slot: fetch/decode of one photo overlaps model
     /// inference of another, keeping both the CPU and the Neural Engine busy.
     /// MLModel.prediction is thread-safe, so concurrent workers share the
     /// engine's loaded models.
     private let workers  = [MLWorker(), MLWorker(), MLWorker()]
 
+    /// Indexes every not-yet-indexed asset. Safe to call repeatedly (launch,
+    /// library-change notifications): overlapping calls coalesce into one
+    /// extra pass after the current run, so assets inserted mid-run still get
+    /// picked up. A cancelled run (expired background window) does not rerun.
     func indexNewPhotos(from library: PhotoLibraryModel) async {
-        guard !hasRun else { return }
-        hasRun = true
+        if isRunning { pendingRerun = true; return }
+        isRunning = true
+        defer { isRunning = false }
 
+        repeat {
+            pendingRerun = false
+            await runIndexPass(from: library)
+        } while pendingRerun && !Task.isCancelled
+    }
+
+    private func runIndexPass(from library: PhotoLibraryModel) async {
         let ml    = OnDeviceMLEngine.shared
         let store = PhotoStore.shared
 
@@ -173,9 +186,6 @@ final class Indexer: ObservableObject {
             }
         }
         store.persist()
-        // A cancelled (expired background window) run is incomplete — allow
-        // the next indexNewPhotos call to pick up where it left off.
-        if Task.isCancelled { hasRun = false }
 
         // Global re-cluster after a substantial batch (mirrors the backend:
         // small increments use the live greedy assignment; big batches get
@@ -189,6 +199,5 @@ final class Indexer: ObservableObject {
     func resetTracking() {
         PhotoStore.shared.resetIndex()
         processed = 0; total = 0
-        hasRun = false
     }
 }

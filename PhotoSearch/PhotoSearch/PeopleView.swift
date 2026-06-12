@@ -11,6 +11,7 @@ struct PeopleView: View {
     @State private var openCluster: PersonCluster?
     @State private var membersOf: PersonCluster?
     @State private var pendingMerge: PendingMerge?
+    @State private var pendingDelete: PersonCluster?
     @State private var showReindexConfirm = false
     @FocusState private var focusedID: Int?
 
@@ -75,6 +76,15 @@ struct PeopleView: View {
             } message: { merge in
                 Text("\(label(merge.source)) and \(label(merge.target)) will be combined.")
             }
+            .confirmationDialog("Remove this person?",
+                                isPresented: deleteConfirmShown,
+                                titleVisibility: .visible,
+                                presenting: pendingDelete) { cluster in
+                Button("Remove", role: .destructive) { deleteCluster(cluster) }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text("This removes the grouping only. The photos stay in your library.")
+            }
         }
         .onAppear {
             for p in people { names[p.id] = p.name ?? "" }
@@ -86,6 +96,10 @@ struct PeopleView: View {
 
     private var mergeAlertShown: Binding<Bool> {
         Binding(get: { pendingMerge != nil }, set: { if !$0 { pendingMerge = nil } })
+    }
+
+    private var deleteConfirmShown: Binding<Bool> {
+        Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })
     }
 
     private func label(_ id: Int) -> String {
@@ -107,7 +121,7 @@ struct PeopleView: View {
                         focusedID: $focusedID,
                         onSave: { saveName(cluster.id) },
                         onOpen: { openCluster = cluster },
-                        onDelete: { deleteCluster(cluster) },
+                        onDelete: { pendingDelete = cluster },
                         onShowMembers: { membersOf = cluster },
                         onMerge: { source in
                             pendingMerge = PendingMerge(source: source, target: cluster.id)

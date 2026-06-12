@@ -82,6 +82,11 @@ struct DuplicatesView: View {
                         .padding(5)
                         .highPriorityGesture(TapGesture().onEnded { toggle(p.photoID) })
                 }
+                .overlay(alignment: .bottomLeading) {
+                    if p.video {
+                        VideoDurationBadge(duration: p.duration ?? 0)
+                    }
+                }
         }
         .buttonStyle(.plain)
     }
@@ -214,7 +219,11 @@ private struct ReviewerPage: View {
     @Binding var isZoomed: Bool
 
     var body: some View {
-        PHFullImageView(assetID: photo.assetID, isZoomed: $isZoomed)
+        if photo.video {
+            VideoPage(assetID: photo.assetID)
+        } else {
+            PHFullImageView(assetID: photo.assetID, isZoomed: $isZoomed)
+        }
     }
 }
 

@@ -122,6 +122,11 @@ private struct AllAssetsGrid: View {
                                 .frame(width: side, height: side)
                                 .clipped()
                                 .contentShape(Rectangle())
+                                .overlay(alignment: .bottomLeading) {
+                                    if asset.mediaType == .video {
+                                        VideoDurationBadge(duration: asset.duration)
+                                    }
+                                }
                         }
                         .buttonStyle(.plain)
                     }
@@ -151,8 +156,14 @@ private struct AssetPageViewer: View {
         NavigationStack {
             TabView(selection: $selection) {
                 ForEach(Array(assets.enumerated()), id: \.element.localIdentifier) { idx, asset in
-                    PHFullImageView(assetID: asset.localIdentifier, isZoomed: $isZoomed)
-                        .tag(idx)
+                    Group {
+                        if asset.mediaType == .video {
+                            VideoPage(assetID: asset.localIdentifier)
+                        } else {
+                            PHFullImageView(assetID: asset.localIdentifier, isZoomed: $isZoomed)
+                        }
+                    }
+                    .tag(idx)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))

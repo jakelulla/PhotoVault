@@ -15,10 +15,11 @@ struct PhotoSearchApp: App {
         }
         .onChange(of: scenePhase) { _, phase in
             // Whenever the user leaves the app, ask iOS for a background
-            // window to keep indexing (no-op if indexing is already done —
-            // the indexer skips already-indexed photos and exits).
+            // window to keep indexing — but only while unindexed assets
+            // remain, so a fully indexed library doesn't keep iOS waking
+            // the app for nothing.
             if phase == .background {
-                BackgroundIndexer.schedule()
+                BackgroundIndexer.scheduleIfWorkRemains()
             }
         }
     }

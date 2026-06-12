@@ -168,6 +168,7 @@ final class PhotoStore: ObservableObject {
     }
 
     func persist() {
+        indexesSincePersist = 0
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
         try? enc.encode(photos).write(to: Self.photosURL, options: .atomic)
         try? enc.encode(clusters).write(to: Self.clustersURL, options: .atomic)
@@ -179,6 +180,10 @@ final class PhotoStore: ObservableObject {
     }
 
     private var persistTask: Task<Void, Never>?
+    /// index() calls since the last persist — drives the forced flush in
+    /// index() (the debounce alone never fires during continuous indexing).
+    private var indexesSincePersist = 0
+
     func schedulePersist() {
         persistTask?.cancel()
         persistTask = Task {
@@ -235,7 +240,16 @@ final class PhotoStore: ObservableObject {
             enqueueGeocode(assetID: assetID, lat: lat, lon: lon)
         }
 
-        schedulePersist()
+        // The 3s debounce never fires during continuous indexing (every
+        // photo resets it), so force a flush every 200 photos — a mid-run
+        // kill then loses at most the last batch, not the whole session.
+        indexesSincePersist += 1
+        if indexesSincePersist >= 200 {
+            persistTask?.cancel()
+            persist()
+        } else {
+            schedulePersist()
+        }
     }
 
     // MARK: - Duplicate detection
@@ -490,6 +504,23 @@ final class PhotoStore: ObservableObject {
 
     func deletePhoto(photoID: Int) {
         if let p = photos.first(where: { $0.photoID == photoID }) { deletePhoto(assetID: p.assetID) }
+    }
+
+    /// Mark assets that were deleted from the system photo library as gone
+    /// in the index too. Same bookkeeping as deletePhoto, minus the library
+    /// deletion (these assets no longer exist there).
+    func pruneDeletedAssets(_ assetIDs: Set<String>) {
+        var pruned = false
+        for assetID in assetIDs {
+            guard let idx = photoIndex[assetID], !photos[idx].isDeleted else { continue }
+            photos[idx].isDeleted = true
+            pruned = true
+        }
+        guard pruned else { return }
+        for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        schedulePersist()
     }
 
     // MARK: - People
@@ -871,10 +902,14 @@ final class PhotoStore: ObservableObject {
 
         var results = photos.filter { !$0.isDeleted }
 
-        // Folder filter
+        // Folder filter. Smart folders keep photoAssetIDs empty — membership
+        // is their saved query, so resolve it the way photosForFolder does
+        // (which calls back in with a nil folderID, so no recursion).
         if let fid = folderID, !fid.isEmpty,
            let folder = folders.first(where: { $0.id == fid }) {
-            let ids = Set(folder.photoAssetIDs)
+            let ids = folder.isSmart
+                ? Set(photosForFolder(folder).map(\.assetID))
+                : Set(folder.photoAssetIDs)
             results = results.filter { ids.contains($0.assetID) }
         }
 

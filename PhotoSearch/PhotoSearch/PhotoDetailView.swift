@@ -83,7 +83,7 @@ private struct PhotoPage: View {
     var body: some View {
         ZStack {
             if photo.video {
-                VideoPage(photo: photo)
+                VideoPage(assetID: photo.assetID)
             } else {
                 PHFullImageView(assetID: photo.assetID, isZoomed: $isZoomed)
             }
@@ -113,8 +113,10 @@ private struct PhotoPage: View {
 
 // MARK: - Video playback
 
-private struct VideoPage: View {
-    let photo: LocalPhoto
+/// Full-screen AVPlayer page for one video asset. Shared by the detail
+/// viewer, the pre-index browse viewer, and the duplicate reviewer.
+struct VideoPage: View {
+    let assetID: String
     @State private var player: AVPlayer?
 
     var body: some View {
@@ -127,7 +129,7 @@ private struct VideoPage: View {
         }
         .task {
             guard player == nil,
-                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [photo.assetID],
+                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetID],
                                                   options: nil).firstObject else { return }
             let opts = PHVideoRequestOptions()
             opts.isNetworkAccessAllowed = true

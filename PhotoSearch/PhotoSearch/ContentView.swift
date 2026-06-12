@@ -17,6 +17,11 @@ struct ContentView: View {
                     .task {
                         await indexer.indexNewPhotos(from: library)
                     }
+                    // Photos taken (or synced in) after launch: the library's
+                    // change observer bumps the token; index the new arrivals.
+                    .onChange(of: library.libraryChangeToken) {
+                        Task { await indexer.indexNewPhotos(from: library) }
+                    }
             case .denied, .restricted:
                 AccessDeniedView()
             default:

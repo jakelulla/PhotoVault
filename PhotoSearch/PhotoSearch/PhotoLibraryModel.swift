@@ -5,11 +5,25 @@ import SwiftUI
 /// Photo-library authorization + access to the device's photos. The Photos tab
 /// shows these immediately; the Indexer ships them to the Mac for embedding.
 @MainActor
-final class PhotoLibraryModel: ObservableObject {
+final class PhotoLibraryModel: NSObject, ObservableObject {
     @Published var status: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published var assets: [PHAsset] = []
+    /// Bumped whenever the system library gains or loses assets (photo taken,
+    /// deletion, iCloud sync) — ContentView watches it to kick a fresh index pass.
+    @Published private(set) var libraryChangeToken = 0
 
     private let imageManager = PHCachingImageManager()
+    /// Live fetch result the change observer diffs against.
+    private var fetchResult: PHFetchResult<PHAsset>?
+
+    override init() {
+        super.init()
+        PHPhotoLibrary.shared().register(self)
+    }
+
+    deinit {
+        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+    }
 
     var isAuthorized: Bool { status == .authorized || status == .limited }
 
@@ -35,10 +49,47 @@ final class PhotoLibraryModel: ObservableObject {
                                         PHAssetMediaType.image.rawValue,
                                         PHAssetMediaType.video.rawValue)
         let result = PHAsset.fetchAssets(with: options)
+        fetchResult = result
         var fetched: [PHAsset] = []
         fetched.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in fetched.append(asset) }
         assets = fetched
+    }
+
+    /// Applies a Photos change notification: swaps in the post-change fetch
+    /// result, refreshes `assets`, prunes deleted photos from the index, and
+    /// bumps `libraryChangeToken` so new photos get indexed.
+    private func applyLibraryChange(_ change: PHChange) {
+        guard let fetchResult,
+              let details = change.changeDetails(for: fetchResult) else { return }
+        let after = details.fetchResultAfterChanges
+        self.fetchResult = after
+
+        var fetched: [PHAsset] = []
+        fetched.reserveCapacity(after.count)
+        after.enumerateObjects { asset, _, _ in fetched.append(asset) }
+
+        let inserted: Bool
+        let removedIDs: Set<String>
+        if details.hasIncrementalChanges {
+            inserted   = !details.insertedObjects.isEmpty
+            removedIDs = Set(details.removedObjects.map(\.localIdentifier))
+        } else {
+            // No per-object diff available (huge change) — compare identifier
+            // sets so deletions still get pruned from the index.
+            let oldIDs = Set(assets.map(\.localIdentifier))
+            let newIDs = Set(fetched.map(\.localIdentifier))
+            inserted   = !newIDs.subtracting(oldIDs).isEmpty
+            removedIDs = oldIDs.subtracting(newIDs)
+        }
+        assets = fetched
+
+        if !removedIDs.isEmpty {
+            PhotoStore.shared.pruneDeletedAssets(removedIDs)
+        }
+        if inserted || !removedIDs.isEmpty {
+            libraryChangeToken += 1
+        }
     }
 
     func requestImage(for asset: PHAsset, targetSize: CGSize, contentMode: PHImageContentMode,
@@ -76,13 +127,21 @@ final class PhotoLibraryModel: ObservableObject {
     /// findable by anything that appears in it, and faces are picked up
     /// from every sampled frame.
     func videoFrameData(for asset: PHAsset, maxPixel: CGFloat = 1280) async -> [Data] {
-        let avAsset: AVAsset? = await withCheckedContinuation { cont in
-            let opts = PHVideoRequestOptions()
-            opts.isNetworkAccessAllowed = true
-            opts.deliveryMode = .mediumQualityFormat
-            PHImageManager.default().requestAVAsset(forVideo: asset, options: opts) { av, _, _ in
-                cont.resume(returning: av)
+        let state = PHRequestCancellationState(manager: PHImageManager.default())
+        let avAsset: AVAsset? = await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                let opts = PHVideoRequestOptions()
+                opts.isNetworkAccessAllowed = true
+                opts.deliveryMode = .mediumQualityFormat
+                let id = PHImageManager.default().requestAVAsset(forVideo: asset, options: opts) { av, _, _ in
+                    // Cancel + completion can race; only the first one resumes.
+                    guard state.takeResume() else { return }
+                    cont.resume(returning: av)
+                }
+                state.register(id)
             }
+        } onCancel: {
+            state.cancel()
         }
         guard let avAsset else { return [] }
         let gen = AVAssetImageGenerator(asset: avAsset)
@@ -93,6 +152,9 @@ final class PhotoLibraryModel: ObservableObject {
         let fractions: [Double] = duration > 3 ? [0.1, 0.5, 0.9] : [0.5]
         var frames: [Data] = []
         for f in fractions {
+            // An expiring background task cancels mid-run — return what's
+            // collected so far instead of risking a watchdog kill.
+            if Task.isCancelled { break }
             let t = CMTime(seconds: max(0, duration * f), preferredTimescale: 600)
             if let cg = try? await gen.image(at: t).image,
                let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.85) {
@@ -106,20 +168,88 @@ final class PhotoLibraryModel: ObservableObject {
     /// backfill — much cheaper than the full original, and its perceptual hash
     /// still matches the full-res upload so the backend dedups against it.
     /// `.highQualityFormat` yields a single (non-degraded) callback, so the
-    /// continuation resumes exactly once.
+    /// continuation resumes exactly once. Cancellation aborts the request
+    /// (e.g. a stuck iCloud download) so an expiring background task can't
+    /// hang past its deadline.
     func thumbnailData(for asset: PHAsset, maxPixel: CGFloat) async -> Data? {
-        await withCheckedContinuation { continuation in
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            options.resizeMode = .fast
-            let target = CGSize(width: maxPixel, height: maxPixel)
-            imageManager.requestImage(for: asset, targetSize: target, contentMode: .aspectFit,
-                                      options: options) { image, info in
-                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if degraded { return }   // wait for the final, full-quality result
-                continuation.resume(returning: image?.jpegData(compressionQuality: 0.9))
+        let state = PHRequestCancellationState(manager: imageManager)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = PHImageRequestOptions()
+                options.isNetworkAccessAllowed = true
+                options.deliveryMode = .highQualityFormat
+                options.resizeMode = .fast
+                let target = CGSize(width: maxPixel, height: maxPixel)
+                let id = imageManager.requestImage(for: asset, targetSize: target, contentMode: .aspectFit,
+                                                   options: options) { image, info in
+                    let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                    if degraded { return }   // wait for the final, full-quality result
+                    // Cancel + completion can race; only the first one resumes.
+                    guard state.takeResume() else { return }
+                    continuation.resume(returning: image?.jpegData(compressionQuality: 0.9))
+                }
+                state.register(id)
             }
+        } onCancel: {
+            state.cancel()
         }
+    }
+}
+
+// MARK: - Library change observation
+
+extension PhotoLibraryModel: PHPhotoLibraryChangeObserver {
+    /// Photos delivers changes on an arbitrary queue; hop to the main actor
+    /// where the fetch result and published state live.
+    nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+        Task { @MainActor [weak self] in
+            self?.applyLibraryChange(changeInstance)
+        }
+    }
+}
+
+// MARK: - Cancellable PHImageManager requests
+
+/// Lock-guarded bridge between an in-flight PHImageManager request and Swift
+/// task cancellation. Cancel and completion fire on different queues, so a
+/// single flag behind the lock guarantees the continuation resumes exactly
+/// once, and a request ID that arrives after cancellation still gets cancelled.
+/// PHImageManager calls the result handler (with nil) even for cancelled
+/// requests, so the cancel path never needs to resume the continuation itself.
+private final class PHRequestCancellationState: @unchecked Sendable {
+    private let manager: PHImageManager
+    private let lock = NSLock()
+    private var requestID: PHImageRequestID?
+    private var cancelled = false
+    private var resumed = false
+
+    init(manager: PHImageManager) {
+        self.manager = manager
+    }
+
+    /// Records the in-flight request, cancelling immediately if the task was
+    /// already cancelled before the request call returned its ID.
+    func register(_ id: PHImageRequestID) {
+        lock.lock()
+        requestID = id
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel { manager.cancelImageRequest(id) }
+    }
+
+    /// Returns true exactly once — the winner resumes the continuation.
+    func takeResume() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if resumed { return false }
+        resumed = true
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let id = requestID
+        lock.unlock()
+        if let id { manager.cancelImageRequest(id) }
     }
 }

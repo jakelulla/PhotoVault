@@ -33,20 +33,40 @@ enum BackgroundIndexer {
         try? BGTaskScheduler.shared.submit(request)
     }
 
-    private static func handle(_ task: BGProcessingTask) {
-        // Keep a follow-up window scheduled while there may be work left.
-        schedule()
+    /// Schedule a window only if the library still has unindexed assets.
+    /// Cheap count comparison (no asset enumeration), so it's fine on every
+    /// backgrounding. Scheduling when there's nothing left makes iOS wake the
+    /// app for no-op runs and deprioritize the identifier over time.
+    @MainActor
+    static func scheduleIfWorkRemains() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return }
+        let libraryCount = PHAsset.fetchAssets(with: .image, options: nil).count
+                         + PHAsset.fetchAssets(with: .video, options: nil).count
+        let indexedCount = PhotoStore.shared.photos.filter { !$0.isDeleted }.count
+        if libraryCount != indexedCount { schedule() }
+    }
 
+    private static func handle(_ task: BGProcessingTask) {
         let work = Task { @MainActor in
             let library = PhotoLibraryModel()
             library.refreshStatus()
             guard library.isAuthorized else {
+                // No photo access — a follow-up window couldn't make progress
+                // either, so don't reschedule.
                 task.setTaskCompleted(success: false)
                 return
             }
             let indexer = Indexer()
             await indexer.indexNewPhotos(from: library)
             PhotoStore.shared.persist()
+            // Ask for another window only while there's still work: assets we
+            // haven't indexed, or a run cut short by expiration. Rescheduling
+            // unconditionally would have iOS wake the app forever once the
+            // library is fully indexed.
+            let store = PhotoStore.shared
+            let workRemains = library.assets.contains { !store.contains(assetID: $0.localIdentifier) }
+            if workRemains || Task.isCancelled { schedule() }
             task.setTaskCompleted(success: !Task.isCancelled)
         }
 
