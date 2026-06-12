@@ -103,8 +103,8 @@ struct FolderManageSheet: View {
     @ObservedObject private var store = PhotoStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var newFolderName = ""
-    @State private var newFolderQuery = ""
     @State private var showCreate = false
+    @State private var showSmartCreate = false
     @State private var deletingFolder: LocalFolder?
     @State private var renamingFolder: LocalFolder?
     @State private var renameText = ""
@@ -115,9 +115,10 @@ struct FolderManageSheet: View {
                 Section {
                     ForEach(store.folders) { folder in
                         HStack {
-                            Label(folder.name, systemImage: "folder")
+                            Label(folder.name, systemImage: folder.isSmart ? "sparkles" : "folder")
                             Spacer()
-                            Text("\(store.activeCount(in: folder)) photos")
+                            // Smart folders have no static membership to count.
+                            Text(folder.isSmart ? "Smart" : "\(store.activeCount(in: folder)) photos")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -150,23 +151,33 @@ struct FolderManageSheet: View {
                     Button("Done") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showCreate = true } label: {
+                    Menu {
+                        Button { showCreate = true } label: {
+                            Label("New Folder", systemImage: "folder.badge.plus")
+                        }
+                        Button { showSmartCreate = true } label: {
+                            Label("New Smart Folder", systemImage: "sparkles")
+                        }
+                    } label: {
                         Image(systemName: "plus")
                     }
                 }
             }
             .alert("New Folder", isPresented: $showCreate) {
                 TextField("Folder name", text: $newFolderName)
-                TextField("Smart search (optional), e.g. \"dog\"", text: $newFolderQuery)
                 Button("Create") {
                     let name = newFolderName.trimmingCharacters(in: .whitespaces)
-                    let query = newFolderQuery.trimmingCharacters(in: .whitespaces)
-                    newFolderName = ""; newFolderQuery = ""
+                    newFolderName = ""
                     if !name.isEmpty {
-                        store.createFolder(name: name, query: query.isEmpty ? nil : query)
+                        store.createFolder(name: name)
                     }
                 }
-                Button("Cancel", role: .cancel) { newFolderName = ""; newFolderQuery = "" }
+                Button("Cancel", role: .cancel) { newFolderName = "" }
+            }
+            // Smart folders get the full editor (query, anchor, minus terms,
+            // sensitivity + live preview) — too much for an alert.
+            .sheet(isPresented: $showSmartCreate) {
+                SmartFolderEditor(folderID: nil, initialQuery: "", initialAnchor: nil)
             }
             .alert("Rename Folder", isPresented: Binding(
                 get: { renamingFolder != nil },
@@ -283,7 +294,9 @@ struct AddToFolderSheet: View {
 struct FoldersGrid: View {
     @ObservedObject private var store = PhotoStore.shared
 
+    @State private var showCreateChoice = false
     @State private var showCreate = false
+    @State private var showSmartCreate = false
     @State private var newName = ""
     @State private var renaming: LocalFolder?
     @State private var renameText = ""
@@ -293,7 +306,6 @@ struct FoldersGrid: View {
                            GridItem(.flexible(), spacing: 12)]
 
     @State private var categories: [(category: AutoCategory, photos: [LocalPhoto])] = []
-    @State private var newQuery = ""
 
     var body: some View {
         ScrollView {
@@ -346,7 +358,7 @@ struct FoldersGrid: View {
                 }
 
                 // New-folder card
-                Button { showCreate = true } label: {
+                Button { showCreateChoice = true } label: {
                     VStack(alignment: .leading, spacing: 6) {
                         Color(.secondarySystemBackground)
                             .aspectRatio(1, contentMode: .fit)
@@ -367,18 +379,29 @@ struct FoldersGrid: View {
             }
             .padding(16)
         }
+        .confirmationDialog("New Folder", isPresented: $showCreateChoice,
+                            titleVisibility: .visible) {
+            Button("Folder") { showCreate = true }
+            Button("Smart Folder") { showSmartCreate = true }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A folder holds photos you add. A smart folder fills itself from a live search.")
+        }
         .alert("New Folder", isPresented: $showCreate) {
             TextField("Folder name", text: $newName)
-            TextField("Smart search (optional), e.g. \"dog\"", text: $newQuery)
             Button("Create") {
                 let name = newName.trimmingCharacters(in: .whitespaces)
-                let query = newQuery.trimmingCharacters(in: .whitespaces)
-                newName = ""; newQuery = ""
+                newName = ""
                 if !name.isEmpty {
-                    store.createFolder(name: name, query: query.isEmpty ? nil : query)
+                    store.createFolder(name: name)
                 }
             }
-            Button("Cancel", role: .cancel) { newName = ""; newQuery = "" }
+            Button("Cancel", role: .cancel) { newName = "" }
+        }
+        // Smart folders get the full editor (query, anchor, minus terms,
+        // sensitivity + live preview) — too much for an alert.
+        .sheet(isPresented: $showSmartCreate) {
+            SmartFolderEditor(folderID: nil, initialQuery: "", initialAnchor: nil)
         }
         .alert("Rename Folder", isPresented: Binding(
             get: { renaming != nil },
@@ -465,7 +488,12 @@ private struct FolderCard: View {
             Color(.secondarySystemBackground)
                 .aspectRatio(1, contentMode: .fit)
                 .overlay {
-                    if folder.isSmart {
+                    if folder.isSmart, let anchor = folder.anchorAssetID {
+                        // Anchored smart folder: the anchor photo is the
+                        // folder's definition, so it makes the best cover.
+                        PHImageView(assetID: anchor,
+                                    targetSize: CGSize(width: 400, height: 400))
+                    } else if folder.isSmart {
                         Image(systemName: "sparkles")
                             .font(.system(size: 40))
                             .foregroundStyle(.tint)
@@ -478,6 +506,17 @@ private struct FolderCard: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
+                .overlay(alignment: .topTrailing) {
+                    // Distinguish "anchored smart" from a plain photo cover.
+                    if folder.isSmart && folder.anchorAssetID != nil {
+                        Image(systemName: "sparkles")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                            .padding(6)
+                            .background(.black.opacity(0.4), in: Circle())
+                            .padding(6)
+                    }
+                }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
             Text(folder.name)
@@ -485,14 +524,18 @@ private struct FolderCard: View {
                 .lineLimit(1)
                 .foregroundStyle(.primary)
             // Smart folders evaluate on open — no static count to show.
-            Text(folder.isSmart
-                 ? "Smart · \"\(folder.query ?? "")\""
-                 : "\(count) photo\(count == 1 ? "" : "s")")
+            Text(folder.isSmart ? smartSubtitle : "\(count) photo\(count == 1 ? "" : "s")")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .contentShape(Rectangle())
+    }
+
+    private var smartSubtitle: String {
+        if let q = folder.query, !q.isEmpty { return "Smart · \"\(q)\"" }
+        if folder.anchorAssetID != nil { return "Smart · looks like the cover" }
+        return "Smart"
     }
 }
 
@@ -505,26 +548,42 @@ struct FolderPhotosView: View {
 
     @State private var showRename = false
     @State private var renameText = ""
-    @State private var showEditQuery = false
-    @State private var queryText = ""
+    @State private var showEditor = false
     @State private var confirmDelete = false
     @State private var photos: [LocalPhoto] = []
 
     private var folder: LocalFolder? { store.folders.first { $0.id == folderID } }
 
+    /// Anchored smart folders may have no query text, so don't render an
+    /// empty quoted string; embedding-backed folders also evaluate empty
+    /// where the on-device models can't run (simulator).
+    private var smartEmptyDescription: String {
+        if let q = folder?.query, !q.isEmpty {
+            return "No photos currently match \"\(q)\"."
+        }
+        return "No photos currently match this folder's smart search."
+    }
+
     /// Inputs that should re-run the (CLIP-heavy for smart folders) membership
-    /// query — folder identity, its saved search, manual membership edits, and
-    /// newly indexed photos. Keying .task(id:) on this keeps the search off
-    /// every body evaluation.
+    /// query — folder identity, its saved search (all four smart fields, so
+    /// SmartFolderEditor saves re-evaluate immediately), manual membership
+    /// edits, and newly indexed photos. Keying .task(id:) on this keeps the
+    /// search off every body evaluation.
     private struct LoadKey: Hashable {
         var folderID: String
         var query: String?
+        var anchorAssetID: String?
+        var minusQuery: String?
+        var minScore: Float?
         var memberCount: Int
         var photoCount: Int
     }
     private var loadKey: LoadKey {
         LoadKey(folderID: folderID,
                 query: folder?.query,
+                anchorAssetID: folder?.anchorAssetID,
+                minusQuery: folder?.minusQuery,
+                minScore: folder?.minScore,
                 memberCount: folder?.photoAssetIDs.count ?? 0,
                 photoCount: store.photos.count)
     }
@@ -536,7 +595,7 @@ struct FolderPhotosView: View {
                 ContentUnavailableView(
                     isSmart ? "No Matches" : "Empty Folder", systemImage: "folder",
                     description: Text(isSmart
-                        ? "No photos currently match \"\(folder?.query ?? "")\"."
+                        ? smartEmptyDescription
                         : "Select photos anywhere in the app and tap the folder button to add them here."))
             } else if isSmart {
                 // Membership is the query — no manual remove.
@@ -569,8 +628,7 @@ struct FolderPhotosView: View {
                     }
                     if folder?.isSmart == true {
                         Button {
-                            queryText = folder?.query ?? ""
-                            showEditQuery = true
+                            showEditor = true
                         } label: {
                             Label("Edit Search", systemImage: "sparkles")
                         }
@@ -591,13 +649,12 @@ struct FolderPhotosView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .alert("Edit Search", isPresented: $showEditQuery) {
-            TextField("Search query", text: $queryText)
-            Button("Save") {
-                let q = queryText.trimmingCharacters(in: .whitespaces)
-                if !q.isEmpty { store.setFolderQuery(id: folderID, query: q) }
-            }
-            Button("Cancel", role: .cancel) {}
+        // Full smart-folder editor (query + anchor + minus terms + sensitivity);
+        // saving mutates the folder, which changes loadKey → photos re-evaluate.
+        .sheet(isPresented: $showEditor) {
+            SmartFolderEditor(folderID: folderID,
+                              initialQuery: folder?.query ?? "",
+                              initialAnchor: folder?.anchorAssetID)
         }
         .confirmationDialog(
             "Delete \"\(folder?.name ?? "")\"?",

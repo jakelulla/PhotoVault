@@ -157,37 +157,111 @@ struct VideoPage: View {
 
 // MARK: - More Like This
 
-/// Library ranked by CLIP similarity to one photo.
+/// Library ranked by CLIP similarity to one photo — and the image-anchor
+/// entry point for search math: +/− text chips re-rank with a composite
+/// embedding ("this photo, but at night"), and the current expression can
+/// be saved as a live smart folder.
 struct SimilarPhotosView: View {
     let sourceAssetID: String
+    @ObservedObject private var store = PhotoStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var results: [LocalPhoto] = []
     @State private var loaded = false
+    @State private var plusTerms: [String] = []
+    @State private var minusTerms: [String] = []
+    @State private var mathUnavailable = false
+    @State private var showSaveFolder = false
+
+    private var mathActive: Bool { !plusTerms.isEmpty || !minusTerms.isEmpty }
 
     var body: some View {
         NavigationStack {
-            Group {
-                if !loaded {
-                    ProgressView()
-                } else if results.isEmpty {
-                    ContentUnavailableView(
-                        "No similar photos", systemImage: "sparkles.rectangle.stack",
-                        description: Text("Nothing else in your library looks like this one."))
-                } else {
-                    PhotoResultsGrid(results: results)
+            VStack(spacing: 0) {
+                MathChipsEditor(plusTerms: $plusTerms,
+                                minusTerms: $minusTerms,
+                                onChange: refresh)
+                    .disabled(mathUnavailable)
+                    // Tinted while a composite vector (∑) drives the ranking.
+                    .background(mathActive ? Color.accentColor.opacity(0.06) : Color.clear)
+                if mathUnavailable {
+                    Text("Chips need the on-device models, which aren't available here — showing plain similarity instead.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
                 }
+                Divider()
+                content
             }
             .navigationTitle("More Like This")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showSaveFolder = true
+                    } label: {
+                        Label("Save as Folder", systemImage: "folder.badge.plus")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
             }
-            .task {
-                results = PhotoStore.shared.similarPhotos(to: sourceAssetID)
-                loaded = true
+            .sheet(isPresented: $showSaveFolder) {
+                // Seed the editor with this photo as anchor plus the chips;
+                // the saved folder re-evaluates the same composite live.
+                // With chips active, seed the SAME 0.45 floor this view
+                // ranked with — the editor's anchored default (0.55) would
+                // save a folder that drops photos visible in this grid.
+                SmartFolderEditor(folderID: nil,
+                                  initialQuery: plusTerms.joined(separator: " "),
+                                  initialAnchor: sourceAssetID,
+                                  initialMinus: minusTerms.joined(separator: ", "),
+                                  initialMinScore: mathActive ? 0.45 : nil)
             }
+            .task { refresh() }
         }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if !loaded {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if results.isEmpty {
+            ContentUnavailableView(
+                "No similar photos", systemImage: "sparkles.rectangle.stack",
+                description: Text(mathActive
+                    ? "Nothing matches this photo combined with those terms."
+                    : "Nothing else in your library looks like this one."))
+        } else {
+            PhotoResultsGrid(results: results)
+        }
+    }
+
+    private func refresh() {
+        if mathActive {
+            // The engine loads its models lazily; nudge it like the store's
+            // own embedding paths do before declaring it unavailable.
+            let engine = OnDeviceMLEngine.shared
+            if !engine.isAvailable { try? engine.loadModels() }
+            if let emb = store.compositeQueryEmbedding(anchorAssetID: sourceAssetID,
+                                                       plus: plusTerms,
+                                                       minus: minusTerms) {
+                mathUnavailable = false
+                // 0.45 floor: looser than pure image–image similarity (0.55)
+                // because the text terms deliberately pull the vector away
+                // from the anchor. The anchor itself always scores ~top, so
+                // drop it from its own results.
+                results = store.searchByEmbedding(emb, floor: 0.45)
+                    .map(\.photo)
+                    .filter { $0.assetID != sourceAssetID }
+                loaded = true
+                return
+            }
+            mathUnavailable = true
+        }
+        results = store.similarPhotos(to: sourceAssetID)
+        loaded = true
     }
 }

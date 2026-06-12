@@ -166,9 +166,17 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
             if let cg = try? await gen.image(at: t).image,
                let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.85) {
                 frames.append(jpeg)
+            } else {
+                // Placeholder keeps the array index-parallel with the sampled
+                // fractions: timing reconstruction (MomentHit.time) assumes
+                // frame i of n sits at duration×(i+0.5)/n, so a silently
+                // dropped frame would shift every later frame's timestamp.
+                // MLWorker.processFrames pads an empty embedding for it.
+                frames.append(Data())
             }
         }
-        return frames
+        // All slots failed → treat as a whole-video failure, same as before.
+        return frames.allSatisfy(\.isEmpty) ? [] : frames
     }
 
     /// A downscaled JPEG (longest side ~`maxPixel`) for the one-time metadata

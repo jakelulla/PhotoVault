@@ -10,6 +10,12 @@ struct PhotoMLResult {
     var clipFrameEmbeddings: [[Float]]? = nil
     let faceEmbeddings: [[Float]]  // N × 512-dim L2-normalized ArcFace embeddings
     let faceRects: [CGRect]        // N bounding boxes, normalized 0…1 in original image space
+    /// Per-face Laplacian-variance sharpness, parallel to faceRects/faceEmbeddings.
+    /// Defaulted so pre-sharpness initializer call sites keep compiling.
+    var faceSharpness: [Float] = []
+    /// Whole-frame sharpness at the same fixed 128×128 analysis size, so
+    /// scores are comparable across photos regardless of resolution.
+    var imageSharpness: Float = 0
 }
 
 // MARK: - Engine
@@ -65,7 +71,13 @@ final class OnDeviceMLEngine {
 
         let clipEmb  = try encodeCLIP(cgImage, model: clip)
         let (faceEmbs, faceRects) = try detectAndEmbedFaces(cgImage, detector: det, embedder: emb)
-        return PhotoMLResult(clipEmbedding: clipEmb, faceEmbeddings: faceEmbs, faceRects: faceRects)
+        // Sharpness piggybacks on the inference pass: the CGImage is already
+        // decoded and the rects already detected, so each score is just one
+        // extra 128×128 grayscale render — negligible next to the models.
+        let faceSharp = faceRects.map { sharpness(of: cgImage, normalizedRegion: $0) }
+        let imageSharp = sharpness(of: cgImage, normalizedRegion: nil)
+        return PhotoMLResult(clipEmbedding: clipEmb, faceEmbeddings: faceEmbs, faceRects: faceRects,
+                             faceSharpness: faceSharp, imageSharpness: imageSharp)
     }
 
     // MARK: - CLIP text (caption search)
@@ -408,6 +420,81 @@ final class OnDeviceMLEngine {
         let inter = max(0, ix2-ix1) * max(0, iy2-iy1)
         guard inter > 0 else { return 0 }
         return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter + 1e-7)
+    }
+
+    // MARK: - Sharpness (Laplacian variance)
+
+    /// Sharpness score for a region of an image: variance of the 3×3
+    /// Laplacian [0,1,0; 1,−4,1; 0,1,0] over a 128×128 8-bit grayscale
+    /// resample of the region. The FIXED analysis size is the point — it
+    /// makes scores comparable across photos of any resolution (a 48MP and
+    /// a 12MP shot of the same scene land near the same number).
+    ///
+    /// `normalizedRegion` (0…1 rect, e.g. a detected face) gets 10% padding
+    /// and a 16px-source minimum so tiny faces still yield signal; nil
+    /// scores the whole frame. Pure CoreGraphics — needs no loaded models,
+    /// so the backfill can use it even where CoreML is unavailable.
+    func sharpness(of cgImage: CGImage, normalizedRegion: CGRect?) -> Float {
+        let W = CGFloat(cgImage.width), H = CGFloat(cgImage.height)
+        guard W >= 1, H >= 1 else { return 0 }
+
+        var source = cgImage
+        if let r = normalizedRegion {
+            // Pad 10% per side: a little context around the face keeps the
+            // crop from being dominated by smooth skin (which scores low on
+            // any photo, sharp or blurry).
+            var px = r.minX * W, py = r.minY * H
+            var pw = r.width * W, ph = r.height * H
+            let padX = pw * 0.1, padY = ph * 0.1
+            px -= padX; py -= padY; pw += 2 * padX; ph += 2 * padY
+            // Below ~16 source pixels there isn't enough detail to measure;
+            // grow around the center before clamping to bounds.
+            if pw < 16 { px -= (16 - pw) / 2; pw = 16 }
+            if ph < 16 { py -= (16 - ph) / 2; ph = 16 }
+            let rect = CGRect(x: px, y: py, width: pw, height: ph)
+                .intersection(CGRect(x: 0, y: 0, width: W, height: H))
+                .integral
+            guard rect.width >= 2, rect.height >= 2,
+                  let cropped = cgImage.cropping(to: rect) else { return 0 }
+            source = cropped
+        }
+
+        let S = 128
+        var gray = [UInt8](repeating: 0, count: S * S)
+        // Keep the buffer pointer valid for the context's whole lifetime —
+        // passing &gray directly to CGContext(data:) is UB once the call
+        // returns (same dangling-pointer hazard as rgbaPixels below).
+        let ok = gray.withUnsafeMutableBytes { (ptr: UnsafeMutableRawBufferPointer) -> Bool in
+            guard let ctx = CGContext(
+                data: ptr.baseAddress, width: S, height: S,
+                bitsPerComponent: 8, bytesPerRow: S,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            ctx.interpolationQuality = .medium
+            ctx.draw(source, in: CGRect(x: 0, y: 0, width: S, height: S))
+            return true
+        }
+        guard ok else { return 0 }
+
+        // Laplacian response over interior pixels (1-pixel border skipped),
+        // then its variance. Integer kernel sums fit easily in Int; the
+        // accumulators need Double (sumSq can reach 126² × 1020²).
+        var sum = 0.0, sumSq = 0.0
+        for y in 1..<(S - 1) {
+            let row = y * S
+            for x in 1..<(S - 1) {
+                let v = Double(
+                    Int(gray[row + x - 1]) + Int(gray[row + x + 1])
+                    + Int(gray[row - S + x]) + Int(gray[row + S + x])
+                    - 4 * Int(gray[row + x]))
+                sum += v
+                sumSq += v * v
+            }
+        }
+        let n = Double((S - 2) * (S - 2))
+        let mean = sum / n
+        return Float(max(0, sumSq / n - mean * mean))
     }
 
     // MARK: - Pixel helpers

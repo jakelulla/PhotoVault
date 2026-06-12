@@ -15,6 +15,16 @@ struct ContentView: View {
                     .task {
                         await indexer.indexNewPhotos(from: library)
                     }
+                    // Belt-and-braces backfill trigger: the indexer fires one
+                    // after each pass, but a pass over a big library can take
+                    // hours — this gets old photos their face/sharpness data
+                    // after launch settles instead of waiting for the pass.
+                    // ~5s of clear air for first paint and indexing spin-up;
+                    // a no-op once every photo carries the data.
+                    .task {
+                        guard (try? await Task.sleep(for: .seconds(5))) != nil else { return }
+                        await SharpnessBackfill.shared.runIfNeeded(library: library)
+                    }
                     // Photos taken (or synced in) after launch: the library's
                     // change observer bumps the token; index the new arrivals.
                     .onChange(of: library.libraryChangeToken) {

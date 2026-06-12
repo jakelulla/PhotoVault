@@ -5,6 +5,17 @@ import SwiftUI
 
 // MARK: - Data models
 
+/// One detected face on a photo, stored with the photo so person-centric
+/// features (growth timelines, best-face picks) can rank faces without
+/// re-reading the on-disk face log. `clusterID` is the raw cluster assigned
+/// at index/backfill time — resolve through resolvedClusterID at query time
+/// so merged people keep working.
+struct PhotoFace: Codable, Hashable {
+    var clusterID: Int?
+    var rect: [Double]           // [x, y, w, h] normalized 0…1
+    var sharpness: Float?        // Laplacian variance of the 128×128 grayscale face crop; nil = not yet computed
+}
+
 struct LocalPhoto: Identifiable, Codable {
     let assetID: String
     let photoID: Int            // stable Int assigned at index time (for Set-based selection in views)
@@ -17,6 +28,8 @@ struct LocalPhoto: Identifiable, Codable {
     var isDeleted: Bool
     var isVideo: Bool?          // optional for back-compat with pre-video stores
     var duration: Double?       // seconds, videos only
+    var faces: [PhotoFace]?     // nil = indexed before per-photo face data existed (backfill fills it)
+    var sharpness: Float?       // whole-image sharpness: Laplacian variance of the 128×128 grayscale downsample
 
     var id: String { assetID }
     var video: Bool { isVideo ?? false }
@@ -68,8 +81,44 @@ struct LocalFolder: Identifiable, Codable {
     /// Non-empty → smart folder: membership is this saved search, re-run on
     /// open, instead of the static photoAssetIDs list.
     var query: String?
+    /// Non-nil → embedding-anchored smart folder: membership is a live CLIP
+    /// ranking against this photo's embedding, composed with query/minusQuery
+    /// (see photosForFolder). All three fields are optional for Codable
+    /// back-compat with folders.json written before they existed.
+    var anchorAssetID: String?
+    /// Comma-separated terms the composite query is steered *away* from.
+    var minusQuery: String?
+    /// Pinned score floor for the embedding ranking; nil → the calibrated
+    /// default (0.55 image-anchored, 0.25 text — see photosForFolder).
+    var minScore: Float?
 
-    var isSmart: Bool { !(query ?? "").isEmpty }
+    var isSmart: Bool { !(query ?? "").isEmpty || anchorAssetID != nil }
+}
+
+/// One representative face of a person per calendar year — the result row
+/// of growthTimeline(forCluster:).
+struct YearFace: Identifiable {
+    let year: Int
+    let assetID: String
+    let rect: CGRect?            // normalized face rect; nil → show the whole photo
+    let score: Float             // (sharpness ?? 1) × √(face area); 0 for whole-photo fallbacks
+    var id: Int { year }
+}
+
+/// The best-matching moment inside one video for a text query — the result
+/// row of videoMoments(matching:). `time` reconstructs the sampled frame's
+/// timestamp with the same formula the sampler uses (PhotoLibraryModel:
+/// frame i of n sits at duration × (i + 0.5) / n), so seeking there lands on
+/// the content that actually matched.
+struct MomentHit: Identifiable {
+    let assetID: String
+    let frameIndex: Int
+    let frameCount: Int
+    let score: Float
+    let duration: Double
+    let createdAt: Date?
+    var time: Double { duration * (Double(frameIndex) + 0.5) / Double(frameCount) }
+    var id: String { assetID }
 }
 
 // MARK: - PhotoStore
@@ -374,10 +423,21 @@ final class PhotoStore: ObservableObject {
 
     func contains(assetID: String) -> Bool { photoIndex[assetID] != nil }
 
+    /// O(1) photo lookup, for callers that stream per-asset updates and need
+    /// to re-check live state (e.g. SharpnessBackfill verifying that a
+    /// photo's faces are still unset before writing a snapshot-derived match).
+    func photo(forAssetID id: String) -> LocalPhoto? {
+        photoIndex[id].map { photos[$0] }
+    }
+
     /// `clipFrameEmbeddings`: per-sampled-frame CLIP vectors for videos.
     /// `clipEmbedding` stays the L2-renormalized frame mean (photos and old
     /// callers pass only that), so existing stores remain valid; frames are
     /// extra signal layered on top.
+    /// `faceSharpness`/`imageSharpness`: Laplacian-variance sharpness from
+    /// the engine (per detected face / whole frame), stored on the photo for
+    /// best-face ranking. Optional with nil defaults so pre-sharpness
+    /// callers keep compiling.
     func index(
         assetID: String,
         createdAt: Date?,
@@ -387,7 +447,9 @@ final class PhotoStore: ObservableObject {
         faceRects: [CGRect],
         isVideo: Bool = false,
         duration: Double? = nil,
-        clipFrameEmbeddings: [[Float]]? = nil
+        clipFrameEmbeddings: [[Float]]? = nil,
+        faceSharpness: [Float]? = nil,
+        imageSharpness: Float? = nil
     ) {
         guard !contains(assetID: assetID) else { return }
 
@@ -404,6 +466,23 @@ final class PhotoStore: ObservableObject {
 
         let clusterIDs = assignFaces(embeddings: faceEmbeddings, rects: faceRects, toAssetID: assetID)
 
+        // Pair each assigned face with its rect and sharpness, index-wise —
+        // clusterIDs follows faceEmbeddings order (assignFaces zips them).
+        // A count mismatch means the pairing can't be trusted: rects fall
+        // back to .zero exactly like assignFaces, sharpness to nil rather
+        // than mislabeling a face. An empty array (vs nil) records that this
+        // photo was indexed with face-data support — backfill can skip it.
+        let pairedRects = faceRects.count == clusterIDs.count
+            ? faceRects : Array(repeating: CGRect.zero, count: clusterIDs.count)
+        let pairedSharpness: [Float]? =
+            faceSharpness?.count == clusterIDs.count ? faceSharpness : nil
+        let faces = clusterIDs.indices.map { i in
+            PhotoFace(clusterID: clusterIDs[i],
+                      rect: [pairedRects[i].minX, pairedRects[i].minY,
+                             pairedRects[i].width, pairedRects[i].height],
+                      sharpness: pairedSharpness?[i])
+        }
+
         var photo = LocalPhoto(
             assetID: assetID,
             photoID: nextPhotoID,
@@ -414,7 +493,9 @@ final class PhotoStore: ObservableObject {
             dupGroupID: nil,
             isDeleted: false,
             isVideo: isVideo,
-            duration: isVideo ? duration : nil
+            duration: isVideo ? duration : nil,
+            faces: faces,
+            sharpness: imageSharpness
         )
         nextPhotoID += 1
 
@@ -438,6 +519,17 @@ final class PhotoStore: ObservableObject {
         } else {
             schedulePersist([.photos, .clusters, .embeddings])
         }
+    }
+
+    /// Backfill setter for per-photo face data on photos indexed before it
+    /// existed. nil args leave the current value alone (only non-nil
+    /// overwrites), so the face pass and the whole-image sharpness pass can
+    /// land independently without clobbering each other.
+    func setFaceData(assetID: String, faces: [PhotoFace]?, imageSharpness: Float?) {
+        guard let idx = photoIndex[assetID] else { return }
+        if let faces { photos[idx].faces = faces }
+        if let imageSharpness { photos[idx].sharpness = imageSharpness }
+        schedulePersist([.photos])
     }
 
     // MARK: - Duplicate detection
@@ -548,10 +640,18 @@ final class PhotoStore: ObservableObject {
     // MARK: - Global re-clustering
 
     @Published private(set) var isReclustering = false
-    /// Bumped whenever soft-delete membership changes (delete/restore/prune).
-    /// photos.count is unchanged by those, so caches and views keyed on count
-    /// alone would go stale — key on this too.
+    /// Bumped whenever photo↔person/group membership changes — soft deletes
+    /// (delete/restore/prune), duplicate-group edits, AND merges/unmerges/
+    /// reclusters. photos.count is unchanged by all of those, so caches and
+    /// views keyed on count alone would go stale — key on this too.
     @Published private(set) var membershipVersion = 0
+    /// Bumped whenever the cluster ID space itself is rebuilt or wiped
+    /// (reclusterPass renumbers every cluster from 0; resetIndex clears
+    /// everything). Long-running consumers that matched faces against a
+    /// snapshot of cluster prototypes (SharpnessBackfill) re-check this
+    /// before writing: a stale match would attach a face to whatever NEW
+    /// cluster happens to reuse the old ID — a different person.
+    private(set) var clusterEpoch = 0
     private var reclusterPending = false
 
     /// Rebuild People from scratch with a global DBSCAN over every stored
@@ -619,7 +719,29 @@ final class PhotoStore: ObservableObject {
         nextClusterID = newClusters.count
         for i in photos.indices {
             photos[i].personClusterIDs = result.assignments[photos[i].assetID] ?? []
+            // Stored per-photo faces carry raw cluster IDs from the OLD
+            // numbering; the rebuild reuses IDs from 0, so a stale ID would
+            // silently resolve to a different person (resolvedClusterID only
+            // follows merge chains, which this pass wipes). Rewrite them from
+            // the same pass, positionally — stored PhotoFace arrays and the
+            // face log share face order and count. Photos the pass didn't see
+            // (soft-deleted, torn log record) get their IDs cleared instead:
+            // no face match beats the wrong person's face, and the next pass
+            // that includes them re-assigns (mirroring personClusterIDs,
+            // which restore also defers to the next recluster).
+            guard var faces = photos[i].faces, !faces.isEmpty else { continue }
+            if let assigned = result.faceAssignments[photos[i].assetID],
+               assigned.count == faces.count {
+                for j in faces.indices { faces[j].clusterID = assigned[j] }
+            } else {
+                for j in faces.indices { faces[j].clusterID = nil }
+            }
+            photos[i].faces = faces
         }
+        // New ID space: invalidate any in-flight prototype-snapshot matching
+        // (SharpnessBackfill), and refresh views keyed on membership.
+        clusterEpoch += 1
+        membershipVersion += 1
         dirty.formUnion([.photos, .clusters])
         persist()
     }
@@ -843,6 +965,63 @@ final class PhotoStore: ObservableObject {
                      .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
     }
 
+    /// Photos containing ALL of the given people — AND semantics, with both
+    /// the query IDs and each photo's assignments resolved through merges.
+    /// Oldest first, so "first photo together" is simply .first.
+    func photos(forClusters ids: [Int]) -> [LocalPhoto] {
+        let want = Set(ids.map { resolvedClusterID($0) })
+        guard !want.isEmpty else { return [] }
+        return photos
+            .filter { p in
+                guard !p.isDeleted else { return false }
+                return want.isSubset(of: Set(p.personClusterIDs.map { resolvedClusterID($0) }))
+            }
+            .sorted { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+    }
+
+    /// One representative face of a person per calendar year, ascending —
+    /// the growth-timeline strip. Best face = (sharpness ?? 1) × √(face
+    /// area): bigger faces crop better and sharpness separates the keeper
+    /// from its motion-blurred near-duplicate; √area keeps the two factors
+    /// on comparable scales. Cluster IDs resolve through merges on both
+    /// sides — a face tagged with a pre-merge cluster ID still counts, so
+    /// merged people keep their timeline. Years whose photos predate
+    /// per-photo face data fall back to the year's latest photo shown whole
+    /// (rect nil, score 0).
+    func growthTimeline(forCluster id: Int) -> [YearFace] {
+        let root = resolvedClusterID(id)
+        let cal = Calendar.current
+        var byYear: [Int: [LocalPhoto]] = [:]
+        for p in photos(forCluster: root) {
+            guard let d = p.createdAt else { continue }
+            byYear[cal.component(.year, from: d), default: []].append(p)
+        }
+        var result: [YearFace] = []
+        for (year, ps) in byYear {
+            var best: YearFace?
+            for p in ps {
+                for face in p.faces ?? [] {
+                    guard let cid = face.clusterID, resolvedClusterID(cid) == root,
+                          face.rect.count == 4 else { continue }
+                    let area = Float(face.rect[2] * face.rect[3])
+                    let score = (face.sharpness ?? 1) * area.squareRoot()
+                    if score > (best?.score ?? -.greatestFiniteMagnitude) {
+                        best = YearFace(year: year, assetID: p.assetID,
+                                        rect: CGRect(x: face.rect[0], y: face.rect[1],
+                                                     width: face.rect[2], height: face.rect[3]),
+                                        score: score)
+                    }
+                }
+            }
+            if best == nil,
+               let latest = ps.max(by: { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }) {
+                best = YearFace(year: year, assetID: latest.assetID, rect: nil, score: 0)
+            }
+            if let best { result.append(best) }
+        }
+        return result.sorted { $0.year < $1.year }
+    }
+
     func resolvedClusterID(_ id: Int) -> Int {
         guard let c = clusters.first(where: { $0.id == id }), let m = c.mergedInto else { return id }
         return resolvedClusterID(m)
@@ -874,6 +1053,7 @@ final class PhotoStore: ObservableObject {
         for i in 0..<photos.count {
             photos[i].personClusterIDs = photos[i].personClusterIDs.map { $0 == source ? target : $0 }
         }
+        membershipVersion += 1   // Together/growth views key on this
         schedulePersist([.clusters, .photos])
     }
 
@@ -891,6 +1071,7 @@ final class PhotoStore: ObservableObject {
                     .map { $0 == targetID ? memberID : $0 }
             }
         }
+        membershipVersion += 1   // Together/growth views key on this
         schedulePersist([.clusters, .photos])
     }
 
@@ -930,17 +1111,41 @@ final class PhotoStore: ObservableObject {
         return f
     }
 
-    func setFolderQuery(id: String, query: String) {
+    /// Full overwrite of a smart folder's definition (the editor saves all
+    /// four fields at once). Empty-string query/minusQuery normalize to nil
+    /// so isSmart and the photosForFolder branches stay unambiguous.
+    func updateSmartFolder(id: String, query: String?, anchorAssetID: String?,
+                           minusQuery: String?, minScore: Float?) {
         guard let fi = folders.firstIndex(where: { $0.id == id }) else { return }
-        folders[fi].query = query.isEmpty ? nil : query
+        folders[fi].query = (query?.isEmpty == true) ? nil : query
+        folders[fi].anchorAssetID = anchorAssetID
+        folders[fi].minusQuery = (minusQuery?.isEmpty == true) ? nil : minusQuery
+        folders[fi].minScore = minScore
         schedulePersist(.folders)
     }
 
     /// Evaluate a smart folder's saved search (static folders return their
     /// list). Soft-deleted photos stay in photoAssetIDs (see deletePhoto) but
-    /// are filtered out here — both paths go through searchPhotos/allPhotos,
-    /// which drop isDeleted.
+    /// are filtered out here — all paths go through
+    /// searchByEmbedding/searchPhotos/allPhotos, which drop isDeleted.
     func photosForFolder(_ folder: LocalFolder) -> [LocalPhoto] {
+        // Embedding-anchored smart folder: membership is a live ranking
+        // against the composite query vector. When the folder doesn't pin
+        // its own floor, defaults follow the existing calibrations: 0.55
+        // image-anchored (similarPhotos), 0.25 text-only (caption floor).
+        // No engine (simulator) → empty, matching searchPhotos' degradation.
+        if folder.anchorAssetID != nil || folder.minScore != nil {
+            let minus = folder.minusQuery?
+                .split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespaces) } ?? []
+            guard let emb = compositeQueryEmbedding(anchorAssetID: folder.anchorAssetID,
+                                                    baseText: folder.query,
+                                                    minus: minus) else { return [] }
+            return searchByEmbedding(
+                emb,
+                floor: folder.minScore ?? (folder.anchorAssetID != nil ? 0.55 : 0.25)
+            ).map(\.photo)
+        }
         if let q = folder.query, !q.isEmpty {
             return searchPhotos(query: q)
         }
@@ -1316,8 +1521,36 @@ final class PhotoStore: ObservableObject {
     }
 
     func searchPhotos(query: String, folderID: String? = nil) -> [LocalPhoto] {
+        let (results, caption) = structuredSearchStage(query: query, folderID: folderID)
+        guard !results.isEmpty || !caption.isEmpty else { return [] }
+
+        // Caption (CLIP) ranking: words not consumed by the structured filters
+        // are treated as content ("beach", "birthday cake", …) and used to
+        // rank the remaining candidates by text↔image cosine similarity.
+        // Mirrors the backend: CAPTION_FLOOR drops unrelated photos
+        // (ViT-B/32 calibration: >0.30 strongly related, <0.22 unrelated).
+        if !caption.isEmpty, let tEmb = try? OnDeviceMLEngine.shared.encodeText(caption) {
+            let floor: Float = 0.25
+            let scored: [(LocalPhoto, Float)] = results.compactMap { p in
+                guard let s = clipScore(assetID: p.assetID, query: tEmb) else { return nil }
+                return s >= floor ? (p, s) : nil
+            }
+            return scored.sorted { $0.1 > $1.1 }.map { $0.0 }
+        }
+
+        return results.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+    }
+
+    /// The structured half of searchPhotos: folder, year, month+year,
+    /// location, and person-name HARD filters, plus the residual caption left
+    /// over for CLIP ranking. Factored out so the refine-chip path
+    /// (SearchView.rerank) can keep "Mom 2021"'s person/year constraints
+    /// while re-ranking the candidates with a composite embedding — routing
+    /// the whole query string through the text encoder silently dropped them.
+    func structuredSearchStage(query: String, folderID: String? = nil)
+        -> (candidates: [LocalPhoto], caption: String) {
         let q = query.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return [] }
+        guard !q.isEmpty else { return ([], "") }
 
         var results = photos.filter { !$0.isDeleted }
 
@@ -1380,24 +1613,117 @@ final class PhotoStore: ObservableObject {
             }
         }
 
-        // Caption (CLIP) ranking: words not consumed by the structured filters
-        // above are treated as content ("beach", "birthday cake", …) and used
-        // to rank the remaining candidates by text↔image cosine similarity.
-        // Mirrors the backend: CAPTION_FLOOR drops unrelated photos
-        // (ViT-B/32 calibration: >0.30 strongly related, <0.22 unrelated).
+        // Whatever the structured filters didn't consume is the CLIP caption.
         let caption = residualCaption(
             from: q, matchedLocations: matchingLocs, matchedClusters: matchingClusters,
             monthYearMatched: monthYear != nil)
-        if !caption.isEmpty, let tEmb = try? OnDeviceMLEngine.shared.encodeText(caption) {
-            let floor: Float = 0.25
-            let scored: [(LocalPhoto, Float)] = results.compactMap { p in
-                guard let s = clipScore(assetID: p.assetID, query: tEmb) else { return nil }
-                return s >= floor ? (p, s) : nil
+        return (results, caption)
+    }
+
+    /// Rank non-deleted photos against an arbitrary query embedding (text,
+    /// image, or a composite of both). Scoring goes through clipScore, so
+    /// videos take the max over their sampled frames exactly like text
+    /// search. Folder intersection mirrors searchPhotos — smart folders
+    /// resolve via photosForFolder, which calls back in with no folderID, so
+    /// there's no recursion. The 0.2 default floor is deliberately
+    /// permissive; callers pass their calibrated one (0.25 text-style,
+    /// 0.55 image-anchored).
+    func searchByEmbedding(_ emb: [Float], folderID: String? = nil, floor: Float = 0.2,
+                           limit: Int? = nil) -> [(photo: LocalPhoto, score: Float)] {
+        guard !emb.isEmpty else { return [] }
+        var candidates = photos.filter { !$0.isDeleted }
+        if let fid = folderID, !fid.isEmpty,
+           let folder = folders.first(where: { $0.id == fid }) {
+            let ids = folder.isSmart
+                ? Set(photosForFolder(folder).map(\.assetID))
+                : Set(folder.photoAssetIDs)
+            candidates = candidates.filter { ids.contains($0.assetID) }
+        }
+        let scored = candidates
+            .compactMap { p -> (photo: LocalPhoto, score: Float)? in
+                guard let s = clipScore(assetID: p.assetID, query: emb), s >= floor
+                else { return nil }
+                return (p, s)
             }
-            return scored.sorted { $0.1 > $1.1 }.map { $0.0 }
+            .sorted { $0.score > $1.score }
+        if let limit { return Array(scored.prefix(limit)) }
+        return scored
+    }
+
+    /// Compose one query vector from any mix of an anchor photo's stored
+    /// CLIP embedding, base text, and plus/minus text terms — CLIP's shared
+    /// image/text space makes the arithmetic meaningful ("this photo, but at
+    /// night"). Anchor/base/plus add at full weight; minus terms subtract at
+    /// 0.8, because a full-strength subtraction overshoots and starts
+    /// matching the concept's visual opposite instead of merely avoiding it.
+    /// Returns nil when the text encoder is unavailable (simulator!), an
+    /// encode throws, or no component is non-empty — callers must handle nil.
+    func compositeQueryEmbedding(anchorAssetID: String? = nil,
+                                 baseText: String? = nil,
+                                 plus: [String] = [],
+                                 minus: [String] = []) -> [Float]? {
+        let engine = OnDeviceMLEngine.shared
+        guard engine.isAvailable else { return nil }
+
+        var v: [Float] = []
+        var hasComponent = false
+        func accumulate(_ emb: [Float], _ weight: Float) {
+            guard !emb.isEmpty else { return }
+            if v.isEmpty { v = [Float](repeating: 0, count: emb.count) }
+            guard emb.count == v.count else { return }
+            for i in emb.indices { v[i] += emb[i] * weight }
+            hasComponent = true
         }
 
-        return results.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        if let anchor = anchorAssetID, let emb = clipEmbeddings[anchor] {
+            accumulate(emb, 1.0)
+        }
+        var terms: [(text: String, weight: Float)] = []
+        if let base = baseText?.trimmingCharacters(in: .whitespaces), !base.isEmpty {
+            terms.append((base, 1.0))
+        }
+        for t in plus {
+            let s = t.trimmingCharacters(in: .whitespaces)
+            if !s.isEmpty { terms.append((s, 1.0)) }
+        }
+        for t in minus {
+            let s = t.trimmingCharacters(in: .whitespaces)
+            if !s.isEmpty { terms.append((s, -0.8)) }
+        }
+        for (text, weight) in terms {
+            guard let emb = try? engine.encodeText(text) else { return nil }
+            accumulate(emb, weight)
+        }
+        guard hasComponent else { return nil }
+        return l2Normalize(v)
+    }
+
+    /// The best-matching moment inside each video for a text query: the
+    /// argmax sampled frame and its score, one hit per video. Chronological
+    /// (createdAt ascending) like a reel; floor matches the caption-search
+    /// calibration. No engine (simulator) → empty.
+    func videoMoments(matching query: String, floor: Float = 0.25, limit: Int = 60) -> [MomentHit] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        let engine = OnDeviceMLEngine.shared
+        guard !q.isEmpty, engine.isAvailable,
+              let tEmb = try? engine.encodeText(q) else { return [] }
+
+        var hits: [MomentHit] = []
+        for p in photos where !p.isDeleted && p.video {
+            guard let frames = videoFrameEmbeddings[p.assetID], !frames.isEmpty else { continue }
+            var bestIdx = -1
+            var bestScore: Float = -.greatestFiniteMagnitude
+            for (i, f) in frames.enumerated() where !f.isEmpty {
+                let s = dot(f, tEmb)
+                if s > bestScore { bestScore = s; bestIdx = i }
+            }
+            guard bestIdx >= 0, bestScore >= floor else { continue }
+            hits.append(MomentHit(assetID: p.assetID, frameIndex: bestIdx,
+                                  frameCount: frames.count, score: bestScore,
+                                  duration: p.duration ?? 0, createdAt: p.createdAt))
+        }
+        return Array(hits.sorted { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+                         .prefix(limit))
     }
 
     /// "San Francisco, California" → "san francisco". Geocoded names are
@@ -1561,6 +1887,11 @@ final class PhotoStore: ObservableObject {
         photos = []; clusters = []; locations = []; folders = []
         clipEmbeddings = [:]; videoFrameEmbeddings = [:]
         photoIndex = [:]; nextPhotoID = 0; nextClusterID = 0
+        // The cluster ID space is gone; a SharpnessBackfill mid-run matched
+        // faces against the pre-reset prototypes and must not keep writing
+        // those IDs onto freshly re-indexed photos (same assetIDs reappear
+        // as the indexer re-walks the library).
+        clusterEpoch += 1
         try? FileManager.default.removeItem(at: Self.photosURL)
         try? FileManager.default.removeItem(at: Self.clustersURL)
         try? FileManager.default.removeItem(at: Self.locationsURL)

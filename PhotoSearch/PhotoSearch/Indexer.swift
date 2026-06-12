@@ -41,16 +41,44 @@ private actor MLWorker {
         var frameClips: [[Float]] = []
         var faceEmbs: [[Float]] = []
         var rects: [CGRect] = []
+        var faceSharp: [Float] = []
+        var imageSharp: Float?
         for data in frameDatas {
-            guard let ui = UIImage(data: data),
+            guard !data.isEmpty,
+                  let ui = UIImage(data: data),
                   let cg = Self.orientedUpCGImage(ui),
-                  let r = try? OnDeviceMLEngine.shared.process(cgImage: cg) else { continue }
+                  let r = try? OnDeviceMLEngine.shared.process(cgImage: cg) else {
+                // Keep frame slots index-parallel with the sampler's timing:
+                // silently dropping a failed frame would shift every later
+                // frame and make MomentHit.time (frame i of n at
+                // duration×(i+0.5)/n) reconstruct the wrong timestamp — the
+                // reel would seek a segment that doesn't contain the match.
+                // An empty embedding pads the slot; every consumer
+                // (clipScore, videoMoments, duplicate checks, categories)
+                // already skips empty frames.
+                frameClips.append([])
+                continue
+            }
             frameClips.append(r.clipEmbedding)
             faceEmbs.append(contentsOf: r.faceEmbeddings)
             rects.append(contentsOf: r.faceRects)
+            // Face sharpness must stay index-parallel with faceEmbs across
+            // frames — pad with zeros if a frame's counts ever disagree so
+            // one bad frame can't shift every later face's score.
+            let sharp = r.faceSharpness.count == r.faceEmbeddings.count
+                ? r.faceSharpness
+                : [Float](repeating: 0, count: r.faceEmbeddings.count)
+            faceSharp.append(contentsOf: sharp)
+            // Whole-video sharpness: first decodable frame's score. Good
+            // enough for ranking — frames of one video share focus quality
+            // far more than frames across videos do.
+            if imageSharp == nil { imageSharp = r.imageSharpness }
         }
-        guard var clip = frameClips.first else { throw MLWorkerError.invalidImage }
-        for emb in frameClips.dropFirst() {
+        // Mean over the frames that actually embedded (padded empty slots
+        // carry no signal); the result succeeds if any frame embedded.
+        let embedded = frameClips.filter { !$0.isEmpty }
+        guard var clip = embedded.first else { throw MLWorkerError.invalidImage }
+        for emb in embedded.dropFirst() {
             for i in 0..<min(clip.count, emb.count) {
                 clip[i] += emb[i]
             }
@@ -59,7 +87,9 @@ private actor MLWorker {
         return PhotoMLResult(clipEmbedding: clip.map { $0 / norm },
                              clipFrameEmbeddings: frameClips,
                              faceEmbeddings: faceEmbs,
-                             faceRects: rects)
+                             faceRects: rects,
+                             faceSharpness: faceSharp,
+                             imageSharpness: imageSharp ?? 0)
     }
 
     enum MLWorkerError: Error { case invalidImage }
@@ -138,6 +168,17 @@ final class Indexer: ObservableObject {
             pendingRerun = false
             await runIndexPass(from: library)
         } while pendingRerun && !Task.isCancelled
+
+        // Newly indexed photos carry face/sharpness data inline; photos
+        // indexed before the feature existed get it backfilled once the
+        // pipeline is quiet. Unstructured Task on purpose: awaiting here
+        // would hold the indexer "running" through the whole backfill, so a
+        // library change during it would set pendingRerun after the loop
+        // already exited and never get consumed. The backfill self-guards
+        // against overlapping runs and is a no-op when nothing is missing.
+        if !Task.isCancelled {
+            Task { await SharpnessBackfill.shared.runIfNeeded(library: library) }
+        }
     }
 
     private func runIndexPass(from library: PhotoLibraryModel) async {
@@ -205,7 +246,9 @@ final class Indexer: ObservableObject {
                             faceRects:           result.faceRects,
                             isVideo:             asset.mediaType == .video,
                             duration:            asset.duration,
-                            clipFrameEmbeddings: result.clipFrameEmbeddings
+                            clipFrameEmbeddings: result.clipFrameEmbeddings,
+                            faceSharpness:       result.faceSharpness,
+                            imageSharpness:      result.imageSharpness
                         )
                         clearFailure(asset.localIdentifier)
                     } else if !Task.isCancelled {

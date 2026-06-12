@@ -12,6 +12,9 @@ struct PeopleView: View {
     @State private var pendingMerge: PendingMerge?
     @State private var pendingDelete: PersonCluster?
     @State private var showReindexConfirm = false
+    @State private var showTogetherPicker = false
+    @State private var togetherSelection: TogetherSelection?
+    @State private var growCluster: PersonCluster?
     @FocusState private var focusedID: Int?
 
     private var people: [PersonCluster] { store.activeClusters }
@@ -31,6 +34,13 @@ struct PeopleView: View {
             }
             .navigationTitle("People")
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    // Together: pick 2+ people, see every photo they share.
+                    Button { showTogetherPicker = true } label: {
+                        Image(systemName: "person.2")
+                    }
+                    .disabled(people.count < 2)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     // Non-destructive: re-groups people from stored face
                     // embeddings (global DBSCAN, same pass the backend used).
@@ -66,8 +76,24 @@ struct PeopleView: View {
             .navigationDestination(item: $openCluster) { cluster in
                 PersonPhotosView(cluster: cluster)
             }
+            .navigationDestination(item: $togetherSelection) { selection in
+                TogetherView(clusters: selection.clusters)
+            }
+            .navigationDestination(item: $growCluster) { cluster in
+                GrowthTimelineView(cluster: cluster)
+            }
             .sheet(item: $membersOf) { cluster in
                 PersonMembersView(cluster: cluster) { }
+            }
+            .sheet(isPresented: $showTogetherPicker) {
+                TogetherPickerSheet { picked in
+                    // Let the sheet finish dismissing before pushing — setting
+                    // the navigation item while the sheet is mid-dismiss can
+                    // swallow the push entirely.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        togetherSelection = TogetherSelection(clusters: picked)
+                    }
+                }
             }
             .alert("Merge people?", isPresented: mergeAlertShown, presenting: pendingMerge) { merge in
                 Button("Merge") { doMerge(source: merge.source, into: merge.target) }
@@ -120,6 +146,7 @@ struct PeopleView: View {
                         focusedID: $focusedID,
                         onSave: { saveName(cluster.id) },
                         onOpen: { openCluster = cluster },
+                        onGrow: { growCluster = cluster },
                         onDelete: { pendingDelete = cluster },
                         onShowMembers: { membersOf = cluster },
                         onMerge: { source in
@@ -159,6 +186,7 @@ private struct PersonRow: View {
     var focusedID: FocusState<Int?>.Binding
     let onSave: () -> Void
     let onOpen: () -> Void
+    let onGrow: () -> Void
     let onDelete: () -> Void
     let onShowMembers: () -> Void
     let onMerge: (Int) -> Void
@@ -197,6 +225,7 @@ private struct PersonRow: View {
 
             Menu {
                 Button { onOpen() }         label: { Label("See Photos", systemImage: "photo.on.rectangle") }
+                Button { onGrow() }         label: { Label("Watch Them Grow", systemImage: "sparkles") }
                 Button { onShowMembers() }  label: { Label("Merged Faces", systemImage: "person.2") }
                 Button(role: .destructive, action: onDelete) { Label("Remove", systemImage: "trash") }
             } label: {

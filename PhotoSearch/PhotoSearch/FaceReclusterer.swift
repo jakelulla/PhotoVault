@@ -39,6 +39,13 @@ enum FaceReclusterer {
         /// assigned face in that photo. Photos in the input with no assigned
         /// faces are present with an empty array.
         var assignments: [String: [Int]]
+        /// assetID → per-face cluster index (into `clusters`) in input/log
+        /// order, one entry per face INCLUDING unassigned/unusable ones
+        /// (nil). PhotoStore rewrites each stored PhotoFace.clusterID
+        /// positionally from this after applying the result — the rebuild
+        /// renumbers every cluster from 0, so a stale stored ID would
+        /// silently resolve to a different person.
+        var faceAssignments: [String: [Int?]]
     }
 
     /// Named prototypes from the previous clustering, used to carry
@@ -87,6 +94,9 @@ enum FaceReclusterer {
         }
         var assignments: [String: [Int]] = [:]
         var bestArea = [Double](repeating: -1, count: clusterCount)
+        /// Per-usable-face winning cluster (nil = below matchThreshold) —
+        /// folded back into per-asset, input-order lists below.
+        var usableWinners = [Int?](repeating: nil, count: n)
 
         for (i, face) in usable.enumerated() {
             if assignments[face.assetID] == nil { assignments[face.assetID] = [] }
@@ -103,6 +113,7 @@ enum FaceReclusterer {
                 if sim > bestSim { bestSim = sim; bestC = c }
             }
             guard bestC >= 0 else { continue }
+            usableWinners[i] = bestC
             assignments[face.assetID]?.append(bestC)
             if !clusters[bestC].photoAssetIDs.contains(face.assetID) {
                 clusters[bestC].photoAssetIDs.append(face.assetID)
@@ -134,6 +145,21 @@ enum FaceReclusterer {
             }
         }
 
+        // Per-asset face assignments in input order, one entry per face of
+        // the ORIGINAL input — unusable faces (wrong dim) keep a nil slot so
+        // the lists stay positionally parallel with the face log (and thus
+        // with the PhotoFace arrays stored on photos).
+        var faceAssignments: [String: [Int?]] = [:]
+        var u = 0
+        for f in faces {
+            if f.embedding.count == dim {
+                faceAssignments[f.assetID, default: []].append(usableWinners[u])
+                u += 1
+            } else {
+                faceAssignments[f.assetID, default: []].append(nil)
+            }
+        }
+
         // Drop clusters that ended up with no photos (all members stolen by a
         // more similar prototype) and remap assignment indices.
         var remap = [Int](repeating: -1, count: clusterCount)
@@ -145,8 +171,15 @@ enum FaceReclusterer {
         for (asset, list) in assignments {
             assignments[asset] = list.compactMap { remap[$0] >= 0 ? remap[$0] : nil }
         }
+        for (asset, list) in faceAssignments {
+            faceAssignments[asset] = list.map { c -> Int? in
+                guard let c, remap[c] >= 0 else { return nil }
+                return remap[c]
+            }
+        }
 
-        return Result(clusters: kept, assignments: assignments)
+        return Result(clusters: kept, assignments: assignments,
+                      faceAssignments: faceAssignments)
     }
 
     // MARK: - Neighbor graph (blocked similarity matrix via BLAS)
