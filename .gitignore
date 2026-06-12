@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Local Claude Code session data
+.claude/
+
 # Xcode
 build/
 DerivedData/
