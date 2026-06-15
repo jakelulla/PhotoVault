@@ -5,6 +5,14 @@ struct ContentView: View {
     @StateObject private var library = PhotoLibraryModel()
     @StateObject private var indexer = Indexer()
 
+    /// Unit tests run inside this host app and drive PhotoStore.shared
+    /// directly. Without this gate the launch-time indexer walks the
+    /// simulator's real photo library and calls store.index() concurrently
+    /// with the tests, leaking real assets into the singleton mid-test (a
+    /// non-hermetic flake). Skip all auto-indexing when hosting XCTest.
+    private static let runningTests =
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+
     var body: some View {
         Group {
             switch library.status {
@@ -13,6 +21,7 @@ struct ContentView: View {
                     .environmentObject(library)
                     .environmentObject(indexer)
                     .task {
+                        guard !Self.runningTests else { return }
                         await indexer.indexNewPhotos(from: library)
                     }
                     // Belt-and-braces backfill trigger: the indexer fires one
@@ -22,12 +31,14 @@ struct ContentView: View {
                     // ~5s of clear air for first paint and indexing spin-up;
                     // a no-op once every photo carries the data.
                     .task {
+                        guard !Self.runningTests else { return }
                         guard (try? await Task.sleep(for: .seconds(5))) != nil else { return }
                         await SharpnessBackfill.shared.runIfNeeded(library: library)
                     }
                     // Photos taken (or synced in) after launch: the library's
                     // change observer bumps the token; index the new arrivals.
                     .onChange(of: library.libraryChangeToken) {
+                        guard !Self.runningTests else { return }
                         Task { await indexer.indexNewPhotos(from: library) }
                     }
             case .denied, .restricted:

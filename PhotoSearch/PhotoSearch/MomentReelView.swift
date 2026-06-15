@@ -282,7 +282,12 @@ final class ReelPlayerModel: ObservableObject {
             self.endObserver = nil
         }
         player.replaceCurrentItem(with: nil)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // Only deactivate if we actually activated it — start() skips activation
+        // for empty hits, and deactivating a session we never owned can spuriously
+        // resume another app's audio (the .notifyOthersOnDeactivation signal).
+        if started {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     // MARK: Controls

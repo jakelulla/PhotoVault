@@ -127,7 +127,9 @@ struct GrowthTimelineView: View {
             let cellW = geo.size.width / CGFloat(count)
             let dim = max(24, min(56, cellW - 8))
             // Hide captions that would collide when years outnumber the width.
-            let labelStride = max(1, Int((34 / cellW).rounded(.up)))
+            // Guard the divisor: a zero-width layout pass (cellW == 0) makes
+            // 34/cellW non-finite and Int() of that traps.
+            let labelStride = cellW >= 1 ? max(1, Int((34 / cellW).rounded(.up))) : 1
             HStack(spacing: 0) {
                 ForEach(entries.indices, id: \.self) { i in
                     VStack(spacing: 4) {

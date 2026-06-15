@@ -426,6 +426,46 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertNil(p.faces)
         XCTAssertNil(p.sharpness)
     }
+
+    // MARK: - Structured search: word-boundary name matching
+
+    func testPersonNameFilterMatchesOnWordBoundary() {
+        // A face-bearing photo whose cluster we name "Mar". The structured
+        // person filter must NOT fire on a query that merely *contains* "mar"
+        // as a substring ("marble"), only on the whole word "mar".
+        let r = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        indexPhoto("p", emb: unitEmb(axis: 0), faceEmbeddings: [unitEmb(axis: 10)],
+                   faceRects: [r])
+        let cid = clusterID(of: "p")
+        store.setClusterName(id: cid, name: "Mar")
+
+        // Substring "marble" must not pull the named cluster in: with no person
+        // match the caption keeps the whole query for CLIP ranking.
+        let substr = store.structuredSearchStage(query: "marble countertop")
+        XCTAssertTrue(substr.caption.contains("marble"))
+        XCTAssertEqual(substr.candidates.count, 1)  // unfiltered by person name
+
+        // Whole word "mar" matches: photos hard-filter to the cluster's
+        // members and "mar" is consumed out of the caption.
+        let whole = store.structuredSearchStage(query: "mar")
+        XCTAssertEqual(whole.candidates.map(\.assetID), ["p"])
+        XCTAssertFalse(whole.caption.contains("mar"))
+    }
+
+    func testMonthFilterMatchesOnWordBoundary() {
+        indexPhoto("dec-photo", emb: unitEmb(axis: 0), createdAt: date(2021, 12, 1))
+        indexPhoto("jun-photo", emb: unitEmb(axis: 1), createdAt: date(2021, 6, 1))
+
+        // "decorations 2021" must not be read as December 2021 — "dec" is a
+        // substring, not a whole word, so the year-only filter applies and
+        // both 2021 photos survive.
+        let decor = store.structuredSearchStage(query: "decorations 2021")
+        XCTAssertEqual(Set(decor.candidates.map(\.assetID)), ["dec-photo", "jun-photo"])
+
+        // "december 2021" is a whole word → month+year filter narrows to Dec.
+        let december = store.structuredSearchStage(query: "december 2021")
+        XCTAssertEqual(december.candidates.map(\.assetID), ["dec-photo"])
+    }
 }
 
 // MARK: - Binary codec

@@ -84,9 +84,17 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
         }
         assets = fetched
 
-        if !removedIDs.isEmpty {
+        // Only prune (which irreversibly strips folder membership) under full
+        // access. Under .limited the fetch only sees the user-selected subset,
+        // so a removed entry means "left the selection", not "deleted from the
+        // library" — pruning it would discard folder membership with no record
+        // to restore it. Mirrors LibraryBrowseView.prepareSync and
+        // SharpnessBackfill's goneForGood guard.
+        let fullAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+        if fullAccess && !removedIDs.isEmpty {
             PhotoStore.shared.pruneDeletedAssets(removedIDs)
         }
+        // Still bump the token on insertions so newly-selected photos index.
         if inserted || !removedIDs.isEmpty {
             libraryChangeToken += 1
         }
@@ -140,6 +148,18 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
                     cont.resume(returning: av)
                 }
                 state.register(id)
+                // Timeout backstop. A stuck iCloud-offline video fetch can
+                // otherwise stall this continuation forever and hang the whole
+                // foreground index pass. The one-shot flag keeps the
+                // continuation single-resume; the losing request is CANCELLED,
+                // not abandoned, so its download stops grinding. Mirrors
+                // ReelAssetLoader.avAsset in MomentReelView.
+                DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
+                    if state.takeResume() {
+                        cont.resume(returning: nil)
+                        state.cancel()
+                    }
+                }
             }
         } onCancel: {
             state.cancel()

@@ -172,38 +172,74 @@ final class PhotoStore: ObservableObject {
 
     // MARK: - Load / Persist
 
+    /// A store file exists on disk but failed to decode (truncated by a kill
+    /// mid-write, disk corruption, schema skew). Without this, load() proceeds
+    /// as if the store were empty, and the very next persist() overwrites the
+    /// original bytes with an empty store — turning a recoverable read error
+    /// into permanent data loss. Renaming the bad file to "<name>.corrupt"
+    /// frees the path for a fresh empty store while preserving the original
+    /// bytes for manual recovery. Returns whether a rename happened.
+    @discardableResult
+    private func backupCorruptStore(_ url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        let backup = url.appendingPathExtension("corrupt")
+        try? FileManager.default.removeItem(at: backup)   // keep only the latest
+        try? FileManager.default.moveItem(at: url, to: backup)
+        return true
+    }
+
+    /// Read a store's bytes, distinguishing a READ failure from a DECODE
+    /// failure. Returns nil in both cases, but only renames the file to
+    /// .corrupt when the bytes were read successfully yet failed to decode
+    /// (genuine corruption / schema skew). A transient read failure — e.g. an
+    /// iOS Data-Protection denial during a locked-device BGProcessingTask
+    /// launch — must NOT rename a healthy file: doing so frees the path for the
+    /// next persist() to overwrite with an empty store, turning a recoverable
+    /// I/O error into data loss. On a read failure we leave the file untouched
+    /// so it self-heals on the next successful launch.
+    private func loadStore<T>(_ url: URL, _ decode: (Data) -> T?) -> T? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        if let value = decode(data) { return value }
+        backupCorruptStore(url)
+        return nil
+    }
+
     func load() {
         let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: Self.photosURL),
-           let arr  = try? dec.decode([LocalPhoto].self, from: data) {
+        if let arr = loadStore(Self.photosURL, { try? dec.decode([LocalPhoto].self, from: $0) }) {
             photos = arr
             photoIndex = Dictionary(uniqueKeysWithValues: arr.enumerated().map { ($1.assetID, $0) })
             nextPhotoID = (arr.map(\.photoID).max() ?? -1) + 1
         }
-        if let data = try? Data(contentsOf: Self.clustersURL),
-           let arr  = try? dec.decode([PersonCluster].self, from: data) {
+        if let arr = loadStore(Self.clustersURL, { try? dec.decode([PersonCluster].self, from: $0) }) {
             clusters = arr
             nextClusterID = (arr.map(\.id).max() ?? -1) + 1
         }
-        if let data = try? Data(contentsOf: Self.locationsURL),
-           let arr  = try? dec.decode([LocalLocation].self, from: data) {
+        if let arr = loadStore(Self.locationsURL, { try? dec.decode([LocalLocation].self, from: $0) }) {
             locations = arr
         }
-        if let data = try? Data(contentsOf: Self.foldersURL),
-           let arr  = try? dec.decode([LocalFolder].self, from: data) {
+        if let arr = loadStore(Self.foldersURL, { try? dec.decode([LocalFolder].self, from: $0) }) {
             folders = arr
         }
         // CLIP embeddings: binary store, with one-time migration from the
         // legacy JSON file (JSON cost 100MB+ encodes and slow launches at
-        // tens of thousands of photos).
-        if let data = try? Data(contentsOf: Self.clipBinURL),
-           let dict = BinaryEmbeddingCodec.decode(data) {
+        // tens of thousands of photos). Use loadStore so a transient read
+        // failure leaves the binary untouched (only a successful-read-but-bad-
+        // decode backs it up); a re-index can rewrite from the .corrupt copy.
+        if let dict = loadStore(Self.clipBinURL, { BinaryEmbeddingCodec.decode($0) }) {
             clipEmbeddings = dict
         } else if let data = try? Data(contentsOf: Self.embeddingsURL),
                   let dict = try? JSONDecoder().decode([String: [Float]].self, from: data) {
             clipEmbeddings = dict
             try? BinaryEmbeddingCodec.encode(dict).write(to: Self.clipBinURL, options: .atomic)
             try? FileManager.default.removeItem(at: Self.embeddingsURL)
+        }
+        // Embeddings empty but photos exist → the binary went missing/corrupt
+        // (the contains() re-index gate keys off photos, not embeddings, so
+        // these would otherwise stay unsearchable). The .corrupt rename above
+        // preserves recovery; surface it for diagnostics.
+        if clipEmbeddings.isEmpty && !photos.isEmpty {
+            print("[PhotoStore] \(photos.count) photos loaded but clipEmbeddings empty — embeddings missing/corrupt")
         }
         // Per-frame video embeddings (new store — no legacy format to
         // migrate; videos indexed before it exists simply have no entry).
@@ -292,6 +328,15 @@ final class PhotoStore: ObservableObject {
     /// persistAndWait(); callers tearing state down synchronously (resetIndex)
     /// use persistAll().
     func persist() {
+        // A debounced persistTask may still be pending (schedulePersist set it,
+        // and a direct persist()/persistAndWait() call beat the 3s timer). This
+        // synchronous write already flushes everything currently dirty, so the
+        // pending task is redundant — and worse, if left live it fires later
+        // (potentially after a resetIndex on a shared singleton) and writes
+        // whatever is dirty *then*, leaking one context's state across a
+        // boundary. Cancel it so persist() is the single source of truth.
+        persistTask?.cancel()
+        persistTask = nil
         indexesSincePersist = 0
         let toWrite = dirty
         dirty = []
@@ -717,27 +762,54 @@ final class PhotoStore: ObservableObject {
         }
         clusters = newClusters
         nextClusterID = newClusters.count
+        // A reentrant index() during the off-main DBSCAN (await above) may have
+        // indexed NEW photos and given them a greedy assignment in the OLD ID
+        // space. The rebuild renumbers every cluster from 0, so those live IDs
+        // now point at a DIFFERENT person (or out of range) — a misattribution
+        // resolvedClusterID can't detect (it only follows merge chains). We
+        // must NOT preserve them. Instead clear them: a temporarily person-less
+        // photo is recoverable, a wrong-person one is not. Track whether any
+        // such photo appeared so we can schedule a follow-up pass that actually
+        // sees them — index() doesn't set reclusterPending itself.
+        var sawUnsnapshottedAsset = false
         for i in photos.indices {
-            photos[i].personClusterIDs = result.assignments[photos[i].assetID] ?? []
+            let assetID = photos[i].assetID
+            // Only assets this pass saw get a result-derived assignment; assets
+            // absent from the snapshot (freshly indexed, or soft-deleted) carry
+            // stale OLD-space IDs and must be cleared, never preserved.
+            if let assigned = result.assignments[assetID] {
+                photos[i].personClusterIDs = assigned
+            } else {
+                if !validAssets.contains(assetID) && !photos[i].isDeleted {
+                    sawUnsnapshottedAsset = true
+                }
+                photos[i].personClusterIDs = []
+            }
             // Stored per-photo faces carry raw cluster IDs from the OLD
             // numbering; the rebuild reuses IDs from 0, so a stale ID would
             // silently resolve to a different person (resolvedClusterID only
             // follows merge chains, which this pass wipes). Rewrite them from
             // the same pass, positionally — stored PhotoFace arrays and the
-            // face log share face order and count. Photos the pass didn't see
-            // (soft-deleted, torn log record) get their IDs cleared instead:
-            // no face match beats the wrong person's face, and the next pass
-            // that includes them re-assigns (mirroring personClusterIDs,
-            // which restore also defers to the next recluster).
+            // face log share face order and count. Same rule: clear (don't
+            // preserve) any face the result didn't name, so no stale old-space
+            // ID survives the renumbering.
             guard var faces = photos[i].faces, !faces.isEmpty else { continue }
-            if let assigned = result.faceAssignments[photos[i].assetID],
+            if let assigned = result.faceAssignments[assetID],
                assigned.count == faces.count {
                 for j in faces.indices { faces[j].clusterID = assigned[j] }
             } else {
+                // Unmatched (freshly indexed during the await, soft-deleted, or
+                // torn log record): nil beats the wrong person's face. The
+                // follow-up pass scheduled below re-assigns the fresh ones.
                 for j in faces.indices { faces[j].clusterID = nil }
             }
             photos[i].faces = faces
         }
+        // A photo was indexed during the off-main compute and cleared above —
+        // it's now person-less. Run one more pass (reclusterPeople's repeat
+        // loop honors this flag) so it gets a real, current-ID-space
+        // assignment from the next DBSCAN instead of staying unattributed.
+        if sawUnsnapshottedAsset { reclusterPending = true }
         // New ID space: invalidate any in-flight prototype-snapshot matching
         // (SharpnessBackfill), and refresh views keyed on membership.
         clusterEpoch += 1
@@ -845,7 +917,14 @@ final class PhotoStore: ObservableObject {
 
     private func applyLocation(assetID: String, name: String) {
         guard !name.isEmpty else { return }
-        if let idx = photoIndex[assetID] { photos[idx].locationName = name }
+        // A deferred reverse-geocode can land after the photo was soft-deleted.
+        // Skip the whole body for deleted (or torn-out) photos so we don't
+        // resurrect a phantom into a Places bucket. restorePhotos re-attaches
+        // buckets from locationName, or re-enqueues the geocode from lat/lon
+        // (cheap, per-cell cached) if it never resolved — so skipping here is
+        // safe.
+        guard let idx = photoIndex[assetID], !photos[idx].isDeleted else { return }
+        photos[idx].locationName = name
         if let li = locations.firstIndex(where: { $0.name == name }) {
             if !locations[li].photoAssetIDs.contains(assetID) {
                 locations[li].photoAssetIDs.append(assetID)
@@ -864,12 +943,24 @@ final class PhotoStore: ObservableObject {
         photos[idx].isDeleted = true
         for ci in 0..<clusters.count  { clusters[ci].photoAssetIDs.removeAll { $0 == assetID } }
         for li in 0..<locations.count { locations[li].photoAssetIDs.removeAll { $0 == assetID } }
+        // Drop the assetID from any pending geocode cell: a deferred lookup
+        // draining after delete would otherwise re-resurrect it into a Places
+        // bucket (and the dangling ID persists in geocode_pending.json and is
+        // re-drained next launch). restorePhotos re-enqueues from lat/lon, so
+        // removal here doesn't lose the eventual place name.
+        for (k, var job) in geocodePending {
+            if let i = job.assetIDs.firstIndex(of: assetID) {
+                job.assetIDs.remove(at: i)
+                if job.assetIDs.isEmpty { geocodePending.removeValue(forKey: k) }
+                else { geocodePending[k] = job }
+            }
+        }
         // Folder membership intentionally survives a soft delete — folder
         // reads filter !isDeleted instead (allPhotos/searchPhotos/activeCount),
         // so restorePhotos can bring a photo back into its folders. Stripping
         // here was irreversible: nothing recorded which folders held it.
         membershipVersion += 1
-        schedulePersist([.photos, .clusters, .locations])
+        schedulePersist([.photos, .clusters, .locations, .geocode])
     }
 
     func deletePhoto(photoID: Int) {
@@ -944,8 +1035,16 @@ final class PhotoStore: ObservableObject {
         // Unlike deletePhoto, folder membership IS stripped here: these
         // assets are gone from the camera roll and can never be restored.
         for fi in 0..<folders.count   { folders[fi].photoAssetIDs.removeAll { assetIDs.contains($0) } }
+        // Drain pruned IDs from the pending geocode queue (as deletePhoto does):
+        // a pruned asset can never be restored, so leaving its ID in
+        // geocode_pending.json is pure residue that re-drains every launch.
+        for (k, var job) in geocodePending {
+            job.assetIDs.removeAll { assetIDs.contains($0) }
+            if job.assetIDs.isEmpty { geocodePending.removeValue(forKey: k) }
+            else { geocodePending[k] = job }
+        }
         membershipVersion += 1
-        schedulePersist([.photos, .clusters, .locations, .folders])
+        schedulePersist([.photos, .clusters, .locations, .folders, .geocode])
     }
 
     // MARK: - People
@@ -1593,8 +1692,8 @@ final class PhotoStore: ObservableObject {
         // name necessarily contains the city part too).
         let matchingLocs = locations.filter { loc in
             let city = cityPart(of: loc.name)
-            if !city.isEmpty, q.contains(city) { return true }
-            return loc.alias.map { !$0.isEmpty && q.contains($0.lowercased()) } ?? false
+            if matchesWord(city, in: q) { return true }
+            return loc.alias.map { matchesWord($0.lowercased(), in: q) } ?? false
         }
         if !matchingLocs.isEmpty {
             let nameSet = Set(matchingLocs.map(\.name))
@@ -1604,7 +1703,7 @@ final class PhotoStore: ObservableObject {
         // Person name filter
         let matchingClusters = clusters.filter { c in
             guard let name = c.name, !name.isEmpty else { return false }
-            return q.contains(name.lowercased())
+            return matchesWord(name.lowercased(), in: q)
         }
         if !matchingClusters.isEmpty {
             let resolvedIDs = Set(matchingClusters.map { resolvedClusterID($0.id) })
@@ -1734,6 +1833,18 @@ final class PhotoStore: ObservableObject {
         let head = name.split(separator: ",", maxSplits: 1,
                               omittingEmptySubsequences: false).first ?? Substring(name)
         return head.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
+    /// Whole-word/phrase match of `term` inside `q`. A raw `q.contains(term)`
+    /// over-matches: a person named "Mar" matches "marble", "dec" matches
+    /// "decorations". Wrap the (regex-escaped) term in `\b…\b` so it only fires
+    /// on word boundaries, while a multi-word term ("san francisco", "mary
+    /// jane") still matches as a contiguous phrase. Mirrors the year filter's
+    /// existing `\b(19|20)\d{2}\b` idiom. `term` is expected lowercased.
+    private func matchesWord(_ term: String, in q: String) -> Bool {
+        guard !term.isEmpty else { return false }
+        let pattern = #"\b"# + NSRegularExpression.escapedPattern(for: term) + #"\b"#
+        return q.range(of: pattern, options: .regularExpression) != nil
     }
 
     /// Words of the query left over after removing everything the structured
@@ -1938,7 +2049,10 @@ final class PhotoStore: ObservableObject {
                       "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
                       "sep":9,"oct":10,"nov":11,"dec":12]
         for (name, m) in months {
-            if q.contains(name) {
+            // Word-bounded: a bare q.contains would let "dec" match
+            // "decorations", "mar" match "marble". (Same class of bug as the
+            // person/location filters above.)
+            if matchesWord(name, in: q) {
                 if let range = q.range(of: #"\b(19|20)\d{2}\b"#, options: .regularExpression),
                    let y = Int(q[range]) {
                     return (y, m)
