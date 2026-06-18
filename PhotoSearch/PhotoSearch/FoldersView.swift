@@ -334,6 +334,25 @@ struct FoldersGrid: View {
                 .padding(.top, 12)
             }
 
+            // Shared Albums entry: CloudKit-backed albums you share with other
+            // people. Visually consistent with the folder cards below. Tapping
+            // is the ONLY path that reaches CloudKit — nothing loads at launch.
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Shared Albums")
+                    .font(.title3.bold())
+                    .padding(.horizontal, 16)
+                LazyVGrid(columns: columns, spacing: 16) {
+                    NavigationLink {
+                        SharedAlbumsView()
+                    } label: {
+                        SharedAlbumsEntryCard()
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.top, 12)
+
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(store.folders) { folder in
                     NavigationLink {
