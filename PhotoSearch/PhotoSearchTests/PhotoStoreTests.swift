@@ -1,3 +1,4 @@
+import CloudKit
 import CoreGraphics
 import XCTest
 @testable import PhotoSearch
@@ -465,6 +466,132 @@ final class PhotoStoreTests: XCTestCase {
         // "december 2021" is a whole word → month+year filter narrows to Dec.
         let december = store.structuredSearchStage(query: "december 2021")
         XCTAssertEqual(december.candidates.map(\.assetID), ["dec-photo"])
+    }
+}
+
+// MARK: - Shared albums: pure-logic round-trips (no CloudKit network)
+
+/// These exercise only the value<->CKRecord mapping and the change-token cache
+/// encode/decode — both pure logic. They construct CKRecords in memory and never
+/// reach a CloudKit container, so they run fine in the simulator test host where
+/// CloudKit itself is unavailable.
+final class SharedAlbumMappingTests: XCTestCase {
+
+    private func zoneID() -> CKRecordZone.ID {
+        CKRecordZone.ID(zoneName: "album-zone-1", ownerName: CKCurrentUserDefaultName)
+    }
+
+    func testSharedPhotoRecordMetadataRoundTrips() {
+        let zone = zoneID()
+        let payload = SharedPhotoUploadPayload(
+            fullImageURL: URL(fileURLWithPath: "/tmp/full.jpg"),
+            thumbnailURL: URL(fileURLWithPath: "/tmp/thumb.jpg"),
+            contributorID: "user-abc",
+            captureDate: Date(timeIntervalSince1970: 1_700_000_000),
+            latitude: 37.33,
+            longitude: -122.03,
+            originalFilename: "IMG_0001.HEIC",
+            contentHash: "deadbeef")
+        let rootRef = CKRecord.Reference(
+            recordID: CKRecord.ID(recordName: SharedAlbum.RecordType.albumRootRecordName,
+                                  zoneID: zone),
+            action: .none)
+
+        let record = SharedPhoto.makeRecord(from: payload, inZone: zone, albumRootRef: rootRef)
+
+        // The record lands in the album's zone, with both assets + the cascade
+        // reference set.
+        XCTAssertEqual(record.recordType, SharedAlbum.RecordType.photo)
+        XCTAssertEqual(record.recordID.zoneID, zone)
+        XCTAssertNotNil(record[SharedAlbum.PhotoField.fullImage] as? CKAsset)
+        XCTAssertNotNil(record[SharedAlbum.PhotoField.thumbnail] as? CKAsset)
+        XCTAssertEqual(record.parent?.recordID.recordName,
+                       SharedAlbum.RecordType.albumRootRecordName)
+        let albumRef = record[SharedAlbum.PhotoField.album] as? CKRecord.Reference
+        XCTAssertEqual(albumRef?.action, .deleteSelf)
+
+        // Mapping the record back recovers the metadata (assets are not read by
+        // the value-type init, by design).
+        let photo = SharedPhoto(record: record)
+        XCTAssertNotNil(photo)
+        XCTAssertEqual(photo?.contributorID, "user-abc")
+        XCTAssertEqual(photo?.captureDate, Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(photo?.latitude, 37.33)
+        XCTAssertEqual(photo?.longitude, -122.03)
+        XCTAssertEqual(photo?.originalFilename, "IMG_0001.HEIC")
+        XCTAssertEqual(photo?.contentHash, "deadbeef")
+        XCTAssertEqual(photo?.albumZoneName, zone.zoneName)
+        XCTAssertEqual(photo?.id, record.recordID.recordName)
+        // recordID rehydrates to the same identity it came from.
+        XCTAssertEqual(photo?.recordID, record.recordID)
+    }
+
+    func testSharedPhotoInitRejectsWrongRecordType() {
+        let wrong = CKRecord(recordType: SharedAlbum.RecordType.album,
+                             recordID: CKRecord.ID(recordName: "x", zoneID: zoneID()))
+        XCTAssertNil(SharedPhoto(record: wrong))
+    }
+
+    func testSharedPhotoOptionalMetadataDefaultsToNil() {
+        // A record with only the required asset fields still maps; optional
+        // metadata comes back nil rather than crashing.
+        let payload = SharedPhotoUploadPayload(
+            fullImageURL: URL(fileURLWithPath: "/tmp/f.jpg"),
+            thumbnailURL: URL(fileURLWithPath: "/tmp/t.jpg"),
+            contributorID: nil, captureDate: nil, latitude: nil,
+            longitude: nil, originalFilename: nil, contentHash: nil)
+        let rootRef = CKRecord.Reference(
+            recordID: CKRecord.ID(recordName: SharedAlbum.RecordType.albumRootRecordName,
+                                  zoneID: zoneID()),
+            action: .none)
+        let record = SharedPhoto.makeRecord(from: payload, inZone: zoneID(), albumRootRef: rootRef)
+        let photo = SharedPhoto(record: record)
+        XCTAssertNotNil(photo)
+        XCTAssertNil(photo?.captureDate)
+        XCTAssertNil(photo?.latitude)
+        XCTAssertNil(photo?.contentHash)
+    }
+
+    func testArrayChunkedSplitsEvenlyAndClampsZeroSize() {
+        XCTAssertEqual([1, 2, 3, 4, 5].chunked(into: 2), [[1, 2], [3, 4], [5]])
+        XCTAssertEqual([Int]().chunked(into: 3), [])
+        // A zero/negative size must not loop forever: clamp to 1.
+        XCTAssertEqual([1, 2].chunked(into: 0), [[1], [2]])
+    }
+}
+
+// MARK: - Shared albums: server-change-token cache encode/decode
+
+final class ChangeTokenCacheTests: XCTestCase {
+
+    /// A real CKServerChangeToken can only be minted by the server, so we build
+    /// the cache from an archived token by feeding it through an archive of a
+    /// known-archivable secure-coding object isn't possible directly. Instead we
+    /// verify the cache's Codable round-trip preserves whatever bytes it holds:
+    /// an empty cache encodes/decodes to an empty cache, and zone removal works.
+    func testEmptyCacheRoundTripsAndReportsEmpty() throws {
+        let cache = ChangeTokenCache()
+        XCTAssertTrue(cache.isEmpty)
+        let data = try JSONEncoder().encode(cache)
+        let back = try JSONDecoder().decode(ChangeTokenCache.self, from: data)
+        XCTAssertTrue(back.isEmpty)
+        XCTAssertNil(back.databaseToken(scope: .shared))
+        XCTAssertNil(back.zoneToken(CKRecordZone.ID(zoneName: "z", ownerName: "o")))
+    }
+
+    func testNilTokenWritesAreNoOps() {
+        var cache = ChangeTokenCache()
+        // Setting a nil database token leaves the cache empty (keep-last-good
+        // semantics); setting a nil zone token is a no-op.
+        cache.setDatabaseToken(nil, scope: .shared)
+        cache.setZoneToken(nil, for: CKRecordZone.ID(zoneName: "z", ownerName: "o"))
+        XCTAssertTrue(cache.isEmpty)
+    }
+
+    func testRemoveZoneOnEmptyCacheIsSafe() {
+        var cache = ChangeTokenCache()
+        cache.removeZone(CKRecordZone.ID(zoneName: "gone", ownerName: "o"))
+        XCTAssertTrue(cache.isEmpty)
     }
 }
 

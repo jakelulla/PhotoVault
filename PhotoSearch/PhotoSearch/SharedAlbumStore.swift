@@ -1,5 +1,8 @@
 import CloudKit
+import CryptoKit
 import Foundation
+import Photos
+import UIKit
 
 /// Owns the shared-albums state for the view layer. Mirrors PhotoStore's idiom:
 /// a `@MainActor` `ObservableObject` singleton, JSON persistence in the app's
@@ -37,7 +40,34 @@ final class SharedAlbumStore: ObservableObject {
     /// future "share with the same people again" affordance. Persisted locally.
     @Published private(set) var knownParticipantIDs: Set<String> = []
 
+    /// Photos currently loaded for the OPEN album, keyed by album id. Thumbnails
+    /// are stored alongside as in-memory bytes; full images are pulled lazily.
+    /// The detail view observes this; only the album it opened is populated.
+    @Published private(set) var photosByAlbum: [String: [SharedPhoto]] = [:]
+
+    /// In-memory thumbnail-bytes cache, keyed by SharedPhoto record name. Small
+    /// (~256px JPEGs); cleared wholesale on demand. Not persisted.
+    @Published private(set) var thumbnailCache: [String: Data] = [:]
+
+    /// Per-album upload progress in [0, 1]; absent when no upload is in flight.
+    /// The detail view shows a progress bar while present.
+    @Published private(set) var uploadProgress: [String: Double] = [:]
+
+    /// Albums currently performing a network load of their photos.
+    @Published private(set) var loadingPhotos: Set<String> = []
+
+    /// True once CKDatabaseSubscriptions have been registered this launch, so we
+    /// don't re-register on every view appearance. Reset only on relaunch.
+    private var subscriptionsRegistered = false
+
     private let cloud = CloudKitService.shared
+
+    /// True when running inside the XCTest host. Mirrors ContentView.runningTests
+    /// so launch/sync-reachable CloudKit work is skipped in the test suite even
+    /// if some entry point is exercised. Belt-and-braces with the isAvailable
+    /// guard (which already short-circuits on the simulator).
+    private static let runningTests =
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
     // MARK: - Storage paths (mirror PhotoStore's documents-dir JSON idiom)
 
@@ -50,6 +80,12 @@ final class SharedAlbumStore: ObservableObject {
 
     private static var albumsCacheURL: URL { storeDir.appendingPathComponent("shared_albums.json") }
     private static var participantsURL: URL { storeDir.appendingPathComponent("shared_participants.json") }
+    private static var changeTokensURL: URL { storeDir.appendingPathComponent("shared_change_tokens.json") }
+
+    /// In-memory copy of the persisted server-change-token cache. Loaded lazily
+    /// (and only when CloudKit is available), so it never touches disk at launch
+    /// or in tests. See `ChangeTokenCache` for the encode/decode contract.
+    private var tokenCache = ChangeTokenCache()
 
     /// Loads only the LOCAL cache — no CloudKit. Safe at any time. Not called
     /// from init by default to honor the "do not auto-run" rule; SharedAlbumsView
@@ -265,6 +301,390 @@ final class SharedAlbumStore: ObservableObject {
         }
     }
 
+    // MARK: - Contribute photos (Phase 3)
+
+    /// Upload local library assets (by `localIdentifier`) into a shared album.
+    /// For each asset we fetch full-res JPEG bytes + a ~256px thumbnail via
+    /// PhotoLibraryModel, write them to temp files, then hand the batch to
+    /// CloudKitService.uploadPhotos. Progress is published per-album; partial
+    /// failures are tolerated (some photos may upload while others fail). The
+    /// album's `photoCount` is bumped optimistically by the number that saved.
+    ///
+    /// Guards on availability up front, so it is inert on the simulator / in
+    /// tests. Always clears `uploadProgress` for the album on exit.
+    func addPhotos(localAssetIDs: [String], toAlbum album: SharedAlbum) async {
+        guard !localAssetIDs.isEmpty else { return }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else {
+            state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
+            return
+        }
+
+        uploadProgress[album.id] = 0
+        defer { uploadProgress[album.id] = nil }
+
+        // Resolve which database the album lives in.
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        let albumRootRef = CKRecord.Reference(recordID: album.recordID, action: .deleteSelf)
+        let contributor = await currentUserDisplayName()
+
+        // 1. Materialize bytes → temp files for each asset (skip failures).
+        var payloads: [SharedPhotoUploadPayload] = []
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: localAssetIDs, options: nil)
+        var phAssets: [PHAsset] = []
+        assets.enumerateObjects { asset, _, _ in phAssets.append(asset) }
+
+        for asset in phAssets {
+            if let payload = await makePayload(for: asset, contributor: contributor) {
+                payloads.append(payload)
+            }
+        }
+
+        guard !payloads.isEmpty else {
+            state = .error(message: "Couldn't read the selected photos.")
+            return
+        }
+
+        // 2. Upload. Progress callback updates the published fraction.
+        do {
+            let saved = try await cloud.uploadPhotos(
+                payloads,
+                toZone: album.zoneID,
+                database: database,
+                albumRootRef: albumRootRef,
+                progress: { [weak self] done, total in
+                    guard let self, total > 0 else { return }
+                    self.uploadProgress[album.id] = Double(done) / Double(total)
+                })
+
+            // 3. Optimistic count bump + cache.
+            if saved > 0, let idx = albums.firstIndex(where: { $0.id == album.id }) {
+                albums[idx].photoCount += saved
+                persistCache()
+            }
+            // Pull the fresh list so the just-uploaded photos appear.
+            await loadPhotos(forAlbum: album)
+            if saved < payloads.count {
+                state = .error(message: "Some photos couldn't be uploaded.")
+            }
+        } catch {
+            state = .error(message: cloud.map(error).localizedDescription)
+        }
+    }
+
+    /// Build an upload payload from a PHAsset: full-res JPEG + ~256px thumbnail
+    /// written to unique temp files, plus capture metadata + a content hash.
+    /// Returns nil if the bytes can't be read. The temp files are owned by the
+    /// uploader, which deletes them after the upload completes.
+    private func makePayload(for asset: PHAsset,
+                            contributor: String?) async -> SharedPhotoUploadPayload? {
+        let library = PhotoLibraryModel.uploadHelper
+        guard let fullData = await library.fullImageData(for: asset) else { return nil }
+        let thumbData = await library.thumbnailData(for: asset, maxPixel: 256)
+            ?? fullData   // fall back to full bytes if a separate thumb fails
+
+        let tmp = FileManager.default.temporaryDirectory
+        let stem = UUID().uuidString
+        let fullURL = tmp.appendingPathComponent("\(stem)-full.jpg")
+        let thumbURL = tmp.appendingPathComponent("\(stem)-thumb.jpg")
+        do {
+            try fullData.write(to: fullURL, options: .atomic)
+            try thumbData.write(to: thumbURL, options: .atomic)
+        } catch {
+            try? FileManager.default.removeItem(at: fullURL)
+            try? FileManager.default.removeItem(at: thumbURL)
+            return nil
+        }
+
+        let hash = SHA256.hash(data: fullData).map { String(format: "%02x", $0) }.joined()
+        let loc = asset.location
+        // Original filename via the public PHAssetResource API (no private KVC).
+        let filename = PHAssetResource.assetResources(for: asset).first?.originalFilename
+        return SharedPhotoUploadPayload(
+            fullImageURL: fullURL,
+            thumbnailURL: thumbURL,
+            contributorID: contributor,
+            captureDate: asset.creationDate,
+            latitude: loc?.coordinate.latitude,
+            longitude: loc?.coordinate.longitude,
+            originalFilename: filename,
+            contentHash: hash)
+    }
+
+    // MARK: - Load + view photos (Phase 4)
+
+    /// Fetch an album's photos (metadata + thumbnail bytes; NOT the full image)
+    /// and publish them for the detail view. Tolerant of availability failure
+    /// (keeps whatever is cached). Caches thumbnail bytes in memory.
+    func loadPhotos(forAlbum album: SharedAlbum) async {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else {
+            state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
+            return
+        }
+        loadingPhotos.insert(album.id)
+        defer { loadingPhotos.remove(album.id) }
+
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        do {
+            let loaded = try await cloud.loadPhotos(inZone: album.zoneID, database: database)
+            // Accumulate thumbnails into a local dict and merge into the
+            // @Published cache ONCE, so a big album triggers a single SwiftUI
+            // invalidation instead of one per photo. (Asset bytes were already
+            // decoded off the main actor inside CloudKitService.loadPhotos.)
+            var photos: [SharedPhoto] = []
+            var newThumbs: [String: Data] = [:]
+            for (photo, thumb) in loaded {
+                photos.append(photo)
+                if let thumb { newThumbs[photo.id] = thumb }
+            }
+            if !newThumbs.isEmpty {
+                thumbnailCache.merge(newThumbs) { _, new in new }
+            }
+            photosByAlbum[album.id] = photos
+            // Keep the album card's count honest with what we actually fetched.
+            if let idx = albums.firstIndex(where: { $0.id == album.id }),
+               albums[idx].photoCount != photos.count {
+                albums[idx].photoCount = photos.count
+                persistCache()
+            }
+        } catch {
+            state = .error(message: cloud.map(error).localizedDescription)
+        }
+    }
+
+    /// Lazily fetch the full-resolution image bytes for one photo, on tap.
+    /// Returns nil (rather than throwing) so the viewer can show a placeholder
+    /// without an alert. Guards on availability.
+    func fullImage(for photo: SharedPhoto, in album: SharedAlbum) async -> Data? {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return nil }
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        return try? await cloud.fullImage(for: photo, database: database)
+    }
+
+    /// Thumbnail bytes for a photo, from the in-memory cache (populated by
+    /// loadPhotos). Nil until the album's photos have been loaded.
+    func cachedThumbnail(for photo: SharedPhoto) -> Data? {
+        thumbnailCache[photo.id]
+    }
+
+    // MARK: - Sync (Phase 4)
+
+    /// Register silent database subscriptions (shared + private DB) so remote
+    /// changes wake the app for a delta sync. Idempotent and gated: skips
+    /// entirely in tests, when iCloud is unavailable, or once already done this
+    /// launch. Called from SharedAlbumsView's `.task`, never at launch.
+    func registerSubscriptionsIfNeeded() async {
+        guard !Self.runningTests else { return }
+        guard !subscriptionsRegistered else { return }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return }
+        // Register for remote notifications so CloudKit's silent pushes are
+        // actually delivered (the database subscriptions above only matter if
+        // the OS routes the push to us). No device token needs forwarding for
+        // CloudKit — registering is enough. Gated identically to the
+        // subscriptions (isAvailable AND not running tests, via the guards
+        // above), so it never runs at cold launch or in the test host, keeping
+        // the feature inert on the simulator. Entitlements already declare
+        // aps-environment + the remote-notification background mode.
+        UIApplication.shared.registerForRemoteNotifications()
+
+        do {
+            try await cloud.ensureDatabaseSubscription(
+                id: "shared-db-changes", on: cloud.sharedDB)
+            try await cloud.ensureDatabaseSubscription(
+                id: "private-db-changes", on: cloud.privateDB)
+            subscriptionsRegistered = true
+        } catch {
+            // Subscriptions are an optimization; a failure just means we rely on
+            // pull-to-refresh. Don't surface an error banner.
+            #if DEBUG
+            print("[SharedAlbums] subscription registration failed: \(error)")
+            #endif
+        }
+    }
+
+    /// Delta-sync both databases since their last server change token. Applies
+    /// changed/deleted SharedPhoto records to `photosByAlbum`, drops deleted
+    /// albums, and persists the new tokens. Driven by the remote-notification
+    /// app-delegate hook (and reusable for manual refresh). Gated in tests and
+    /// inert when iCloud is unavailable. Returns true if anything changed (so
+    /// the app delegate can report `.newData`).
+    @discardableResult
+    func syncChanges() async -> Bool {
+        guard !Self.runningTests else { return false }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return false }
+
+        loadTokenCacheIfNeeded()
+        var changed = false
+        changed = await syncDatabase(cloud.sharedDB, scope: .shared) || changed
+        changed = await syncDatabase(cloud.privateDB, scope: .private) || changed
+        if changed { persistTokenCache() }
+        return changed
+    }
+
+    /// Delta-sync one database. Returns true if any record/zone changed.
+    private func syncDatabase(_ database: CKDatabase,
+                             scope: CKDatabase.Scope) async -> Bool {
+        let result: DatabaseChangeResult
+        do {
+            result = try await fetchDatabaseChangesRecoveringExpiry(database, scope: scope)
+        } catch {
+            #if DEBUG
+            print("[SharedAlbums] syncDatabase(\(scope)) failed: \(error)")
+            #endif
+            return false
+        }
+
+        var anyChange = false
+
+        // Deleted zones → drop the album + its photos + tokens.
+        for zoneID in result.deletedZoneIDs {
+            let albumID = zoneID.zoneName
+            if albums.contains(where: { $0.id == albumID }) {
+                albums.removeAll { $0.id == albumID }
+                photosByAlbum[albumID] = nil
+                anyChange = true
+            }
+            tokenCache.removeZone(zoneID)
+        }
+
+        // Per-zone record changes.
+        for zc in result.zoneChanges {
+            let albumID = zc.zoneID.zoneName
+            // Decode CKAsset thumbnail bytes OFF the main actor first (a large
+            // delta shouldn't jank the UI), then apply the (already-decoded)
+            // changes synchronously on the main actor.
+            let thumbs = await Self.decodeThumbnails(for: zc.changedRecords)
+            if applyZoneChanges(zc, albumID: albumID, decodedThumbnails: thumbs) {
+                anyChange = true
+            }
+            tokenCache.setZoneToken(zc.newToken, for: zc.zoneID)
+        }
+
+        tokenCache.setDatabaseToken(result.newDatabaseToken, scope: scope)
+        if anyChange { persistCache() }
+        return anyChange
+    }
+
+    /// Fetch database changes for a scope, recovering from a database-level
+    /// `CKError.changeTokenExpired` by CLEARING the stale token and refetching
+    /// from scratch (a stale token can't be advanced — leaving it wedges sync
+    /// permanently). Zone-level expiry is recovered inside
+    /// `CloudKitService.fetchDatabaseChanges`. Retries the full refetch once.
+    private func fetchDatabaseChangesRecoveringExpiry(
+        _ database: CKDatabase, scope: CKDatabase.Scope
+    ) async throws -> DatabaseChangeResult {
+        do {
+            return try await cloud.fetchDatabaseChanges(
+                in: database,
+                since: tokenCache.databaseToken(scope: scope),
+                zoneToken: { [weak self] zoneID in self?.tokenCache.zoneToken(zoneID) })
+        } catch SharedAlbumError.changeTokenExpired {
+            // Clear the wedged token and refetch from scratch (nil token).
+            tokenCache.removeDatabaseToken(scope: scope)
+            persistTokenCache()
+            return try await cloud.fetchDatabaseChanges(
+                in: database,
+                since: nil,
+                zoneToken: { [weak self] zoneID in self?.tokenCache.zoneToken(zoneID) })
+        }
+    }
+
+    /// Decode the thumbnail CKAsset bytes for a batch of changed records OFF the
+    /// main actor, keyed by record name. Reading the on-disk asset bytes via
+    /// `Data(contentsOf:)` is blocking I/O; doing it here (in a detached task)
+    /// keeps it off the @MainActor so a large delta doesn't jank the UI.
+    private static func decodeThumbnails(for records: [CKRecord]) async -> [String: Data] {
+        await Task.detached(priority: .userInitiated) {
+            var thumbs: [String: Data] = [:]
+            for record in records where record.recordType == SharedAlbum.RecordType.photo {
+                if let data = (record[SharedAlbum.PhotoField.thumbnail] as? CKAsset)
+                    .flatMap(CloudKitService.assetData) {
+                    thumbs[record.recordID.recordName] = data
+                }
+            }
+            return thumbs
+        }.value
+    }
+
+    /// Apply one zone's record-level changes to the in-memory photo list for
+    /// that album. Ignores changes to the album-root record (album metadata is
+    /// refreshed by loadAlbums). Thumbnail bytes are pre-decoded off the main
+    /// actor (see `decodeThumbnails`) and passed in as `decodedThumbnails`, keyed
+    /// by record name, so this stays a fast pure-mutation pass and the
+    /// @Published thumbnailCache is updated in a single merge (one SwiftUI
+    /// invalidation) instead of per-record. Returns true if the album's photos
+    /// changed.
+    private func applyZoneChanges(_ zc: ZoneChangeResult,
+                                  albumID: String,
+                                  decodedThumbnails: [String: Data]) -> Bool {
+        var photos = photosByAlbum[albumID] ?? []
+        var changed = false
+        var thumbInserts: [String: Data] = [:]
+        var thumbRemovals: [String] = []
+
+        // Upserts.
+        for record in zc.changedRecords {
+            guard record.recordType == SharedAlbum.RecordType.photo,
+                  let photo = SharedPhoto(record: record) else { continue }
+            if let thumb = decodedThumbnails[photo.id] {
+                thumbInserts[photo.id] = thumb
+            }
+            if let idx = photos.firstIndex(where: { $0.id == photo.id }) {
+                photos[idx] = photo
+            } else {
+                photos.append(photo)
+            }
+            changed = true
+        }
+
+        // Deletions.
+        for id in zc.deletedRecordIDs {
+            let name = id.recordName
+            if let idx = photos.firstIndex(where: { $0.id == name }) {
+                photos.remove(at: idx)
+                thumbRemovals.append(name)
+                changed = true
+            }
+        }
+
+        // Apply cache mutations in one batch (single @Published invalidation).
+        if !thumbInserts.isEmpty {
+            thumbnailCache.merge(thumbInserts) { _, new in new }
+        }
+        for name in thumbRemovals { thumbnailCache[name] = nil }
+
+        if changed {
+            photosByAlbum[albumID] = photos
+            // Keep the album card count in step with the live photo list.
+            if let idx = albums.firstIndex(where: { $0.id == albumID }) {
+                albums[idx].photoCount = photos.count
+            }
+        }
+        return changed
+    }
+
+    // MARK: - Change-token cache persistence
+
+    /// Load the persisted token cache once, lazily, only when CloudKit is in
+    /// use. Never reached at launch or in tests.
+    private func loadTokenCacheIfNeeded() {
+        guard tokenCache.isEmpty else { return }
+        if let data = try? Data(contentsOf: Self.changeTokensURL),
+           let decoded = try? JSONDecoder().decode(ChangeTokenCache.self, from: data) {
+            tokenCache = decoded
+        }
+    }
+
+    private func persistTokenCache() {
+        if let data = try? JSONEncoder().encode(tokenCache) {
+            try? data.write(to: Self.changeTokensURL, options: .atomic)
+        }
+    }
+
     // MARK: - Helpers
 
     /// Resolve an owner stamp for the current user, falling back to nil.
@@ -292,5 +712,88 @@ final class SharedAlbumStore: ObservableObject {
     /// for the "same people again" affordance. Exposed for the invite flow.
     func noteShared(with participantIDs: [String]) {
         rememberParticipants(participantIDs)
+    }
+}
+
+// MARK: - Server-change-token cache
+
+/// Codable cache of CloudKit server change tokens — one per database scope and
+/// one per record zone — so delta sync only fetches what changed since last
+/// time. `CKServerChangeToken` is not Codable, but it IS `NSSecureCoding`, so
+/// we archive each token to `Data` (via `NSKeyedArchiver`) and store the bytes.
+/// Unarchiving a corrupt/stale blob fails closed (nil token ⇒ a full re-fetch),
+/// never a crash. Keys are stringified scopes / zone identifiers.
+struct ChangeTokenCache: Codable {
+    /// scope ("private"/"shared") -> archived database token bytes.
+    private var databaseTokens: [String: Data] = [:]
+    /// "zoneName|ownerName" -> archived zone token bytes.
+    private var zoneTokens: [String: Data] = [:]
+
+    var isEmpty: Bool { databaseTokens.isEmpty && zoneTokens.isEmpty }
+
+    private static func key(for scope: CKDatabase.Scope) -> String {
+        switch scope {
+        case .public:  return "public"
+        case .private: return "private"
+        case .shared:  return "shared"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private static func key(for zoneID: CKRecordZone.ID) -> String {
+        "\(zoneID.zoneName)|\(zoneID.ownerName)"
+    }
+
+    func databaseToken(scope: CKDatabase.Scope) -> CKServerChangeToken? {
+        databaseTokens[Self.key(for: scope)].flatMap(Self.unarchive)
+    }
+
+    mutating func setDatabaseToken(_ token: CKServerChangeToken?, scope: CKDatabase.Scope) {
+        let k = Self.key(for: scope)
+        if let token, let data = Self.archive(token) {
+            databaseTokens[k] = data
+        } else if token == nil {
+            // Leave an existing token in place if we got nil (no progress);
+            // a nil result during a normal fetch just means "no newer token",
+            // so keep the last good one. To deliberately reset (e.g. after a
+            // `changeTokenExpired` error) use `removeDatabaseToken(scope:)`.
+        }
+    }
+
+    /// Explicitly clear the database token for a scope so the next sync refetches
+    /// from scratch. Needed for `CKError.changeTokenExpired` recovery — a stale
+    /// token can't be advanced, only discarded, or sync wedges permanently.
+    mutating func removeDatabaseToken(scope: CKDatabase.Scope) {
+        databaseTokens[Self.key(for: scope)] = nil
+    }
+
+    func zoneToken(_ zoneID: CKRecordZone.ID) -> CKServerChangeToken? {
+        zoneTokens[Self.key(for: zoneID)].flatMap(Self.unarchive)
+    }
+
+    mutating func setZoneToken(_ token: CKServerChangeToken?, for zoneID: CKRecordZone.ID) {
+        guard let token, let data = Self.archive(token) else { return }
+        zoneTokens[Self.key(for: zoneID)] = data
+    }
+
+    /// Explicitly clear a single zone's token so its next fetch refetches from
+    /// scratch (zone-level `changeTokenExpired` recovery).
+    mutating func removeZoneToken(_ zoneID: CKRecordZone.ID) {
+        zoneTokens[Self.key(for: zoneID)] = nil
+    }
+
+    mutating func removeZone(_ zoneID: CKRecordZone.ID) {
+        zoneTokens[Self.key(for: zoneID)] = nil
+    }
+
+    // MARK: token <-> Data
+
+    private static func archive(_ token: CKServerChangeToken) -> Data? {
+        try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+    }
+
+    private static func unarchive(_ data: Data) -> CKServerChangeToken? {
+        try? NSKeyedUnarchiver.unarchivedObject(
+            ofClass: CKServerChangeToken.self, from: data)
     }
 }

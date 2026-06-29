@@ -57,6 +57,10 @@ struct SharedAlbumsView: View {
             await store.refreshAvailability()
             if case .unavailable = store.state { return }
             await store.loadAlbums()
+            // Register silent push subscriptions for delta sync. Internally
+            // gated on isAvailable AND not-running-tests, and idempotent — so
+            // this is the single, post-launch, user-reachable trigger point.
+            await store.registerSubscriptionsIfNeeded()
         }
         .alert("New Shared Album", isPresented: $showCreate) {
             TextField("Album name", text: $newName)
@@ -103,14 +107,33 @@ struct SharedAlbumsView: View {
         } else {
             List {
                 ForEach(store.albums) { album in
-                    SharedAlbumRow(album: album)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            // Only owners can present the invite sheet.
-                            if album.isOwnedByMe {
+                    NavigationLink {
+                        SharedAlbumDetailView(album: album)
+                    } label: {
+                        SharedAlbumRow(album: album)
+                    }
+                    // Owners can (re)open the system invite sheet via a swipe
+                    // action or context menu — tapping the row now OPENS the
+                    // album (Phase 4) rather than presenting the invite.
+                    .swipeActions(edge: .trailing) {
+                        if album.isOwnedByMe {
+                            Button {
                                 Task { await presentInvite(for: album) }
+                            } label: {
+                                Label("Invite", systemImage: "person.badge.plus")
+                            }
+                            .tint(.blue)
+                        }
+                    }
+                    .contextMenu {
+                        if album.isOwnedByMe {
+                            Button {
+                                Task { await presentInvite(for: album) }
+                            } label: {
+                                Label("Invite People", systemImage: "person.badge.plus")
                             }
                         }
+                    }
                 }
             }
             .listStyle(.plain)
@@ -192,11 +215,6 @@ private struct SharedAlbumRow: View {
                 Text(album.photoCount == 1 ? "photo" : "photos")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-            }
-            if album.isOwnedByMe {
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
             }
         }
         .padding(.vertical, 4)

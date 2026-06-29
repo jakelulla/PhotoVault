@@ -300,6 +300,383 @@ final class CloudKitService {
         }
     }
 
+    // MARK: - Photo upload (Phase 3)
+
+    /// How many photo records to push per CKModifyRecordsOperation. CloudKit's
+    /// hard cap is 400 records / 2MB of metadata per op, but with CKAssets the
+    /// practical limit is bandwidth, so we keep batches small (~50) to bound
+    /// memory and give finer-grained progress / partial-success reporting.
+    private static let uploadChunkSize = 50
+
+    /// Upload a batch of photos into `zoneID`, each as a "SharedPhoto" record
+    /// with a full-res + thumbnail CKAsset and a parent reference to the album
+    /// root. Saves in chunks via `CKModifyRecordsOperation`s at
+    /// `.userInitiated` QoS, honoring CKError rate-limits with the same retry
+    /// policy as `save(_:to:)`. Temp files referenced by the payloads are
+    /// deleted after each chunk completes (success or hard failure), so a failed
+    /// upload never leaks temp files.
+    ///
+    /// - Returns: the count of successfully saved photo records (partial success
+    ///   is tolerated — a per-record failure does not sink the whole batch).
+    /// - Note: guards on availability, so it is inert on the simulator / in
+    ///   tests, throwing `.unavailable` before any network work.
+    @discardableResult
+    func uploadPhotos(_ payloads: [SharedPhotoUploadPayload],
+                      toZone zoneID: CKRecordZone.ID,
+                      database: CKDatabase,
+                      albumRootRef: CKRecord.Reference,
+                      progress: (@MainActor (Int, Int) -> Void)? = nil) async throws -> Int {
+        try await requireAvailable()
+        guard !payloads.isEmpty else { return 0 }
+
+        let total = payloads.count
+        var savedCount = 0
+        // Track every temp file so we can clean up even if we throw mid-batch.
+        let allTempURLs = payloads.flatMap { [$0.fullImageURL, $0.thumbnailURL] }
+        defer { Self.removeTempFiles(allTempURLs) }
+
+        for chunk in payloads.chunked(into: Self.uploadChunkSize) {
+            let records = chunk.map {
+                SharedPhoto.makeRecord(from: $0, inZone: zoneID, albumRootRef: albumRootRef)
+            }
+            let saved = try await modifyLongLived(saving: records, in: database)
+            savedCount += saved
+            let done = savedCount
+            if let progress { await MainActor.run { progress(done, total) } }
+        }
+        return savedCount
+    }
+
+    /// Save records via a `CKModifyRecordsOperation` (bridged to async, bounded
+    /// by the foreground upload task — NOT long-lived), with the same
+    /// transient-error retry policy as `save(_:to:)`. Returns the count of
+    /// records that saved successfully; per-record failures are tolerated unless
+    /// the whole op fails with a non-retryable error.
+    private func modifyLongLived(saving records: [CKRecord],
+                                 in database: CKDatabase,
+                                 maxAttempts: Int = 4) async throws -> Int {
+        var attempt = 0
+        var lastError: Error?
+        while attempt < maxAttempts {
+            attempt += 1
+            do {
+                return try await runModifyOperation(saving: records, in: database)
+            } catch let error as CKError {
+                lastError = error
+                if let delay = Self.retryDelay(for: error), attempt < maxAttempts {
+                    try? await Task.sleep(for: .seconds(delay))
+                    continue
+                }
+                throw map(error)
+            } catch {
+                throw map(error)
+            }
+        }
+        throw SharedAlbumError.retryExhausted(
+            (lastError.map { String(describing: $0) }) ?? "unknown")
+    }
+
+    /// One pass of a modify operation, bridged to async. Tolerates per-record
+    /// failures (counts successes); rethrows the operation-level error so the
+    /// retry layer can decide.
+    private func runModifyOperation(saving records: [CKRecord],
+                                    in database: CKDatabase) async throws -> Int {
+        let op = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: nil)
+        op.savePolicy = .allKeys
+        op.isAtomic = false
+        op.qualityOfService = .userInitiated
+        // NOT long-lived: this op is bridged through a withCheckedContinuation
+        // bounded by the foreground upload task. A long-lived op would be
+        // resumed after app suspension with no rediscovery code here, silently
+        // dropping the completion (and the continuation would never resume). A
+        // normal operation is the correct lifetime for this bridge.
+
+        let guardBox = OneShotResume()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, Error>) in
+            // Count successes; we ignore per-record failures here (they show up
+            // as fewer saved records) and only fail the whole op on a hard error.
+            var successes = 0
+            op.perRecordSaveBlock = { _, result in
+                if case .success = result { successes += 1 }
+            }
+            op.modifyRecordsResultBlock = { [weak self] result in
+                guard guardBox.take() else { return }
+                switch result {
+                case .success:
+                    cont.resume(returning: successes)
+                case .failure(let error):
+                    // A partial failure where SOME records saved is not fatal:
+                    // return the success count so the caller keeps the progress.
+                    if let ck = error as? CKError, ck.code == .partialFailure, successes > 0 {
+                        cont.resume(returning: successes)
+                    } else {
+                        cont.resume(throwing: self?.map(error)
+                            ?? SharedAlbumError.cloudKit(String(describing: error)))
+                    }
+                }
+            }
+            database.add(op)
+        }
+    }
+
+    /// Best-effort temp-file cleanup. Never throws — a failed delete is logged
+    /// in DEBUG and otherwise ignored (the OS reclaims the temp dir anyway).
+    private static func removeTempFiles(_ urls: [URL]) {
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    // MARK: - Photo loading (Phase 4)
+
+    /// Fetch the album's photos as METADATA + thumbnail only (NOT the full
+    /// image), keyed off the parent album reference. Loads thumbnails first; the
+    /// full bytes are pulled lazily on tap via `fullImage(for:)`.
+    ///
+    /// We enumerate the zone's records with a `CKFetchRecordZoneChangesOperation`
+    /// driven from a nil change token (a full enumeration of the zone). This
+    /// deliberately avoids a zone-scoped `CKQuery`, which would sort/filter on
+    /// custom fields (`captureDate`) and therefore require those fields be marked
+    /// Queryable/Sortable in the CloudKit schema — the auto-created dev schema
+    /// does NOT mark custom fields queryable or sortable, so the first real query
+    /// would throw `CKError.invalidArguments`. Zone-changes enumeration needs no
+    /// such indexes. We sort client-side by `captureDate` descending (nil dates
+    /// last), reusing `fetchZoneChanges` and the asset-decode helper. Malformed
+    /// records are skipped. Guards on availability.
+    func loadPhotos(inZone zoneID: CKRecordZone.ID,
+                    database: CKDatabase) async throws -> [(photo: SharedPhoto, thumbnail: Data?)] {
+        try await requireAvailable()
+
+        do {
+            // Full enumeration: nil previous token ⇒ all records in the zone.
+            // (Same desiredKeys — thumbnail + metadata, no fullImage — as sync.)
+            let zc = try await fetchZoneChanges(zoneID, in: database, since: nil)
+
+            // Decode CKAsset thumbnail bytes OFF the main actor so a large album
+            // doesn't jank the UI, then return the mapped value types. Sorting is
+            // client-side (newest first; records with no captureDate sort last).
+            let records = zc.changedRecords
+            let mapped: [(photo: SharedPhoto, thumbnail: Data?)] =
+                await Task.detached(priority: .userInitiated) {
+                    records.compactMap { record -> (photo: SharedPhoto, thumbnail: Data?)? in
+                        guard let photo = SharedPhoto(record: record) else { return nil }
+                        let thumb = (record[SharedAlbum.PhotoField.thumbnail] as? CKAsset)
+                            .flatMap(CloudKitService.assetData)
+                        return (photo, thumb)
+                    }
+                }.value
+
+            return mapped.sorted { lhs, rhs in
+                switch (lhs.photo.captureDate, rhs.photo.captureDate) {
+                case let (l?, r?): return l > r          // newest first
+                case (nil, _?):    return false           // nils sort last
+                case (_?, nil):    return true
+                case (nil, nil):   return false
+                }
+            }
+        } catch {
+            throw map(error)
+        }
+    }
+
+    /// Lazily fetch the FULL-resolution image bytes for one photo, on demand
+    /// (when the user taps it). Uses a `CKFetchRecordsOperation` scoped to just
+    /// the `fullImage` asset field so we download only the bytes we need, not the
+    /// thumbnail again. Returns nil if the record / asset is gone. Guards on
+    /// availability.
+    func fullImage(for photo: SharedPhoto, database: CKDatabase) async throws -> Data? {
+        try await requireAvailable()
+        let op = CKFetchRecordsOperation(recordIDs: [photo.recordID])
+        op.desiredKeys = [SharedAlbum.PhotoField.fullImage]
+        op.qualityOfService = .userInitiated
+
+        let guardBox = OneShotResume()
+        let record: CKRecord? = try await withCheckedThrowingContinuation { cont in
+            var fetched: CKRecord?
+            op.perRecordResultBlock = { _, result in
+                if case .success(let rec) = result { fetched = rec }
+            }
+            // The result block fires after all per-record blocks, so resume there.
+            op.fetchRecordsResultBlock = { [weak self] result in
+                guard guardBox.take() else { return }
+                switch result {
+                case .success:
+                    cont.resume(returning: fetched)
+                case .failure(let error):
+                    cont.resume(throwing: self?.map(error)
+                        ?? SharedAlbumError.cloudKit(String(describing: error)))
+                }
+            }
+            database.add(op)
+        }
+        guard let asset = record?[SharedAlbum.PhotoField.fullImage] as? CKAsset else {
+            return nil
+        }
+        return Self.assetData(asset)
+    }
+
+    /// Read a CKAsset's bytes off its on-disk file URL. Returns nil if the asset
+    /// has no file URL (e.g. it was excluded by desiredKeys) or the read fails.
+    /// `nonisolated` so callers can decode off the main actor.
+    nonisolated static func assetData(_ asset: CKAsset) -> Data? {
+        guard let url = asset.fileURL else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
+    // MARK: - Subscriptions + delta sync (Phase 4)
+
+    /// Register a silent (background) database subscription on `database` if one
+    /// is not already present. Used to wake the app on remote changes so
+    /// `syncChanges()` can delta-fetch. Idempotent: an "already exists" error is
+    /// treated as success. Guards on availability — callers ALSO gate on
+    /// `runningTests` so this never runs in the test host.
+    func ensureDatabaseSubscription(id: String, on database: CKDatabase) async throws {
+        try await requireAvailable()
+        let subscription = CKDatabaseSubscription(subscriptionID: id)
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true   // silent push, no alert/badge
+        subscription.notificationInfo = info
+        do {
+            _ = try await database.save(subscription)
+        } catch let error as CKError {
+            if Self.indicatesAlreadyExists(error) { return }
+            throw map(error)
+        } catch {
+            throw map(error)
+        }
+    }
+
+    /// Fetch the set of changed record zones in `database` since `token`, then
+    /// for each changed zone fetch its record-level changes since that zone's
+    /// own token (resolved by `zoneToken`, which the store backs with its
+    /// persisted per-zone token cache). Returns the changes plus the NEW tokens
+    /// to persist. Pure CloudKit; the store owns token persistence and value
+    /// mapping.
+    func fetchDatabaseChanges(
+        in database: CKDatabase,
+        since token: CKServerChangeToken?,
+        zoneToken: (CKRecordZone.ID) -> CKServerChangeToken?
+    ) async throws -> DatabaseChangeResult {
+        try await requireAvailable()
+
+        // 1. Which zones changed (or were deleted)?
+        let zoneResult = try await fetchChangedZones(in: database, since: token)
+
+        // 2. For each changed zone, fetch record-level deltas since its own token.
+        //    A zone-level `changeTokenExpired` can't be advanced — recover by
+        //    clearing it (refetch from scratch with a nil token). The new token
+        //    returned replaces the stale one in the store's cache, so this also
+        //    un-wedges persisted state.
+        var zoneChanges: [ZoneChangeResult] = []
+        for zoneID in zoneResult.changedZones {
+            do {
+                let rc = try await fetchZoneChanges(zoneID, in: database, since: zoneToken(zoneID))
+                zoneChanges.append(rc)
+            } catch SharedAlbumError.changeTokenExpired {
+                let rc = try await fetchZoneChanges(zoneID, in: database, since: nil)
+                zoneChanges.append(rc)
+            }
+        }
+
+        return DatabaseChangeResult(
+            newDatabaseToken: zoneResult.newToken,
+            deletedZoneIDs: zoneResult.deletedZones,
+            zoneChanges: zoneChanges)
+    }
+
+    /// Run CKFetchDatabaseChangesOperation, bridged to async. Returns the set of
+    /// changed-zone IDs, deleted-zone IDs, and the new database token.
+    private func fetchChangedZones(
+        in database: CKDatabase,
+        since token: CKServerChangeToken?
+    ) async throws -> (changedZones: [CKRecordZone.ID],
+                       deletedZones: [CKRecordZone.ID],
+                       newToken: CKServerChangeToken?) {
+        let op = CKFetchDatabaseChangesOperation(previousServerChangeToken: token)
+        op.qualityOfService = .userInitiated
+        op.fetchAllChanges = true
+
+        var changed: [CKRecordZone.ID] = []
+        var deleted: [CKRecordZone.ID] = []
+        op.recordZoneWithIDChangedBlock = { changed.append($0) }
+        op.recordZoneWithIDWasDeletedBlock = { deleted.append($0) }
+
+        let guardBox = OneShotResume()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(changedZones: [CKRecordZone.ID], deletedZones: [CKRecordZone.ID], newToken: CKServerChangeToken?), Error>) in
+            op.fetchDatabaseChangesResultBlock = { [weak self] result in
+                guard guardBox.take() else { return }
+                switch result {
+                case .success(let (newToken, _)):
+                    cont.resume(returning: (changed, deleted, newToken))
+                case .failure(let error):
+                    cont.resume(throwing: self?.map(error)
+                        ?? SharedAlbumError.cloudKit(String(describing: error)))
+                }
+            }
+            database.add(op)
+        }
+    }
+
+    /// Run CKFetchRecordZoneChangesOperation for one zone, bridged to async.
+    /// Returns changed records, deleted record IDs, and the zone's new token.
+    private func fetchZoneChanges(
+        _ zoneID: CKRecordZone.ID,
+        in database: CKDatabase,
+        since token: CKServerChangeToken?
+    ) async throws -> ZoneChangeResult {
+        let config = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
+        config.previousServerChangeToken = token
+        // Metadata + thumbnail only on sync; full image stays lazy.
+        config.desiredKeys = [
+            SharedAlbum.PhotoField.thumbnail,
+            SharedAlbum.PhotoField.contributorID,
+            SharedAlbum.PhotoField.captureDate,
+            SharedAlbum.PhotoField.latitude,
+            SharedAlbum.PhotoField.longitude,
+            SharedAlbum.PhotoField.originalFilename,
+            SharedAlbum.PhotoField.contentHash,
+        ]
+        let op = CKFetchRecordZoneChangesOperation(
+            recordZoneIDs: [zoneID],
+            configurationsByRecordZoneID: [zoneID: config])
+        op.qualityOfService = .userInitiated
+        op.fetchAllChanges = true
+
+        var changedRecords: [CKRecord] = []
+        var deletedRecordIDs: [CKRecord.ID] = []
+        var newToken: CKServerChangeToken?
+
+        op.recordWasChangedBlock = { _, result in
+            if case .success(let record) = result { changedRecords.append(record) }
+        }
+        op.recordWithIDWasDeletedBlock = { id, _ in deletedRecordIDs.append(id) }
+        op.recordZoneChangeTokensUpdatedBlock = { _, serverToken, _ in
+            if let serverToken { newToken = serverToken }
+        }
+        op.recordZoneFetchResultBlock = { _, result in
+            if case .success(let (serverToken, _, _)) = result { newToken = serverToken }
+        }
+
+        let guardBox = OneShotResume()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<ZoneChangeResult, Error>) in
+            op.fetchRecordZoneChangesResultBlock = { [weak self] result in
+                guard guardBox.take() else { return }
+                switch result {
+                case .success:
+                    cont.resume(returning: ZoneChangeResult(
+                        zoneID: zoneID,
+                        newToken: newToken,
+                        changedRecords: changedRecords,
+                        deletedRecordIDs: deletedRecordIDs))
+                case .failure(let error):
+                    cont.resume(throwing: self?.map(error)
+                        ?? SharedAlbumError.cloudKit(String(describing: error)))
+                }
+            }
+            database.add(op)
+        }
+    }
+
     // MARK: - Error mapping + retry policy
 
     /// Map any error into our typed enum. Never rethrows raw CKError to the view.
@@ -311,6 +688,10 @@ final class CloudKitService {
                 return .unavailable(reason: "Sign in to iCloud to use Shared Albums")
             case .networkUnavailable, .networkFailure:
                 return .cloudKit("iCloud is unreachable. Check your connection.")
+            case .changeTokenExpired:
+                // Surfaced as a distinct case so the sync layer can clear the
+                // stale token and refetch from scratch instead of wedging.
+                return .changeTokenExpired
             default:
                 return .cloudKit(ck.localizedDescription)
             }
@@ -345,6 +726,35 @@ final class CloudKitService {
             return false
         default:
             return false
+        }
+    }
+}
+
+// MARK: - Delta-sync result types
+
+/// Record-level delta for a single zone, plus its new server change token.
+struct ZoneChangeResult {
+    let zoneID: CKRecordZone.ID
+    let newToken: CKServerChangeToken?
+    let changedRecords: [CKRecord]
+    let deletedRecordIDs: [CKRecord.ID]
+}
+
+/// The full delta for one database: which zones were deleted, the per-zone
+/// record changes, and the new database-level change token to persist.
+struct DatabaseChangeResult {
+    let newDatabaseToken: CKServerChangeToken?
+    let deletedZoneIDs: [CKRecordZone.ID]
+    let zoneChanges: [ZoneChangeResult]
+}
+
+extension Array {
+    /// Split into chunks of at most `size`. Used to bound CKModifyRecordsOperation
+    /// batch sizes. `size` is clamped to ≥ 1 so a zero never loops forever.
+    func chunked(into size: Int) -> [[Element]] {
+        let step = Swift.max(1, size)
+        return stride(from: 0, to: count, by: step).map {
+            Array(self[$0 ..< Swift.min($0 + step, count)])
         }
     }
 }

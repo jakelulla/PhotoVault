@@ -54,4 +54,24 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             await SharedAlbumStore.shared.acceptShare(metadata)
         }
     }
+
+    /// Silent CloudKit push: a shared-albums database subscription fired because
+    /// a record zone changed. Delta-sync and report the fetch result so iOS
+    /// keeps granting background time. This is reached ONLY when a real remote
+    /// notification arrives after launch (never at startup, never in the test
+    /// host — no subscription is ever registered there), and the sync itself
+    /// re-guards on `isAvailable`, so it stays inert on the simulator / in tests.
+    func application(_ application: UIApplication,
+                     didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        // Only handle CloudKit pushes; ignore anything else.
+        guard CKNotification(fromRemoteNotificationDictionary: userInfo) != nil else {
+            completionHandler(.noData)
+            return
+        }
+        Task { @MainActor in
+            let changed = await SharedAlbumStore.shared.syncChanges()
+            completionHandler(changed ? .newData : .noData)
+        }
+    }
 }

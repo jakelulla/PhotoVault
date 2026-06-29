@@ -16,13 +16,34 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
     /// Live fetch result the change observer diffs against.
     private var fetchResult: PHFetchResult<PHAsset>?
 
+    /// Shared, observer-free instance used purely for byte extraction by the
+    /// shared-albums uploader (fullImageData / thumbnailData). It does NOT
+    /// register a library change observer (it skips the designated init), so it
+    /// is cheap and never fires UI updates — it's just a wrapper around its own
+    /// PHCachingImageManager. Created lazily on first upload; never at launch.
+    static let uploadHelper: PhotoLibraryModel = PhotoLibraryModel(observing: false)
+
     override init() {
         super.init()
+        observingLibrary = true
         PHPhotoLibrary.shared().register(self)
     }
 
+    /// Observer-free init for the upload helper: no change observer is
+    /// registered, so this instance never publishes UI updates and `deinit`
+    /// skips the matching unregister.
+    private init(observing: Bool) {
+        super.init()
+        observingLibrary = observing
+        if observing { PHPhotoLibrary.shared().register(self) }
+    }
+
+    /// Whether this instance registered a change observer (so deinit knows
+    /// whether to unregister). Avoids unregistering an observer we never added.
+    private var observingLibrary = false
+
     deinit {
-        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        if observingLibrary { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
     }
 
     var isAuthorized: Bool { status == .authorized || status == .limited }
@@ -197,6 +218,43 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
         }
         // All slots failed → treat as a whole-video failure, same as before.
         return frames.allSatisfy(\.isEmpty) ? [] : frames
+    }
+
+    /// Full-resolution JPEG bytes for a single asset, for uploading to a shared
+    /// album. Uses `requestImageDataAndOrientation` (the original on-disk
+    /// representation) so we ship the real photo, transcoding to JPEG when the
+    /// source isn't already JPEG/HEIC-decodable. `.highQualityFormat` yields a
+    /// single non-degraded callback; cancellation aborts a stuck iCloud
+    /// download. Returns nil if the asset/bytes are unavailable. Mirrors the
+    /// one-shot continuation safety used elsewhere in this file.
+    func fullImageData(for asset: PHAsset) async -> Data? {
+        let state = PHRequestCancellationState(manager: imageManager)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = PHImageRequestOptions()
+                options.isNetworkAccessAllowed = true
+                options.deliveryMode = .highQualityFormat
+                options.resizeMode = .none
+                options.isSynchronous = false
+                let id = imageManager.requestImageDataAndOrientation(
+                    for: asset, options: options
+                ) { data, _, _, info in
+                    let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                    if degraded { return }   // wait for the final, full-quality result
+                    guard state.takeResume() else { return }
+                    // Normalize to JPEG: HEIC originals re-encode for broad
+                    // compatibility; an already-JPEG original round-trips cheaply.
+                    if let data, let image = UIImage(data: data) {
+                        continuation.resume(returning: image.jpegData(compressionQuality: 0.92))
+                    } else {
+                        continuation.resume(returning: data)
+                    }
+                }
+                state.register(id)
+            }
+        } onCancel: {
+            state.cancel()
+        }
     }
 
     /// A downscaled JPEG (longest side ~`maxPixel`) for the one-time metadata

@@ -19,6 +19,11 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
     case cloudKit(String)
     /// We exhausted the retry budget on a retryable CKError.
     case retryExhausted(String)
+    /// A server change token is too old to advance (`CKError.changeTokenExpired`).
+    /// The sync layer recovers by clearing the offending token and refetching
+    /// from scratch rather than wedging on the stale token. Kept as a distinct
+    /// case (not folded into `.cloudKit`) so the store can detect it.
+    case changeTokenExpired
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +31,7 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
         case .malformedRecord(let what):     return "Unexpected data from iCloud (\(what))."
         case .cloudKit(let msg):             return msg
         case .retryExhausted(let msg):       return "iCloud kept failing: \(msg)"
+        case .changeTokenExpired:            return "iCloud sync needs a full refresh."
         }
     }
 }
@@ -80,13 +86,17 @@ struct SharedAlbum: Identifiable, Codable, Equatable {
     }
 }
 
-// MARK: - SharedPhoto value type (metadata only — bytes deferred)
+// MARK: - SharedPhoto value type (metadata; bytes live in CKAssets on the record)
 
-/// A photo inside a shared album, as the view layer sees it. Metadata only for
-/// now: the actual image bytes ship as a CKAsset in the UPLOAD PHASE (later),
-/// so the CKAsset reference and any local file URL are intentionally absent.
-/// Fields are laid out so the upload phase can add them without reshaping the
-/// type or its persistence.
+/// A photo inside a shared album, as the view layer sees it. This is the
+/// METADATA projection: the actual image bytes ship as two CKAssets on the
+/// underlying "SharedPhoto" record (a full-res JPEG and a ~256px thumbnail).
+/// We deliberately do NOT carry the CKAsset file handles on this value type —
+/// the detail grid fetches records with `desiredKeys` that exclude the full
+/// image and loads thumbnail/full bytes through CloudKitService on demand, so
+/// the SwiftUI layer never touches CloudKit file handles directly. Staying a
+/// pure value type keeps diffing cheap and the type trivially Codable for the
+/// local cache.
 struct SharedPhoto: Identifiable, Codable, Equatable {
     /// Record name of the "SharedPhoto" record.
     let id: String
@@ -99,16 +109,34 @@ struct SharedPhoto: Identifiable, Codable, Equatable {
     var latitude: Double?
     var longitude: Double?
     var originalFilename: String?
-    /// Content hash for dedupe on upload (sha256 hex). Filled in the upload phase.
+    /// Content hash for dedupe on upload (sha256 hex of the full-res bytes).
     var contentHash: String?
-
-    // TODO(upload-phase): add `assetRecordName` / a CKAsset-backed image
-    // reference + a local cache URL. The CKAsset is NOT modeled here yet so the
-    // view layer never touches CloudKit file handles.
 
     var albumZoneID: CKRecordZone.ID {
         CKRecordZone.ID(zoneName: albumZoneName, ownerName: albumZoneOwnerName)
     }
+
+    var recordID: CKRecord.ID {
+        CKRecord.ID(recordName: id, zoneID: albumZoneID)
+    }
+}
+
+/// The bytes + metadata for ONE photo about to be uploaded. Built by the store
+/// from a local PHAsset (full-res JPEG + thumbnail written to temp files) and
+/// handed to CloudKitService, which materializes the CKRecord + CKAssets. Kept
+/// separate from `SharedPhoto` so the value type the view sees never holds file
+/// URLs or CloudKit handles.
+struct SharedPhotoUploadPayload {
+    /// Temp-file URL of the full-resolution JPEG. Deleted after upload.
+    let fullImageURL: URL
+    /// Temp-file URL of the ~256px thumbnail JPEG. Deleted after upload.
+    let thumbnailURL: URL
+    var contributorID: String?
+    var captureDate: Date?
+    var latitude: Double?
+    var longitude: Double?
+    var originalFilename: String?
+    var contentHash: String?
 }
 
 // MARK: - CKRecord <-> value mapping
@@ -128,6 +156,20 @@ extension SharedAlbum {
     enum Field {
         static let name = "name"
         static let createdBy = "createdBy"
+    }
+
+    /// Field names on the "SharedPhoto" record. One place so the CloudKit
+    /// dashboard schema and both the read/write sites stay in lockstep.
+    enum PhotoField {
+        static let album = "album"               // CKRecord.Reference -> album root
+        static let fullImage = "fullImage"       // CKAsset (full-res JPEG)
+        static let thumbnail = "thumbnail"       // CKAsset (~256px JPEG)
+        static let contributorID = "contributorID"
+        static let captureDate = "captureDate"
+        static let latitude = "latitude"
+        static let longitude = "longitude"
+        static let originalFilename = "originalFilename"
+        static let contentHash = "contentHash"
     }
 
     /// Build a value from the album's root record. Failable so a malformed /
@@ -175,13 +217,58 @@ extension SharedAlbum {
 }
 
 extension SharedPhoto {
-    // TODO(upload-phase): implement `init?(record:)` and `toRecord()` for the
-    // "SharedPhoto" record type. The record carries:
-    //   - a CKRecord.Reference to the parent SharedAlbum (action .deleteSelf, so
-    //     deleting the album cascades to its photos),
-    //   - captureDate / latitude / longitude / originalFilename / contentHash,
-    //   - the image bytes as a CKAsset (the reason this is deferred — we are not
-    //     uploading bytes in this phase).
-    // Mapping is stubbed now so SharedPhoto compiles and the store can hold the
-    // type, but no SharedPhoto records are read or written in Phase 1/2.
+    /// Build the METADATA value from a fetched "SharedPhoto" record. Failable so
+    /// a malformed / wrong-type record degrades to nil (the loader skips it and
+    /// reports a partial result) instead of crashing. Note this reads only the
+    /// metadata + asset-presence; it never touches the CKAsset file handles, so
+    /// it is safe whether the record was fetched with the full image or with
+    /// `desiredKeys` that excluded it.
+    init?(record: CKRecord) {
+        guard record.recordType == SharedAlbum.RecordType.photo else { return nil }
+
+        self.id = record.recordID.recordName
+        self.albumZoneName = record.recordID.zoneID.zoneName
+        self.albumZoneOwnerName = record.recordID.zoneID.ownerName
+        self.contributorID = record[SharedAlbum.PhotoField.contributorID] as? String
+        self.captureDate = record[SharedAlbum.PhotoField.captureDate] as? Date
+        self.latitude = record[SharedAlbum.PhotoField.latitude] as? Double
+        self.longitude = record[SharedAlbum.PhotoField.longitude] as? Double
+        self.originalFilename = record[SharedAlbum.PhotoField.originalFilename] as? String
+        self.contentHash = record[SharedAlbum.PhotoField.contentHash] as? String
+    }
+
+    /// Materialize a "SharedPhoto" CKRecord from an upload payload, into the
+    /// album's zone, with a parent reference to the album-root record.
+    ///
+    /// - The record ID is minted in `zoneID` so the photo lands in the album's
+    ///   custom zone (the unit of sharing), never the default zone.
+    /// - `parent` is set to the album-root reference AND mirrored into the
+    ///   `album` field with action `.deleteSelf`, so deleting the album cascades
+    ///   to its photos. (CloudKit uses `parent` for the share hierarchy and a
+    ///   user-defined reference field for the cascade.)
+    /// - Both image fields are CKAssets pointing at the payload's temp files.
+    static func makeRecord(from payload: SharedPhotoUploadPayload,
+                           inZone zoneID: CKRecordZone.ID,
+                           albumRootRef: CKRecord.Reference) -> CKRecord {
+        let recordID = CKRecord.ID(recordName: "photo-\(UUID().uuidString)", zoneID: zoneID)
+        let rec = CKRecord(recordType: SharedAlbum.RecordType.photo, recordID: recordID)
+
+        // Parent reference drives the share hierarchy; the explicit album
+        // reference with `.deleteSelf` makes album deletion cascade to photos.
+        rec.parent = albumRootRef
+        rec[SharedAlbum.PhotoField.album] =
+            CKRecord.Reference(recordID: albumRootRef.recordID, action: .deleteSelf)
+
+        rec[SharedAlbum.PhotoField.fullImage] = CKAsset(fileURL: payload.fullImageURL)
+        rec[SharedAlbum.PhotoField.thumbnail] = CKAsset(fileURL: payload.thumbnailURL)
+
+        if let v = payload.contributorID { rec[SharedAlbum.PhotoField.contributorID] = v as CKRecordValue }
+        if let v = payload.captureDate { rec[SharedAlbum.PhotoField.captureDate] = v as CKRecordValue }
+        if let v = payload.latitude { rec[SharedAlbum.PhotoField.latitude] = v as CKRecordValue }
+        if let v = payload.longitude { rec[SharedAlbum.PhotoField.longitude] = v as CKRecordValue }
+        if let v = payload.originalFilename { rec[SharedAlbum.PhotoField.originalFilename] = v as CKRecordValue }
+        if let v = payload.contentHash { rec[SharedAlbum.PhotoField.contentHash] = v as CKRecordValue }
+
+        return rec
+    }
 }
