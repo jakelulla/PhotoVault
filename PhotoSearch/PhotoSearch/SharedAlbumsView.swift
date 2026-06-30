@@ -7,6 +7,7 @@ import UIKit
 /// Nothing here runs at app launch.
 struct SharedAlbumsView: View {
     @ObservedObject private var store = SharedAlbumStore.shared
+    @ObservedObject private var invitations = InvitationStore.shared
 
     @State private var showCreate = false
     @State private var newName = ""
@@ -17,6 +18,10 @@ struct SharedAlbumsView: View {
     @State private var creating = false
     @State private var preparingInvite = false
     @State private var createError: String?
+    /// The album we're inviting a FRIEND to (in-app, no share sheet).
+    @State private var friendInviteAlbum: SharedAlbum?
+    @State private var showFriends = false
+    @State private var showInbox = false
 
     var body: some View {
         Group {
@@ -40,6 +45,14 @@ struct SharedAlbumsView: View {
         }
         .navigationTitle("Shared Albums")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showFriends = true
+                } label: {
+                    Image(systemName: "person.2")
+                }
+                .disabled({ if case .unavailable = store.state { return true } else { return false } }())
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     newName = ""
@@ -54,6 +67,7 @@ struct SharedAlbumsView: View {
         // for an instant offline view, then check availability + refresh.
         .task {
             store.loadLocalCache()
+            invitations.loadLocalCache()
             await store.refreshAvailability()
             if case .unavailable = store.state { return }
             await store.loadAlbums()
@@ -61,6 +75,11 @@ struct SharedAlbumsView: View {
             // gated on isAvailable AND not-running-tests, and idempotent — so
             // this is the single, post-launch, user-reachable trigger point.
             await store.registerSubscriptionsIfNeeded()
+            // Friends/invitation layer: pull pending invitations and register the
+            // invitation-inbox subscription. Both internally gated on isAvailable
+            // AND not-running-tests, so this is inert on the simulator / in tests.
+            await invitations.refreshPendingInvitations()
+            await invitations.registerInvitationSubscriptionIfNeeded()
         }
         .alert("New Shared Album", isPresented: $showCreate) {
             TextField("Album name", text: $newName)
@@ -77,14 +96,50 @@ struct SharedAlbumsView: View {
             Text(createError ?? "")
         }
         // Present the invite (UICloudSharingController) once we have resolved the
-        // album's LIVE CKShare from the server.
+        // album's LIVE CKShare from the server. This is the SECONDARY
+        // "Share via Link" path; the primary path is the in-app friend invite.
         .sheet(item: $inviteTarget) { target in
             CloudSharingControllerView(album: target.album, share: target.share)
                 .ignoresSafeArea()
         }
+        // In-app friend invite (programmatic share, no share sheet).
+        .sheet(item: $friendInviteAlbum) { album in
+            InviteFriendView(album: album)
+        }
+        .sheet(isPresented: $showFriends) {
+            NavigationStack { FriendsView() }
+        }
+        .sheet(isPresented: $showInbox) {
+            InvitationInboxView()
+        }
+        // Pending-invitation banner: a tappable bar that opens the inbox.
+        .safeAreaInset(edge: .top) {
+            if !invitations.pendingInvitations.isEmpty {
+                Button {
+                    showInbox = true
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "envelope.badge.fill")
+                        Text(pendingBannerText)
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption)
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 10)
+                    .background(.bar)
+                }
+                .buttonStyle(.plain)
+            }
+        }
         .overlay {
             if preparingInvite { ProgressView("Preparing invite…").controlSize(.large) }
         }
+    }
+
+    private var pendingBannerText: String {
+        let n = invitations.pendingInvitations.count
+        return n == 1 ? "1 album invitation" : "\(n) album invitations"
     }
 
     @ViewBuilder
@@ -112,13 +167,13 @@ struct SharedAlbumsView: View {
                     } label: {
                         SharedAlbumRow(album: album)
                     }
-                    // Owners can (re)open the system invite sheet via a swipe
-                    // action or context menu — tapping the row now OPENS the
-                    // album (Phase 4) rather than presenting the invite.
+                    // Owners can invite a FRIEND in-app (primary) or share via a
+                    // system link (secondary) — tapping the row OPENS the album
+                    // (Phase 4) rather than presenting an invite.
                     .swipeActions(edge: .trailing) {
                         if album.isOwnedByMe {
                             Button {
-                                Task { await presentInvite(for: album) }
+                                friendInviteAlbum = album
                             } label: {
                                 Label("Invite", systemImage: "person.badge.plus")
                             }
@@ -128,9 +183,14 @@ struct SharedAlbumsView: View {
                     .contextMenu {
                         if album.isOwnedByMe {
                             Button {
+                                friendInviteAlbum = album
+                            } label: {
+                                Label("Invite Friend", systemImage: "person.badge.plus")
+                            }
+                            Button {
                                 Task { await presentInvite(for: album) }
                             } label: {
-                                Label("Invite People", systemImage: "person.badge.plus")
+                                Label("Share via Link", systemImage: "link")
                             }
                         }
                     }

@@ -24,6 +24,10 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
     /// from scratch rather than wedging on the stale token. Kept as a distinct
     /// case (not folded into `.cloudKit`) so the store can detect it.
     case changeTokenExpired
+    /// The requested username already belongs to a DIFFERENT iCloud user, so the
+    /// directory claim was refused. Distinct case so the onboarding UI can show
+    /// a "try another name" message rather than a generic CloudKit error.
+    case usernameTaken
 
     var errorDescription: String? {
         switch self {
@@ -32,6 +36,7 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
         case .cloudKit(let msg):             return msg
         case .retryExhausted(let msg):       return "iCloud kept failing: \(msg)"
         case .changeTokenExpired:            return "iCloud sync needs a full refresh."
+        case .usernameTaken:                 return "That username is already taken. Try another."
         }
     }
 }

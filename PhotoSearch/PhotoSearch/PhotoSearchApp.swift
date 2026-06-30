@@ -65,13 +65,27 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                      didReceiveRemoteNotification userInfo: [AnyHashable: Any],
                      fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
         // Only handle CloudKit pushes; ignore anything else.
-        guard CKNotification(fromRemoteNotificationDictionary: userInfo) != nil else {
+        guard let notification = CKNotification(fromRemoteNotificationDictionary: userInfo) else {
             completionHandler(.noData)
             return
         }
+        // Two kinds of push reach us: the zone/database subscriptions (private +
+        // shared DB) drive a delta sync; the public-DB invitation QUERY
+        // subscription drives an inbox refresh. We route by notification type so
+        // each push does the right work, and call the completion handler EXACTLY
+        // ONCE on every path. Both stores re-guard on `isAvailable`, so this stays
+        // inert on the simulator / in tests (where no subscription is registered).
         Task { @MainActor in
-            let changed = await SharedAlbumStore.shared.syncChanges()
-            completionHandler(changed ? .newData : .noData)
+            if notification.subscriptionID == DirectoryService.invitationSubscriptionID
+                || notification is CKQueryNotification {
+                // New invitation in the public inbox.
+                await InvitationStore.shared.refreshPendingInvitations()
+                completionHandler(.newData)
+            } else {
+                // Album/photo zone change → delta sync.
+                let changed = await SharedAlbumStore.shared.syncChanges()
+                completionHandler(changed ? .newData : .noData)
+            }
         }
     }
 }

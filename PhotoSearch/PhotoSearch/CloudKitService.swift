@@ -539,7 +539,10 @@ final class CloudKitService {
         do {
             _ = try await database.save(subscription)
         } catch let error as CKError {
-            if Self.indicatesAlreadyExists(error) { return }
+            // A duplicate subscription (same subscriptionID) is rejected with
+            // .serverRejectedRequest — treat it as success so re-registration
+            // on every launch is idempotent.
+            if error.code == .serverRejectedRequest || Self.indicatesAlreadyExists(error) { return }
             throw map(error)
         } catch {
             throw map(error)

@@ -615,3 +615,166 @@ final class EmbeddingCodecTests: XCTestCase {
         XCTAssertNil(BinaryEmbeddingCodec.decode(data.prefix(data.count - 2)))
     }
 }
+
+// MARK: - Friends / directory / invitation: pure-logic round-trips (no CloudKit)
+
+/// These exercise only the value<->CKRecord mapping, username normalization, the
+/// handled-invitations cache, and the friends-cache encode/decode — all pure
+/// logic. They build CKRecords in memory and never reach a CloudKit container, so
+/// they run in the simulator test host where CloudKit itself is unavailable.
+final class DirectoryMappingTests: XCTestCase {
+
+    // MARK: UserProfile record-name normalization
+
+    func testUsernameRecordNameIsCaseInsensitiveAndTrimmed() {
+        // Case + surrounding whitespace collapse to the same record name, so
+        // "Alice" and "  alice " collide (case-insensitive uniqueness).
+        XCTAssertEqual(UserProfile.recordName(for: "Alice"), "profile_alice")
+        XCTAssertEqual(UserProfile.recordName(for: "  ALICE  "), "profile_alice")
+        XCTAssertEqual(UserProfile.recordName(for: "alice"),
+                       UserProfile.recordName(for: "ALICE"))
+        XCTAssertEqual(UserProfile.normalizedUsername("  BoB "), "bob")
+    }
+
+    func testUsernameValidationBounds() {
+        XCTAssertTrue(UserProfile.isValidUsername("jake"))
+        XCTAssertTrue(UserProfile.isValidUsername("a_b.c-1"))
+        XCTAssertFalse(UserProfile.isValidUsername("a"))            // too short
+        XCTAssertFalse(UserProfile.isValidUsername(""))            // empty
+        XCTAssertFalse(UserProfile.isValidUsername("has space"))   // disallowed char
+        XCTAssertFalse(UserProfile.isValidUsername("emoji😀"))      // disallowed char
+        XCTAssertFalse(UserProfile.isValidUsername(String(repeating: "x", count: 31)))
+    }
+
+    // MARK: UserProfile <-> CKRecord
+
+    func testUserProfileRecordRoundTrips() {
+        let profile = UserProfile(
+            username: "Jake",
+            displayName: "Jake L",
+            userRecordID: "_abc123",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let record = profile.toRecord()
+
+        // The record lands at the deterministic, normalized record name.
+        XCTAssertEqual(record.recordType, UserProfile.RecordType.profile)
+        XCTAssertEqual(record.recordID.recordName, "profile_jake")
+        XCTAssertEqual(record[UserProfile.Field.username] as? String, "Jake")
+        XCTAssertEqual(record[UserProfile.Field.userRecordID] as? String, "_abc123")
+
+        // Mapping back recovers the value (original-case username preserved).
+        let back = UserProfile(record: record)
+        XCTAssertEqual(back?.username, "Jake")
+        XCTAssertEqual(back?.displayName, "Jake L")
+        XCTAssertEqual(back?.userRecordID, "_abc123")
+        XCTAssertEqual(back?.createdAt, Date(timeIntervalSince1970: 1_700_000_000))
+    }
+
+    func testUserProfileInitRejectsWrongTypeAndMissingFields() {
+        // Wrong record type → nil.
+        let wrong = CKRecord(recordType: Invitation.RecordType.invitation,
+                             recordID: CKRecord.ID(recordName: "x"))
+        XCTAssertNil(UserProfile(record: wrong))
+
+        // Right type but missing the required username/userRecordID → nil.
+        let incomplete = CKRecord(recordType: UserProfile.RecordType.profile,
+                                  recordID: CKRecord.ID(recordName: "profile_x"))
+        XCTAssertNil(UserProfile(record: incomplete))
+    }
+
+    func testUserProfileDisplayNameDefaultsToUsername() {
+        let rec = CKRecord(recordType: UserProfile.RecordType.profile,
+                           recordID: CKRecord.ID(recordName: "profile_x"))
+        rec[UserProfile.Field.username] = "Xavier" as CKRecordValue
+        rec[UserProfile.Field.userRecordID] = "_x" as CKRecordValue
+        // No displayName field set → falls back to username.
+        XCTAssertEqual(UserProfile(record: rec)?.displayName, "Xavier")
+    }
+
+    // MARK: Invitation <-> CKRecord
+
+    func testInvitationRecordRoundTrips() {
+        let url = URL(string: "https://www.icloud.com/share/ABC123")!
+        let invitation = Invitation.make(
+            toUserRecordID: "_recipient",
+            fromUserRecordID: "_sender",
+            fromUsername: "jake",
+            albumName: "Trip 2026",
+            shareURL: url)
+        let record = invitation.toRecord()
+
+        XCTAssertEqual(record.recordType, Invitation.RecordType.invitation)
+        XCTAssertEqual(record.recordID.recordName, invitation.id)   // UUID
+        XCTAssertEqual(record[Invitation.Field.toUserRecordID] as? String, "_recipient")
+        XCTAssertEqual(record[Invitation.Field.shareURL] as? String, url.absoluteString)
+
+        let back = Invitation(record: record)
+        XCTAssertEqual(back?.id, invitation.id)
+        XCTAssertEqual(back?.toUserRecordID, "_recipient")
+        XCTAssertEqual(back?.fromUserRecordID, "_sender")
+        XCTAssertEqual(back?.fromUsername, "jake")
+        XCTAssertEqual(back?.albumName, "Trip 2026")
+        XCTAssertEqual(back?.shareURL, url)
+    }
+
+    func testInvitationInitRejectsWrongTypeAndMissingFields() {
+        let wrong = CKRecord(recordType: UserProfile.RecordType.profile,
+                             recordID: CKRecord.ID(recordName: "profile_y"))
+        XCTAssertNil(Invitation(record: wrong))
+
+        // Missing the required share URL → nil (won't show a useless inbox row).
+        let incomplete = CKRecord(recordType: Invitation.RecordType.invitation,
+                                  recordID: CKRecord.ID(recordName: "inv-1"))
+        incomplete[Invitation.Field.toUserRecordID] = "_r" as CKRecordValue
+        incomplete[Invitation.Field.fromUserRecordID] = "_s" as CKRecordValue
+        XCTAssertNil(Invitation(record: incomplete))
+    }
+
+    // MARK: HandledInvitations cache
+
+    func testHandledInvitationsFilterAndRoundTrip() throws {
+        var handled = HandledInvitations()
+        let a = Invitation.make(toUserRecordID: "_r", fromUserRecordID: "_s",
+                                fromUsername: "x", albumName: "A",
+                                shareURL: URL(string: "https://x/a")!)
+        let b = Invitation.make(toUserRecordID: "_r", fromUserRecordID: "_s",
+                                fromUsername: "x", albumName: "B",
+                                shareURL: URL(string: "https://x/b")!)
+        XCTAssertEqual(handled.unhandled([a, b]).count, 2)
+
+        handled.mark(a.id)
+        XCTAssertTrue(handled.contains(a.id))
+        let remaining = handled.unhandled([a, b])
+        XCTAssertEqual(remaining.map(\.id), [b.id])
+
+        // Codable round-trip preserves the handled set.
+        let data = try JSONEncoder().encode(handled)
+        let back = try JSONDecoder().decode(HandledInvitations.self, from: data)
+        XCTAssertTrue(back.contains(a.id))
+        XCTAssertFalse(back.contains(b.id))
+    }
+
+    // MARK: Friend cache encode/decode
+
+    func testFriendCacheEncodeDecode() throws {
+        let friends = [
+            Friend(username: "alice", displayName: "Alice", userRecordID: "_a"),
+            Friend(username: "bob", displayName: "Bob", userRecordID: "_b"),
+        ]
+        let data = try JSONEncoder().encode(friends)
+        let back = try JSONDecoder().decode([Friend].self, from: data)
+        XCTAssertEqual(back, friends)
+        // Identity is the userRecordID (unique per person).
+        XCTAssertEqual(back.first?.id, "_a")
+    }
+
+    func testFriendFromProfileCopiesIdentity() {
+        let profile = UserProfile(username: "Cara", displayName: "Cara K",
+                                  userRecordID: "_c", createdAt: Date())
+        let friend = Friend(profile: profile)
+        XCTAssertEqual(friend.username, "Cara")
+        XCTAssertEqual(friend.displayName, "Cara K")
+        XCTAssertEqual(friend.userRecordID, "_c")
+        XCTAssertEqual(friend.id, "_c")
+    }
+}
