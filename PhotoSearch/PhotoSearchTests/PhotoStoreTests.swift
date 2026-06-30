@@ -467,6 +467,99 @@ final class PhotoStoreTests: XCTestCase {
         let december = store.structuredSearchStage(query: "december 2021")
         XCTAssertEqual(december.candidates.map(\.assetID), ["dec-photo"])
     }
+
+    // MARK: - Photo request helpers (photosMatching / clusterMatching / face filter)
+
+    func testPhotosMatchingFiltersToDateWindow() {
+        // Date-only request (blank description) returns every photo in the
+        // inclusive [from, to] window; photos outside it (and undated) drop.
+        indexPhoto("in1", emb: unitEmb(axis: 0), createdAt: date(2023, 6, 10))
+        indexPhoto("in2", emb: unitEmb(axis: 1), createdAt: date(2023, 6, 20))
+        indexPhoto("before", emb: unitEmb(axis: 2), createdAt: date(2023, 5, 1))
+        indexPhoto("after", emb: unitEmb(axis: 3), createdAt: date(2023, 7, 1))
+        store.index(assetID: "undated", createdAt: nil,
+                    lat: nil, lon: nil, clipEmbedding: unitEmb(axis: 4),
+                    faceEmbeddings: [], faceRects: [], isVideo: false, duration: 0)
+
+        let hits = store.photosMatching(description: "",
+                                        from: date(2023, 6, 1), to: date(2023, 6, 30))
+        XCTAssertEqual(Set(hits.map(\.assetID)), ["in1", "in2"])
+
+        // Swapped bounds are normalized (min/max), so the same window works.
+        let swapped = store.photosMatching(description: "",
+                                           from: date(2023, 6, 30), to: date(2023, 6, 1))
+        XCTAssertEqual(Set(swapped.map(\.assetID)), ["in1", "in2"])
+    }
+
+    func testClusterMatchingPicksBestAboveThreshold() {
+        // Three orthogonal "people" with ≥3 photos each so they're activeClusters.
+        let r = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        for i in 0..<3 { indexPhoto("p\(i)", emb: unitEmb(axis: i), faceEmbeddings: [unitEmb(axis: 20)], faceRects: [r]) }
+        for i in 0..<3 { indexPhoto("q\(i)", emb: unitEmb(axis: 5 + i), faceEmbeddings: [unitEmb(axis: 21)], faceRects: [r]) }
+        let pCluster = store.clusterID(forAsset: "p0")
+
+        // An embedding identical to person-P's prototype matches P (cosine 1.0).
+        let matchP = store.clusterMatching(unitEmb(axis: 20))
+        XCTAssertEqual(matchP?.id, pCluster)
+
+        // An embedding orthogonal to every prototype (cosine 0) is below the
+        // 0.45 threshold → nil (the requester isn't recognized here).
+        XCTAssertNil(store.clusterMatching(unitEmb(axis: 100)))
+        // Empty embedding → nil.
+        XCTAssertNil(store.clusterMatching([]))
+    }
+
+    func testApplyFaceFilterOnlyMeAndWithoutMe() {
+        let r = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        // Person "me" (axis 20) appears in m0/m1/m2; person "other" in o0/o1/o2.
+        for i in 0..<3 { indexPhoto("m\(i)", emb: unitEmb(axis: i), createdAt: date(2023, 1, i + 1),
+                                    faceEmbeddings: [unitEmb(axis: 20)], faceRects: [r]) }
+        for i in 0..<3 { indexPhoto("o\(i)", emb: unitEmb(axis: 5 + i), createdAt: date(2023, 1, i + 4),
+                                    faceEmbeddings: [unitEmb(axis: 21)], faceRects: [r]) }
+        let all = store.allPhotos()
+        let meEmb = unitEmb(axis: 20)
+
+        // any → unchanged (embedding ignored).
+        XCTAssertEqual(store.applyFaceFilter(.any, to: all, requesterEmbedding: []).count, all.count)
+
+        // onlyMe → just the photos "me" is in.
+        let onlyMe = store.applyFaceFilter(.onlyMe, to: all, requesterEmbedding: meEmb)
+        XCTAssertEqual(Set(onlyMe.map(\.assetID)), ["m0", "m1", "m2"])
+
+        // withoutMe → everything except those.
+        let withoutMe = store.applyFaceFilter(.withoutMe, to: all, requesterEmbedding: meEmb)
+        XCTAssertEqual(Set(withoutMe.map(\.assetID)), ["o0", "o1", "o2"])
+    }
+
+    func testApplyFaceFilterUnrecognizedRequester() {
+        // The requester isn't in this library (no cluster clears the threshold):
+        //   onlyMe   → empty (can't prove they're in any photo),
+        //   withoutMe → all (they're in none, as far as we can tell).
+        let r = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        for i in 0..<3 { indexPhoto("x\(i)", emb: unitEmb(axis: i),
+                                    faceEmbeddings: [unitEmb(axis: 30)], faceRects: [r]) }
+        let all = store.allPhotos()
+        let stranger = unitEmb(axis: 100)   // orthogonal to every prototype
+        XCTAssertTrue(store.applyFaceFilter(.onlyMe, to: all, requesterEmbedding: stranger).isEmpty)
+        XCTAssertEqual(store.applyFaceFilter(.withoutMe, to: all, requesterEmbedding: stranger).count, all.count)
+    }
+
+    func testBuildFolderStagesAssetsInOrder() {
+        indexPhoto("a", emb: unitEmb(axis: 0))
+        indexPhoto("b", emb: unitEmb(axis: 1))
+        let folder = store.buildFolder(named: "For Jake", assetIDs: ["b", "a"])
+        let saved = store.folders.first { $0.id == folder.id }!
+        XCTAssertEqual(saved.name, "For Jake")
+        XCTAssertEqual(saved.photoAssetIDs, ["b", "a"])   // order preserved
+        XCTAssertFalse(saved.isSmart)                      // static folder
+    }
+}
+
+// Test-only convenience: the cluster id a single-face photo was assigned to.
+private extension PhotoStore {
+    func clusterID(forAsset assetID: String) -> Int {
+        photos.first { $0.assetID == assetID }!.personClusterIDs[0]
+    }
 }
 
 // MARK: - Shared albums: pure-logic round-trips (no CloudKit network)
@@ -776,5 +869,279 @@ final class DirectoryMappingTests: XCTestCase {
         XCTAssertEqual(friend.displayName, "Cara K")
         XCTAssertEqual(friend.userRecordID, "_c")
         XCTAssertEqual(friend.id, "_c")
+    }
+
+    // MARK: UserProfile public avatar (decorative; never matched)
+
+    func testUserProfileAvatarRoundTripsThroughRecord() {
+        let profile = UserProfile(username: "Pat", displayName: "Pat",
+                                  userRecordID: "_p", createdAt: Date())
+        let record = profile.toRecord()
+        // toRecord stays pure (no avatar). attachAvatar adds the CKAsset.
+        XCTAssertNil(record[UserProfile.Field.avatar])
+        let bytes = Data([0xFF, 0xD8, 0xFF, 0x01, 0x02])   // arbitrary "jpeg-ish" bytes
+        let tempURL = UserProfile.attachAvatar(bytes, to: record)
+        defer { tempURL.map { try? FileManager.default.removeItem(at: $0) } }
+        XCTAssertNotNil(record[UserProfile.Field.avatar] as? CKAsset)
+
+        // Mapping the record back recovers the avatar bytes from the CKAsset file.
+        let back = UserProfile(record: record)
+        XCTAssertEqual(back?.avatarData, bytes)
+
+        // Clearing the avatar removes the field and yields nil bytes on map-back.
+        UserProfile.attachAvatar(nil, to: record)
+        XCTAssertNil(record[UserProfile.Field.avatar])
+        XCTAssertNil(UserProfile(record: record)?.avatarData)
+    }
+}
+
+// MARK: - Photo requests: pure-logic round-trips (no CloudKit network)
+
+/// These exercise only the value<->CKRecord mapping for PhotoRequest /
+/// FacePayload, the FaceFilter raw values, the embedding byte codec, and the
+/// handled-requests cache — all pure logic. They build CKRecords in memory and
+/// never reach a CloudKit container, so they run in the simulator test host.
+/// CRITICALLY they also assert the biometric embedding is NEVER on the public
+/// PhotoRequest record.
+final class PhotoRequestMappingTests: XCTestCase {
+
+    func testFaceFilterRawValuesAndNeedsFace() {
+        // Raw values are part of the on-the-wire schema; pin them.
+        XCTAssertEqual(FaceFilter.any.rawValue, "any")
+        XCTAssertEqual(FaceFilter.onlyMe.rawValue, "onlyMe")
+        XCTAssertEqual(FaceFilter.withoutMe.rawValue, "withoutMe")
+        XCTAssertEqual(FaceFilter(rawValue: "onlyMe"), .onlyMe)
+        XCTAssertNil(FaceFilter(rawValue: "bogus"))
+        XCTAssertFalse(FaceFilter.any.needsFace)
+        XCTAssertTrue(FaceFilter.onlyMe.needsFace)
+        XCTAssertTrue(FaceFilter.withoutMe.needsFace)
+    }
+
+    func testPhotoRequestRecordRoundTripsWithFaceShare() {
+        let url = URL(string: "https://www.icloud.com/share/FACE123")!
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let end = Date(timeIntervalSince1970: 1_700_600_000)
+        let request = PhotoRequest.make(
+            toUserRecordID: "_friend",
+            fromUserRecordID: "_me",
+            fromUsername: "jake",
+            description: "concert",
+            startDate: start, endDate: end,
+            faceFilter: .onlyMe,
+            faceShareURL: url)
+        let record = request.toRecord()
+
+        XCTAssertEqual(record.recordType, PhotoRequest.RecordType.request)
+        XCTAssertEqual(record.recordID.recordName, request.id)
+        XCTAssertEqual(record[PhotoRequest.Field.toUserRecordID] as? String, "_friend")
+        XCTAssertEqual(record[PhotoRequest.Field.faceFilter] as? String, "onlyMe")
+        XCTAssertEqual(record[PhotoRequest.Field.faceShareURL] as? String, url.absoluteString)
+
+        // PRIVACY: the public record carries NO embedding and NO photo — only the
+        // criteria + the (access-controlled) face-share URL.
+        XCTAssertNil(record["embedding"])
+        XCTAssertNil(record[FacePayload.Field.embedding])
+        XCTAssertFalse(record.allKeys().contains { $0.lowercased().contains("embedding") })
+
+        let back = PhotoRequest(record: record)
+        XCTAssertEqual(back?.toUserRecordID, "_friend")
+        XCTAssertEqual(back?.fromUsername, "jake")
+        XCTAssertEqual(back?.requestDescription, "concert")
+        XCTAssertEqual(back?.startDate, start)
+        XCTAssertEqual(back?.endDate, end)
+        XCTAssertEqual(back?.faceFilter, .onlyMe)
+        XCTAssertEqual(back?.faceShareURL, url)
+    }
+
+    func testPhotoRequestAnyFilterOmitsFaceShareURL() {
+        let request = PhotoRequest.make(
+            toUserRecordID: "_f", fromUserRecordID: "_m", fromUsername: "x",
+            description: "beach",
+            startDate: Date(timeIntervalSince1970: 0), endDate: Date(timeIntervalSince1970: 1),
+            faceFilter: .any, faceShareURL: nil)
+        let record = request.toRecord()
+        XCTAssertNil(record[PhotoRequest.Field.faceShareURL])
+        XCTAssertEqual(PhotoRequest(record: record)?.faceFilter, .any)
+        XCTAssertNil(PhotoRequest(record: record)?.faceShareURL)
+    }
+
+    func testPhotoRequestInitRejectsWrongTypeAndDegradesUnknownFilter() {
+        // Wrong record type → nil.
+        let wrong = CKRecord(recordType: UserProfile.RecordType.profile,
+                             recordID: CKRecord.ID(recordName: "profile_z"))
+        XCTAssertNil(PhotoRequest(record: wrong))
+
+        // Missing required fields → nil.
+        let incomplete = CKRecord(recordType: PhotoRequest.RecordType.request,
+                                  recordID: CKRecord.ID(recordName: "req-1"))
+        incomplete[PhotoRequest.Field.toUserRecordID] = "_f" as CKRecordValue
+        XCTAssertNil(PhotoRequest(record: incomplete))
+
+        // Complete but with an UNKNOWN faceFilter string → degrades to .any (the
+        // safe, no-biometric mode) rather than dropping the whole request.
+        let rec = CKRecord(recordType: PhotoRequest.RecordType.request,
+                           recordID: CKRecord.ID(recordName: "req-2"))
+        rec[PhotoRequest.Field.toUserRecordID] = "_f" as CKRecordValue
+        rec[PhotoRequest.Field.fromUserRecordID] = "_m" as CKRecordValue
+        rec[PhotoRequest.Field.description] = "x" as CKRecordValue
+        rec[PhotoRequest.Field.startDate] = Date(timeIntervalSince1970: 0) as CKRecordValue
+        rec[PhotoRequest.Field.endDate] = Date(timeIntervalSince1970: 1) as CKRecordValue
+        rec[PhotoRequest.Field.faceFilter] = "garbage" as CKRecordValue
+        XCTAssertEqual(PhotoRequest(record: rec)?.faceFilter, .any)
+    }
+
+    // MARK: FacePayload (the biometric — lives ONLY in the ephemeral private zone)
+
+    func testFacePayloadEmbeddingByteCodecRoundTrips() {
+        let vector: [Float] = (0..<512).map { Float($0) / 512 - 0.5 }
+        let data = FacePayload.encode(vector)
+        XCTAssertEqual(data.count, 512 * MemoryLayout<Float32>.size)
+        let back = FacePayload.decode(data)
+        XCTAssertEqual(back, vector)
+    }
+
+    func testFacePayloadDecodeRejectsTruncatedBytes() {
+        let data = FacePayload.encode([1, 2, 3])
+        XCTAssertNil(FacePayload.decode(data.prefix(data.count - 1)))   // not a whole Float32
+    }
+
+    func testFacePayloadRecordRoundTripsInEphemeralZone() {
+        let zone = CKRecordZone.ID(zoneName: "facereq-1", ownerName: CKCurrentUserDefaultName)
+        let payload = FacePayload(embedding: [0.1, -0.2, 0.3])
+        let record = payload.toRecord(inZone: zone)
+
+        XCTAssertEqual(record.recordType, FacePayload.RecordType.payload)
+        XCTAssertEqual(record.recordID.recordName, FacePayload.recordName)
+        XCTAssertEqual(record.recordID.zoneID, zone)   // never the default/public zone
+        XCTAssertNotNil(record[FacePayload.Field.embedding] as? Data)
+
+        let back = FacePayload(record: record)
+        XCTAssertEqual(back?.embedding, [0.1, -0.2, 0.3])
+
+        // Wrong record type → nil.
+        let wrong = CKRecord(recordType: PhotoRequest.RecordType.request,
+                             recordID: CKRecord.ID(recordName: "x"))
+        XCTAssertNil(FacePayload(record: wrong))
+    }
+
+    // MARK: HandledRequests cache
+
+    func testHandledRequestsFilterAndRoundTrip() throws {
+        var handled = HandledRequests()
+        let a = PhotoRequest.make(toUserRecordID: "_r", fromUserRecordID: "_s",
+                                  fromUsername: "x", description: "A",
+                                  startDate: Date(timeIntervalSince1970: 0),
+                                  endDate: Date(timeIntervalSince1970: 1),
+                                  faceFilter: .any, faceShareURL: nil)
+        let b = PhotoRequest.make(toUserRecordID: "_r", fromUserRecordID: "_s",
+                                  fromUsername: "x", description: "B",
+                                  startDate: Date(timeIntervalSince1970: 0),
+                                  endDate: Date(timeIntervalSince1970: 1),
+                                  faceFilter: .any, faceShareURL: nil)
+        XCTAssertEqual(handled.unhandled([a, b]).count, 2)
+        handled.mark(a.id)
+        XCTAssertTrue(handled.contains(a.id))
+        XCTAssertEqual(handled.unhandled([a, b]).map(\.id), [b.id])
+
+        let data = try JSONEncoder().encode(handled)
+        let back = try JSONDecoder().decode(HandledRequests.self, from: data)
+        XCTAssertTrue(back.contains(a.id))
+        XCTAssertFalse(back.contains(b.id))
+    }
+
+    // MARK: PendingFaceZones cache (durable ephemeral-face-zone cleanup, #4)
+
+    func testPendingFaceZonesAddIsIdempotentRemoveAndRoundTrip() throws {
+        var pending = PendingFaceZones()
+        XCTAssertTrue(pending.isEmpty)
+
+        let a = PendingFaceZones.ZoneRef(zoneName: "facereq-A", ownerName: "_owner")
+        let b = PendingFaceZones.ZoneRef(zoneName: "facereq-B", ownerName: "_owner")
+
+        pending.add(a)
+        pending.add(a)                 // duplicate → no-op
+        pending.add(b)
+        XCTAssertEqual(pending.zones.count, 2)
+        XCTAssertFalse(pending.isEmpty)
+
+        pending.remove(a)
+        XCTAssertEqual(pending.zones, [b])
+
+        // Codable round-trip (the on-disk persistence contract for the sweep).
+        let data = try JSONEncoder().encode(pending)
+        let back = try JSONDecoder().decode(PendingFaceZones.self, from: data)
+        XCTAssertEqual(back.zones, [b])
+
+        // Removing an absent ref is a harmless no-op (tolerant of already-gone).
+        var p2 = back
+        p2.remove(a)
+        XCTAssertEqual(p2.zones, [b])
+    }
+}
+
+// MARK: - RequestStore fulfill: face-filter status (privacy, #2)
+
+/// Exercises RequestStore.fulfill's FACE-FILTER STATUS in the XCTest host, where
+/// `runningTests` is true so the CloudKit accept never runs and a face-filtered
+/// request deterministically reports `.unavailable` (never silently degrading to
+/// a pre-selected unfiltered set). Pure on-device PhotoStore search underneath.
+@MainActor
+final class RequestStoreFulfillTests: XCTestCase {
+
+    private var store: PhotoStore { PhotoStore.shared }
+    private var requests: RequestStore { RequestStore.shared }
+
+    override func setUp() async throws { store.resetIndex() }
+    override func tearDown() async throws { store.resetIndex() }
+
+    private func date(_ y: Int, _ m: Int, _ d: Int) -> Date {
+        Calendar.current.date(from: DateComponents(year: y, month: m, day: d))!
+    }
+
+    private func indexPhoto(_ id: String, createdAt: Date) {
+        store.index(assetID: id, createdAt: createdAt, lat: nil, lon: nil,
+                    clipEmbedding: [Float](repeating: 0, count: 512),
+                    faceEmbeddings: [], faceRects: [], isVideo: false, duration: 0,
+                    faceSharpness: nil, imageSharpness: nil)
+    }
+
+    /// A `.any` request needs no face → status `.notRequested`, candidates = the
+    /// date-window matches, and the review view will pre-select them.
+    func testFulfillAnyFilterIsNotRequestedAndReturnsWindowMatches() async {
+        indexPhoto("p1", createdAt: date(2023, 5, 10))
+        indexPhoto("p2", createdAt: date(2023, 5, 11))
+        indexPhoto("out", createdAt: date(2022, 1, 1))   // outside the window
+
+        let req = PhotoRequest.make(
+            toUserRecordID: "_me", fromUserRecordID: "_them", fromUsername: "ann",
+            description: "", startDate: date(2023, 5, 1), endDate: date(2023, 5, 31),
+            faceFilter: .any, faceShareURL: nil)
+
+        let result = await requests.fulfill(request: req)
+        XCTAssertEqual(result.faceFilterStatus, .notRequested)
+        XCTAssertEqual(Set(result.candidateAssetIDs), ["p1", "p2"])
+    }
+
+    /// A face-filtered request with a face-share URL CANNOT obtain the embedding in
+    /// the test host (gated). It MUST report `.unavailable` (NOT `.applied`), so the
+    /// review view starts with nothing pre-selected — never defaulting an `.onlyMe`
+    /// request to sharing the whole unfiltered set.
+    func testFulfillFaceFilterUnavailableInTestHostDoesNotClaimApplied() async {
+        indexPhoto("p1", createdAt: date(2023, 5, 10))
+        indexPhoto("p2", createdAt: date(2023, 5, 11))
+
+        let url = URL(string: "https://www.icloud.com/share/FACEXYZ")!
+        let req = PhotoRequest.make(
+            toUserRecordID: "_me", fromUserRecordID: "_them", fromUsername: "ann",
+            description: "", startDate: date(2023, 5, 1), endDate: date(2023, 5, 31),
+            faceFilter: .onlyMe, faceShareURL: url)
+
+        let result = await requests.fulfill(request: req)
+        // Critically NOT `.applied` — the filter could not be enforced.
+        XCTAssertEqual(result.faceFilterStatus, .unavailable)
+        // The candidate POOL is the unfiltered window matches (so a retry/manual
+        // pick is possible), but the status flags that nothing should be
+        // pre-selected.
+        XCTAssertEqual(Set(result.candidateAssetIDs), ["p1", "p2"])
     }
 }

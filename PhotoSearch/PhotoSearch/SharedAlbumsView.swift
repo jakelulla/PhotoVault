@@ -8,8 +8,11 @@ import UIKit
 struct SharedAlbumsView: View {
     @ObservedObject private var store = SharedAlbumStore.shared
     @ObservedObject private var invitations = InvitationStore.shared
+    @ObservedObject private var requests = RequestStore.shared
 
     @State private var showCreate = false
+    @State private var showCompose = false
+    @State private var showRequestInbox = false
     @State private var newName = ""
     /// The resolved invite target: the album plus its LIVE server CKShare. We
     /// only set this once the share is fetched, so the system sheet always gets
@@ -54,9 +57,18 @@ struct SharedAlbumsView: View {
                 .disabled({ if case .unavailable = store.state { return true } else { return false } }())
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    newName = ""
-                    showCreate = true
+                Menu {
+                    Button {
+                        newName = ""
+                        showCreate = true
+                    } label: {
+                        Label("New Shared Album", systemImage: "person.2.crop.square.stack")
+                    }
+                    Button {
+                        showCompose = true
+                    } label: {
+                        Label("Request Photos", systemImage: "square.and.arrow.down.on.square")
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -80,6 +92,18 @@ struct SharedAlbumsView: View {
             // AND not-running-tests, so this is inert on the simulator / in tests.
             await invitations.refreshPendingInvitations()
             await invitations.registerInvitationSubscriptionIfNeeded()
+            // Photo-request layer: pull pending requests + register the request
+            // subscription. Both internally gated on isAvailable AND not-running-
+            // tests, so this is inert on the simulator / in tests.
+            requests.loadLocalCache()
+            await requests.refreshPendingRequests()
+            await requests.registerRequestSubscriptionIfNeeded()
+            // Durable ephemeral-face-zone cleanup: tear down any face zones a prior
+            // send created but the fast-path 600s timer never reached (app
+            // suspension). Gated on isAvailable AND not-running-tests internally, so
+            // it's inert on the simulator / in tests. Honors the "ephemeral"
+            // privacy guarantee for the biometric embedding.
+            await requests.sweepPendingEphemeralFaceZones()
         }
         .alert("New Shared Album", isPresented: $showCreate) {
             TextField("Album name", text: $newName)
@@ -112,24 +136,31 @@ struct SharedAlbumsView: View {
         .sheet(isPresented: $showInbox) {
             InvitationInboxView()
         }
-        // Pending-invitation banner: a tappable bar that opens the inbox.
+        .sheet(isPresented: $showCompose) {
+            ComposeRequestView()
+        }
+        .sheet(isPresented: $showRequestInbox) {
+            RequestInboxView()
+        }
+        // Pending banners: invitation + photo-request, each a tappable bar.
         .safeAreaInset(edge: .top) {
-            if !invitations.pendingInvitations.isEmpty {
-                Button {
-                    showInbox = true
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "envelope.badge.fill")
-                        Text(pendingBannerText)
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.caption)
+            VStack(spacing: 0) {
+                if !invitations.pendingInvitations.isEmpty {
+                    Button {
+                        showInbox = true
+                    } label: {
+                        bannerLabel(icon: "envelope.badge.fill", text: pendingBannerText)
                     }
-                    .padding(.horizontal)
-                    .padding(.vertical, 10)
-                    .background(.bar)
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+                if !requests.pendingRequests.isEmpty {
+                    Button {
+                        showRequestInbox = true
+                    } label: {
+                        bannerLabel(icon: "square.and.arrow.down.on.square.fill", text: requestBannerText)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
         .overlay {
@@ -140,6 +171,23 @@ struct SharedAlbumsView: View {
     private var pendingBannerText: String {
         let n = invitations.pendingInvitations.count
         return n == 1 ? "1 album invitation" : "\(n) album invitations"
+    }
+
+    private var requestBannerText: String {
+        let n = requests.pendingRequests.count
+        return n == 1 ? "1 photo request" : "\(n) photo requests"
+    }
+
+    private func bannerLabel(icon: String, text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+            Text(text).font(.subheadline.weight(.medium))
+            Spacer()
+            Image(systemName: "chevron.right").font(.caption)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.bar)
     }
 
     @ViewBuilder

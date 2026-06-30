@@ -44,6 +44,43 @@ import Foundation
 ///   server-side (would need a Sortable index on createdAt that the auto-created
 ///   dev schema doesn't provide), so we sort the results client-side. The same
 ///   `toUserRecordID == me` predicate also backs the CKQuerySubscription.
+///
+/// Record type "PhotoRequest" (public DB, default zone). Fields:
+///   - toUserRecordID   (String)  ←  REQUIRES a QUERYABLE index (we filter on it)
+///   - fromUserRecordID (String)
+///   - fromUsername     (String)
+///   - requestDescription (String)
+///   - startDate        (Date/Time)
+///   - endDate          (Date/Time)
+///   - faceFilter       (String)
+///   - faceShareURL     (String, optional)
+///   - createdAt        (Date/Time)
+///   ONLY `toUserRecordID` needs a Queryable index (same rationale as
+///   Invitation: client-side sort, no Sortable index).
+///
+///   ⚠️ REQUIRED IN BOTH DEV **AND** PRODUCTION: the `toUserRecordID` QUERYABLE
+///   index on PhotoRequest is mandatory in EVERY environment. It backs both
+///   `fetchPendingRequests` (the inbox query) AND the PhotoRequest
+///   CKQuerySubscription (the silent push). If it is missing, the subscription
+///   save fails with `.serverRejectedRequest` — INDISTINGUISHABLE from the benign
+///   "duplicate subscription" case, so `registerRequestSubscription` swallows it
+///   and the friend silently never receives request pushes (see the long comment
+///   at that call site). The auto-created dev schema marks fields Queryable on
+///   first use, but the production schema does NOT inherit that automatically —
+///   you MUST promote/deploy the index to production explicitly, or production
+///   pushes silently break. Same trap applies to Invitation.toUserRecordID above.
+///
+///   CRITICALLY: this record carries NO face embedding and NO photo — the
+///   biometric embedding lives ONLY in an ephemeral PRIVATE record zone shared
+///   invite-only via `faceShareURL` (see the RequestService section below +
+///   PhotoRequestModels.swift).
+///
+/// Record type "FacePayload" (PRIVATE database, EPHEMERAL custom zone — NEVER
+/// public). One field:
+///   - embedding (Bytes)   the requester's 512-d ArcFace embedding as raw
+///                         little-endian Float32 bytes. Lives only inside the
+///                         ephemeral zone, shared friends-only, then deleted.
+///   No index required (read by deterministic record name after share accept).
 /// ──────────────────────────────────────────────────────────────────────────
 @MainActor
 final class DirectoryService {
@@ -56,6 +93,9 @@ final class DirectoryService {
 
     /// Subscription id for the invitation-inbox push. Idempotent registration.
     static let invitationSubscriptionID = "public-invitations-for-me"
+
+    /// Subscription id for the photo-request-inbox push. Idempotent registration.
+    static let requestSubscriptionID = "public-photo-requests-for-me"
 
     private init() {}
 
@@ -164,6 +204,27 @@ final class DirectoryService {
         } catch {
             throw cloud.map(error)
         }
+    }
+
+    /// Set (or clear) the PUBLIC avatar on my existing UserProfile record. The
+    /// avatar is decorative (shown in friends/requests UI) and is NEVER used for
+    /// face matching. Fetches my live record by deterministic name, attaches the
+    /// CKAsset, saves, and returns the refreshed profile (with avatar bytes).
+    /// Throws if no profile exists yet (claim a username first).
+    @discardableResult
+    func setProfileAvatar(_ data: Data?, forUsername username: String) async throws -> UserProfile {
+        try await requireAvailable()
+        let recordID = CKRecord.ID(recordName: UserProfile.recordName(for: username))
+        guard let record = try? await publicDB.record(for: recordID) else {
+            throw SharedAlbumError.cloudKit("Claim a username before setting an avatar.")
+        }
+        let tempURL = UserProfile.attachAvatar(data, to: record)
+        defer { if let tempURL { try? FileManager.default.removeItem(at: tempURL) } }
+        let saved = try await save(record, to: publicDB)
+        guard let profile = UserProfile(record: saved) else {
+            throw SharedAlbumError.malformedRecord("profile after avatar save")
+        }
+        return profile
     }
 
     // MARK: - Invitations
@@ -291,6 +352,258 @@ final class DirectoryService {
             throw SharedAlbumError.cloudKit("Share has no URL yet. Try again.")
         }
         return url
+    }
+
+    // MARK: - Photo requests (public-DB inbox + ephemeral face share)
+
+    /// Send a photo request to a friend. Writes a public `PhotoRequest` record so
+    /// the friend's inbox can show it. When `faceEmbedding` is provided (the
+    /// filter needs the requester's face), we FIRST stand up an EPHEMERAL private
+    /// shared zone carrying ONLY that embedding (a `FacePayload` record),
+    /// invite-only to this friend, and put the resulting share URL on the public
+    /// record. The biometric embedding therefore never touches the public DB —
+    /// only a URL that grants nothing except to the invited identity does.
+    ///
+    /// The outcome of sending a photo request: the ephemeral face-zone ID (when
+    /// one was created, so the caller can schedule durable cleanup) and whether
+    /// the requested face filter was DOWNGRADED to `.any` because we couldn't
+    /// stand up the ephemeral face share. The compose UI surfaces the downgrade so
+    /// the requester knows the friend will see "any photos", not a face-filtered set.
+    struct SendRequestOutcome {
+        let ephemeralZoneID: CKRecordZone.ID?
+        /// True iff `faceFilter.needsFace` was requested but we shipped `.any`.
+        let downgradedToAny: Bool
+    }
+
+    /// Returns the outcome (ephemeral face-zone ID, when created, + a
+    /// face-filter-downgrade flag) so the caller can best-effort clean up the zone
+    /// AND disclose a downgrade to the user.
+    @discardableResult
+    func sendPhotoRequest(toUserRecordID: String,
+                          fromUsername: String,
+                          description: String,
+                          from startDate: Date,
+                          to endDate: Date,
+                          faceFilter: FaceFilter,
+                          faceEmbedding: [Float]?) async throws -> SendRequestOutcome {
+        try await requireAvailable()
+        let myID = try await myUserRecordID()
+
+        var faceShareURL: URL?
+        var ephemeralZoneID: CKRecordZone.ID?
+
+        // Only build the ephemeral face share when the filter needs a face AND
+        // we actually have an embedding. Defense: never put the embedding
+        // anywhere but the private zone.
+        if faceFilter.needsFace, let embedding = faceEmbedding, !embedding.isEmpty {
+            let (url, zoneID) = try await createEphemeralFaceShare(
+                embedding: embedding, toUserRecordID: toUserRecordID)
+            faceShareURL = url
+            ephemeralZoneID = zoneID
+        }
+
+        // If the filter wanted a face but we couldn't produce a share, fall back
+        // to `.any` rather than silently shipping an unenforceable
+        // onlyMe/withoutMe with no embedding for the friend to use. Disclose this
+        // downgrade to the caller so the compose UI can inform the requester.
+        let downgraded = faceFilter.needsFace && faceShareURL == nil
+        let request = PhotoRequest.make(
+            toUserRecordID: toUserRecordID,
+            fromUserRecordID: myID,
+            fromUsername: fromUsername,
+            description: description,
+            startDate: startDate,
+            endDate: endDate,
+            faceFilter: downgraded ? .any : faceFilter,
+            faceShareURL: faceShareURL)
+        _ = try await save(request.toRecord(), to: publicDB)
+        return SendRequestOutcome(ephemeralZoneID: ephemeralZoneID, downgradedToAny: downgraded)
+    }
+
+    /// Stand up the ephemeral private face share: create a fresh custom zone in
+    /// MY private DB, write the embedding as a `FacePayload` record into it,
+    /// create a zone-wide CKShare (publicPermission `.none`), add the friend as an
+    /// explicit participant, save, and return the share URL + zone ID. Mirrors
+    /// `shareAlbum` exactly, but for a private throwaway zone instead of an album.
+    private func createEphemeralFaceShare(embedding: [Float],
+                                          toUserRecordID: String) async throws -> (URL, CKRecordZone.ID) {
+        // 1. Fresh, unique ephemeral zone in MY private DB.
+        let zoneName = "facereq-\(UUID().uuidString)"
+        let zone = try await cloud.createAlbumZone(named: zoneName)
+        let zoneID = zone.zoneID
+
+        // 2. Write the FacePayload (the ONLY copy of the embedding in CloudKit).
+        let payload = FacePayload(embedding: embedding)
+        try await cloud.save([payload.toRecord(inZone: zoneID)], to: cloud.privateDB)
+
+        // 3. Zone-wide, invite-only share; add the friend as explicit participant.
+        let share = try await cloud.fetchOrCreateShare(for: zoneID, title: "Face match")
+        share.publicPermission = .none
+        let alreadyParticipant = share.participants.contains {
+            $0.userIdentity.userRecordID?.recordName == toUserRecordID
+        }
+        if !alreadyParticipant {
+            let participant = try await fetchParticipant(forUserRecordID: toUserRecordID)
+            participant.permission = .readWrite
+            participant.role = .privateUser
+            share.addParticipant(participant)
+        }
+        try await modifySharing(saving: [share], in: cloud.privateDB)
+
+        guard let url = share.url else {
+            throw SharedAlbumError.cloudKit("Face share has no URL yet. Try again.")
+        }
+        return (url, zoneID)
+    }
+
+    /// Query the public DB for photo requests addressed to me, sorted client-side
+    /// by `createdAt` (newest first). Requires a QUERYABLE index on
+    /// `toUserRecordID` (documented in the file header). Mirrors
+    /// fetchPendingInvitations.
+    func fetchPendingRequests() async throws -> [PhotoRequest] {
+        try await requireAvailable()
+        let myID = try await myUserRecordID()
+        let predicate = NSPredicate(format: "%K == %@", PhotoRequest.Field.toUserRecordID, myID)
+        let query = CKQuery(recordType: PhotoRequest.RecordType.request, predicate: predicate)
+        do {
+            let (matchResults, _) = try await publicDB.records(
+                matching: query, desiredKeys: nil, resultsLimit: CKQueryOperation.maximumResults)
+            let requests: [PhotoRequest] = matchResults.compactMap { _, result in
+                guard case .success(let record) = result else { return nil }
+                return PhotoRequest(record: record)
+            }
+            return requests.sorted { $0.createdAt > $1.createdAt }
+        } catch {
+            throw cloud.map(error)
+        }
+    }
+
+    /// Accept the ephemeral face share at `url` and read the requester's
+    /// embedding out of the shared zone. Mirrors `acceptInvitation` /
+    /// SharedAlbumStore.acceptShare → loadAlbums: resolve the share metadata,
+    /// accept it (tolerating an already-accepted share), then ENUMERATE the now
+    /// available shared-DB zones and read the deterministic `FacePayload` record
+    /// from whichever shared zone actually carries it. Returns the 512-d embedding
+    /// for the friend's on-device cluster matching. The friend never has to delete
+    /// the zone — the requester does that best-effort.
+    ///
+    /// Why enumerate instead of reconstructing the zoneID from
+    /// `metadata.share.recordID.zoneID`: that reconstruction is fragile. After a
+    /// zone-wide share is accepted, the zone appears in the recipient's shared DB
+    /// under the OWNER's zone identity, and reading it back by a locally
+    /// reconstructed ID (especially on the FIRST accept, before local share state
+    /// settles) can throw `unknownItem` / `zoneNotFound`. The robust path — the
+    /// same one the album sync uses — is to let `sharedDB.allRecordZones()` report
+    /// the freshly available zones and fetch the deterministic record from each.
+    func acceptFaceShare(url: URL) async throws -> [Float] {
+        try await requireAvailable()
+        let metadata = try await fetchShareMetadata(for: url)
+
+        // Tolerate an already-accepted share. `fulfill`/Build may re-run on the
+        // same request (e.g. a retry, or rebuilding after a prior failure), and
+        // re-accepting an already-joined share can throw — in that case the zone
+        // is already in our shared DB, so swallow the accept error and proceed to
+        // read the payload. A genuine "can't accept" failure is still caught
+        // below when no shared zone yields the payload.
+        do {
+            try await cloud.acceptShare(metadata)
+        } catch {
+            // Already a participant (or a transient accept hiccup): fall through to
+            // the enumeration, which is the source of truth for whether the zone
+            // is actually reachable.
+            #if DEBUG
+            print("[Requests] acceptFaceShare: accept returned \(error) — proceeding to enumerate shared zones")
+            #endif
+        }
+
+        do {
+            // Enumerate the shared-DB zones that are now available to us and read
+            // the deterministic `FacePayload` record from whichever one carries it.
+            // The ephemeral face zone is single-purpose, so the first shared zone
+            // that yields a decodable payload IS the requester's. Prefer the zone
+            // whose ownerName matches the accepted share's owner when present, but
+            // fall back to scanning all shared zones (robust on first accept).
+            let zones = try await cloud.fetchSharedAlbumZones()
+            let preferredOwner = metadata.share.recordID.zoneID.ownerName
+            let ordered = zones.sorted { a, b in
+                (a.zoneID.ownerName == preferredOwner ? 0 : 1)
+                    < (b.zoneID.ownerName == preferredOwner ? 0 : 1)
+            }
+            for zone in ordered {
+                let payloadID = CKRecord.ID(recordName: FacePayload.recordName,
+                                            zoneID: zone.zoneID)
+                guard let record = try? await cloud.fetchRecord(payloadID, from: cloud.sharedDB),
+                      let payload = FacePayload(record: record) else { continue }
+                return payload.embedding
+            }
+            // No shared zone yielded the payload — the share wasn't actually
+            // accepted (or the zone is gone). Surface a clear error so the caller
+            // treats the face filter as UNAVAILABLE rather than silently dropping it.
+            throw SharedAlbumError.malformedRecord("face payload (no shared zone carried it)")
+        } catch {
+            throw cloud.map(error)
+        }
+    }
+
+    /// Best-effort: the REQUESTER deletes the ephemeral face zone (and with it the
+    /// embedding + share) after the friend has built the album. Never throws —
+    /// the embedding was always transient and the zone is single-purpose. We never
+    /// rely on the friend deleting it.
+    func deleteEphemeralFaceZone(_ zoneID: CKRecordZone.ID) async {
+        guard (try? await requireAvailable()) != nil else { return }
+        _ = try? await cloud.privateDB.deleteRecordZone(withID: zoneID)
+    }
+
+    /// Best-effort: the REQUESTER deletes its own PhotoRequest record once the
+    /// friend has fulfilled/dismissed it. Low priority — the friend's local
+    /// handled-set already prevents re-display. Never throws.
+    func deleteSentRequest(id: String) async {
+        guard (try? await requireAvailable()) != nil else { return }
+        let recordID = CKRecord.ID(recordName: id)
+        _ = try? await publicDB.deleteRecord(withID: recordID)
+    }
+
+    /// Register a silent CKQuerySubscription on the public "PhotoRequest" record
+    /// type, filtered to requests addressed to me. Idempotent (a duplicate is
+    /// rejected with `.serverRejectedRequest`, treated as success). Caller gates
+    /// on isAvailable AND !runningTests. Mirrors registerInvitationSubscription.
+    func registerRequestSubscription() async throws {
+        try await requireAvailable()
+        let myID = try await myUserRecordID()
+        let predicate = NSPredicate(format: "%K == %@", PhotoRequest.Field.toUserRecordID, myID)
+        let subscription = CKQuerySubscription(
+            recordType: PhotoRequest.RecordType.request,
+            predicate: predicate,
+            subscriptionID: Self.requestSubscriptionID,
+            options: [.firesOnRecordCreation])
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true   // silent — no alert/badge
+        subscription.notificationInfo = info
+        do {
+            _ = try await publicDB.save(subscription)
+        } catch let error as CKError {
+            // IDEMPOTENCY TRAP (documented, deliberately accepted): CloudKit
+            // returns .serverRejectedRequest for BOTH cases we cannot cleanly
+            // distinguish here —
+            //   (a) a duplicate subscription (same subscriptionID, every launch
+            //       after the first) — the benign, expected case, AND
+            //   (b) a subscription whose predicate filters on a field that is NOT
+            //       marked QUERYABLE in the CloudKit schema. If the
+            //       `toUserRecordID` Queryable index is missing on the PhotoRequest
+            //       record type, the subscription is REJECTED with this SAME code,
+            //       and we would swallow it as "already exists" — the friend then
+            //       silently never receives request pushes.
+            // We keep treating it as success (idempotency is required and the two
+            // cases are indistinguishable from the error alone), so the OPERATIONAL
+            // guarantee is the Dashboard config: the `toUserRecordID` Queryable
+            // index MUST exist in BOTH dev and production (see the file header).
+            // Without it, fetchPendingRequests also throws, so the inbox is empty —
+            // that surfaces the misconfiguration during testing.
+            if error.code == .serverRejectedRequest || Self.indicatesAlreadyExists(error) { return }
+            throw cloud.map(error)
+        } catch {
+            throw cloud.map(error)
+        }
     }
 
     // MARK: - CKOperation bridges (one-shot continuation, main-actor hop)

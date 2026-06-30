@@ -32,9 +32,24 @@ struct UserProfile: Identifiable, Codable, Equatable {
     /// resolve into a share participant via CKUserIdentity.LookupInfo.
     var userRecordID: String
     var createdAt: Date
+    /// Bytes of the PUBLIC avatar JPEG, when one has been set / fetched. Optional
+    /// and small (a downscaled JPEG). Decorative only — NEVER used for face
+    /// matching. Carried here (rather than as a CKAsset) so UserProfile stays a
+    /// pure Codable value type for the JSON cache. Excluded from `Equatable` skew
+    /// concerns because it is just an image cache, not identity.
+    var avatarData: Data?
 
     /// Stable identity for SwiftUI: the normalized record name.
     var id: String { Self.recordName(for: username) }
+
+    init(username: String, displayName: String, userRecordID: String,
+         createdAt: Date, avatarData: Data? = nil) {
+        self.username = username
+        self.displayName = displayName
+        self.userRecordID = userRecordID
+        self.createdAt = createdAt
+        self.avatarData = avatarData
+    }
 
     // MARK: record name normalization
 
@@ -130,6 +145,12 @@ extension UserProfile {
         static let displayName = "displayName"
         static let userRecordID = "userRecordID"
         static let createdAt = "createdAt"
+        /// PUBLIC avatar — a CKAsset (small JPEG) shown in the friends / request
+        /// UI. Optional. NEVER used for face matching (that is the requester's
+        /// separate, local, private face photo → ephemeral face share). Keeping
+        /// the avatar a plain decorative image on the public record means a
+        /// readable avatar carries no biometric guarantee and no matching weight.
+        static let avatar = "avatar"
     }
 
     /// Map a fetched public "UserProfile" record to the value type. Failable so a
@@ -142,12 +163,18 @@ extension UserProfile {
         self.userRecordID = userRecordID
         self.displayName = (record[Field.displayName] as? String) ?? username
         self.createdAt = (record[Field.createdAt] as? Date) ?? Date()
+        // PUBLIC avatar bytes, if present. Decorative only — never matched.
+        self.avatarData = (record[Field.avatar] as? CKAsset)
+            .flatMap { $0.fileURL }
+            .flatMap { try? Data(contentsOf: $0) }
     }
 
     /// Materialize the value into a public-DB record. The record ID is the
     /// deterministic `profile_<lower>` name in the default zone (public DB only
     /// supports the default zone), which is what makes uniqueness an existence
-    /// check rather than a query.
+    /// check rather than a query. The avatar is attached separately by the
+    /// caller via `attachAvatar` (it needs a temp-file CKAsset), so this base
+    /// mapping stays pure / testable.
     func toRecord() -> CKRecord {
         let id = CKRecord.ID(recordName: Self.recordName(for: username))
         let rec = CKRecord(recordType: RecordType.profile, recordID: id)
@@ -156,6 +183,24 @@ extension UserProfile {
         rec[Field.userRecordID] = userRecordID as CKRecordValue
         rec[Field.createdAt] = createdAt as CKRecordValue
         return rec
+    }
+
+    /// Attach (or clear) the public avatar on a record by writing the bytes to a
+    /// temp-file CKAsset. Returns the temp-file URL to clean up after save, or
+    /// nil when there is nothing to attach. Kept off `toRecord()` because a
+    /// CKAsset needs a file on disk (not expressible in a pure value mapping).
+    @discardableResult
+    static func attachAvatar(_ data: Data?, to record: CKRecord) -> URL? {
+        guard let data else { record[Field.avatar] = nil; return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("avatar-\(UUID().uuidString).jpg")
+        do {
+            try data.write(to: url, options: .atomic)
+            record[Field.avatar] = CKAsset(fileURL: url)
+            return url
+        } catch {
+            return nil
+        }
     }
 }
 

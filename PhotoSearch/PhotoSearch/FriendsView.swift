@@ -11,10 +11,13 @@ import UIKit
 /// and does no network work.
 struct FriendsView: View {
     @ObservedObject private var store = InvitationStore.shared
+    @ObservedObject private var requests = RequestStore.shared
 
     @State private var showOnboarding = false
     @State private var showAddFriend = false
     @State private var addError: String?
+    @State private var showAvatarPicker = false
+    @State private var showFacePhotoPicker = false
 
     var body: some View {
         Group {
@@ -37,13 +40,81 @@ struct FriendsView: View {
             }
         }
         // Hydrate local cache for an instant view; no CloudKit at launch.
-        .task { store.loadLocalCache() }
+        .task { store.loadLocalCache(); requests.loadLocalCache() }
         .sheet(isPresented: $showOnboarding) {
             UsernameOnboardingView()
         }
         .sheet(isPresented: $showAddFriend) {
             AddFriendView()
         }
+        .sheet(isPresented: $showAvatarPicker) {
+            FacePhotoPickerView(mode: .publicAvatar)
+        }
+        .sheet(isPresented: $showFacePhotoPicker) {
+            FacePhotoPickerView(mode: .privateFace)
+        }
+    }
+
+    /// Profile-photos section: a PUBLIC avatar (decorative; shown to friends) and
+    /// a PRIVATE face photo (local only; used solely to find the user in a
+    /// friend's library for face-filtered requests — never uploaded).
+    @ViewBuilder
+    private var profileSection: some View {
+        Section {
+            Button {
+                showAvatarPicker = true
+            } label: {
+                HStack {
+                    profileAvatar
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Public avatar").foregroundStyle(.primary)
+                        Text(store.myProfile?.avatarData == nil ? "Not set — shown to friends" : "Tap to change")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Button {
+                showFacePhotoPicker = true
+            } label: {
+                HStack {
+                    Image(systemName: requests.hasPrivateFacePhoto
+                          ? "person.crop.circle.badge.checkmark" : "person.crop.circle.badge.plus")
+                        .font(.title2).foregroundStyle(.tint).frame(width: 40)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Private face photo").foregroundStyle(.primary)
+                        Text(requests.hasPrivateFacePhoto
+                             ? "Set — stays on this device, used only for face-filtered requests"
+                             : "Set one to request photos you’re in")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if requests.hasPrivateFacePhoto {
+                Button(role: .destructive) {
+                    requests.clearPrivateFacePhoto()
+                } label: {
+                    Label("Remove face photo", systemImage: "trash")
+                }
+            }
+        } header: {
+            Text("Your profile")
+        } footer: {
+            Text("Your private face photo never leaves the device. For a face-filtered request, only a private, friends-only match is shared — never the public directory.")
+        }
+    }
+
+    @ViewBuilder
+    private var profileAvatar: some View {
+        ZStack {
+            Circle().fill(Color(.secondarySystemBackground))
+            if let data = store.myProfile?.avatarData, let ui = UIImage(data: data) {
+                Image(uiImage: ui).resizable().scaledToFill()
+            } else {
+                Image(systemName: "person.fill").foregroundStyle(.tint)
+            }
+        }
+        .frame(width: 40, height: 40)
+        .clipShape(Circle())
     }
 
     private var onboardingPrompt: some View {
@@ -63,21 +134,24 @@ struct FriendsView: View {
 
     @ViewBuilder
     private var friendsList: some View {
-        if store.friends.isEmpty {
-            ContentUnavailableView {
-                Label("No friends yet", systemImage: "person.2")
-            } description: {
-                Text("Add friends by username to invite them to your shared albums.")
-            } actions: {
-                Button {
-                    showAddFriend = true
-                } label: {
-                    Label("Add Friend", systemImage: "person.badge.plus")
+        List {
+            profileSection
+            if store.friends.isEmpty {
+                Section {
+                    ContentUnavailableView {
+                        Label("No friends yet", systemImage: "person.2")
+                    } description: {
+                        Text("Add friends by username to invite them to shared albums and request photos.")
+                    } actions: {
+                        Button {
+                            showAddFriend = true
+                        } label: {
+                            Label("Add Friend", systemImage: "person.badge.plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-            }
-        } else {
-            List {
+            } else {
                 Section {
                     ForEach(store.friends) { friend in
                         FriendRow(friend: friend)

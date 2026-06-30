@@ -121,6 +121,25 @@ final class InvitationStore: ObservableObject {
         return profile
     }
 
+    /// Set my PUBLIC avatar (decorative; never used for face matching). Updates
+    /// the public UserProfile record and refreshes the cached profile + avatar
+    /// bytes locally. Throws `.unavailable` when signed out, or `.cloudKit` when
+    /// no profile exists yet. Routed here so the @Published myProfile updates.
+    func setMyAvatar(_ data: Data) async throws {
+        isWorking = true
+        defer { isWorking = false }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else {
+            throw SharedAlbumError.unavailable(reason: "Sign in to iCloud to set an avatar")
+        }
+        guard let username = myProfile?.username else {
+            throw SharedAlbumError.cloudKit("Claim a username before setting an avatar.")
+        }
+        let updated = try await directory.setProfileAvatar(data, forUsername: username)
+        myProfile = updated
+        persistProfile()
+    }
+
     /// Best-effort refresh of my profile from the directory (e.g. to confirm the
     /// cached username still resolves). No-op when unavailable or not onboarded.
     func refreshMyProfile() async {

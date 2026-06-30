@@ -1749,6 +1749,89 @@ final class PhotoStore: ObservableObject {
         return scored
     }
 
+    // MARK: - Photo request support (additive — used by RequestStore.fulfill)
+
+    /// Search this library for photos matching `description` whose capture date
+    /// falls within the inclusive [from, to] window. Reuses `searchPhotos` for
+    /// the structured + CLIP-caption ranking, then keeps only photos whose
+    /// `createdAt` is inside the range. A blank description falls back to "every
+    /// photo in the window" (so a pure date request still returns candidates).
+    /// Photos with no `createdAt` are excluded (can't honor the window).
+    ///
+    /// Used by the "build & share" flow: the friend searches THEIR own library
+    /// for what the requester asked for. Pure on-device; no CloudKit.
+    func photosMatching(description: String, from: Date, to: Date) -> [LocalPhoto] {
+        // Normalize the window so a caller passing the bounds in either order
+        // still works, and so an inclusive end-of-day is honored.
+        let lo = min(from, to)
+        let hi = max(from, to)
+        let inWindow: (LocalPhoto) -> Bool = { p in
+            guard let d = p.createdAt else { return false }
+            return d >= lo && d <= hi
+        }
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty
+            ? allPhotos()                       // date-only request
+            : searchPhotos(query: trimmed)      // description + structured/CLIP
+        return base.filter(inWindow)
+    }
+
+    /// Best `activeClusters` prototype for `embedding` by cosine similarity
+    /// (`dot`, valid because prototypes and embeddings are L2-normalized), or nil
+    /// if the top match is below `threshold`. Used by the face filter: the
+    /// requester's ArcFace embedding (delivered via the ephemeral face share) is
+    /// matched against the FRIEND's people clusters to find "the requester" in
+    /// the friend's library. 0.45 is between the LFW same-person mean (~0.64) and
+    /// diff-person max (~0.23), so a real match clears it and a stranger doesn't.
+    func clusterMatching(_ embedding: [Float], threshold: Float = 0.45) -> PersonCluster? {
+        guard !embedding.isEmpty else { return nil }
+        var best: PersonCluster?
+        var bestScore: Float = -.greatestFiniteMagnitude
+        for cluster in activeClusters {
+            let s = Self.dot(embedding, cluster.prototype)
+            if s > bestScore { bestScore = s; best = cluster }
+        }
+        guard bestScore >= threshold else { return nil }
+        return best
+    }
+
+    /// Apply a 3-way face filter to a candidate result set, given the requester's
+    /// face embedding (already delivered via the ephemeral share). Pure logic:
+    ///   - `.any`        → results unchanged.
+    ///   - `.onlyMe`     → results ∩ matched cluster's photos; if NO cluster
+    ///                     matches (the requester isn't recognized in this
+    ///                     library), the intersection is empty — correct, since
+    ///                     we can't prove the requester is in any photo.
+    ///   - `.withoutMe`  → results minus the matched cluster's photos; if no
+    ///                     cluster matches, ALL results pass (the requester is in
+    ///                     none of them, as far as we can tell).
+    /// `embedding` is ignored for `.any` (callers should pass []).
+    func applyFaceFilter(_ filter: FaceFilter,
+                         to results: [LocalPhoto],
+                         requesterEmbedding embedding: [Float]) -> [LocalPhoto] {
+        guard filter.needsFace else { return results }
+        let match = clusterMatching(embedding)
+        let memberIDs: Set<String> = match.map { Set(photos(forCluster: $0.id).map(\.assetID)) } ?? []
+        switch filter {
+        case .any:
+            return results
+        case .onlyMe:
+            return results.filter { memberIDs.contains($0.assetID) }
+        case .withoutMe:
+            return results.filter { !memberIDs.contains($0.assetID) }
+        }
+    }
+
+    /// Build a static folder named `name` containing exactly `assetIDs`, in their
+    /// given order. Thin convenience over createFolder + addPhotos so the
+    /// build-&-share flow has a one-call "stage these for review/upload" path.
+    @discardableResult
+    func buildFolder(named name: String, assetIDs: [String]) -> LocalFolder {
+        let folder = createFolder(name: name, query: nil)
+        addPhotos(assetIDs, toFolder: folder.id)
+        return folder
+    }
+
     /// Compose one query vector from any mix of an anchor photo's stored
     /// CLIP embedding, base text, and plus/minus text terms — CLIP's shared
     /// image/text space makes the arithmetic meaningful ("this photo, but at

@@ -313,11 +313,28 @@ final class SharedAlbumStore: ObservableObject {
     /// Guards on availability up front, so it is inert on the simulator / in
     /// tests. Always clears `uploadProgress` for the album on exit.
     func addPhotos(localAssetIDs: [String], toAlbum album: SharedAlbum) async {
-        guard !localAssetIDs.isEmpty else { return }
+        _ = try? await addPhotosReportingCount(localAssetIDs: localAssetIDs, toAlbum: album)
+    }
+
+    /// Like `addPhotos`, but RETURNS the number of photos that actually saved and
+    /// THROWS on a hard upload failure. This is the variant share-back uses so it
+    /// can gate the invite + "Shared N photos" message + markFulfilled on a
+    /// verified non-zero upload — never reporting success for an empty/failed
+    /// album (the original `addPhotos` swallowed all errors, so a friend could be
+    /// told "Shared 5 photos" while the requester got an EMPTY album and the
+    /// request was gone forever).
+    ///
+    /// Throws `SharedAlbumError` on unavailability, unreadable inputs, or a CK
+    /// upload failure. Returns 0 only when there were no inputs (callers should
+    /// treat 0 as "nothing shared"). Still updates published progress/cache state.
+    @discardableResult
+    func addPhotosReportingCount(localAssetIDs: [String], toAlbum album: SharedAlbum) async throws -> Int {
+        guard !localAssetIDs.isEmpty else { return 0 }
         await cloud.accountStatus()
         guard cloud.isAvailable else {
-            state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
-            return
+            let reason = "Sign in to iCloud to use Shared Albums"
+            state = .unavailable(reason: reason)
+            throw SharedAlbumError.unavailable(reason: reason)
         }
 
         uploadProgress[album.id] = 0
@@ -342,7 +359,7 @@ final class SharedAlbumStore: ObservableObject {
 
         guard !payloads.isEmpty else {
             state = .error(message: "Couldn't read the selected photos.")
-            return
+            throw SharedAlbumError.cloudKit("Couldn't read the selected photos.")
         }
 
         // 2. Upload. Progress callback updates the published fraction.
@@ -367,8 +384,11 @@ final class SharedAlbumStore: ObservableObject {
             if saved < payloads.count {
                 state = .error(message: "Some photos couldn't be uploaded.")
             }
+            return saved
         } catch {
-            state = .error(message: cloud.map(error).localizedDescription)
+            let mapped = cloud.map(error)
+            state = .error(message: mapped.localizedDescription)
+            throw mapped
         }
     }
 

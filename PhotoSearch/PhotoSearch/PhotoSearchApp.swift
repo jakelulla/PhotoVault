@@ -69,22 +69,37 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             completionHandler(.noData)
             return
         }
-        // Two kinds of push reach us: the zone/database subscriptions (private +
-        // shared DB) drive a delta sync; the public-DB invitation QUERY
-        // subscription drives an inbox refresh. We route by notification type so
-        // each push does the right work, and call the completion handler EXACTLY
-        // ONCE on every path. Both stores re-guard on `isAvailable`, so this stays
-        // inert on the simulator / in tests (where no subscription is registered).
+        // Three kinds of push reach us, all routed by subscriptionID so each does
+        // the right work and the completion handler is called EXACTLY ONCE on
+        // every path:
+        //   1. the public-DB INVITATION query subscription → invitation inbox,
+        //   2. the public-DB PHOTO-REQUEST query subscription → request inbox,
+        //   3. the zone/database subscriptions (private + shared DB) → delta sync.
+        // Both query subscriptions surface as CKQueryNotification, so we must
+        // distinguish them by subscriptionID (not by type). Every store re-guards
+        // on `isAvailable`, so this stays inert on the simulator / in tests (where
+        // no subscription is registered).
+        let subID = notification.subscriptionID
         Task { @MainActor in
-            if notification.subscriptionID == DirectoryService.invitationSubscriptionID
-                || notification is CKQueryNotification {
-                // New invitation in the public inbox.
+            switch subID {
+            case DirectoryService.invitationSubscriptionID:
                 await InvitationStore.shared.refreshPendingInvitations()
                 completionHandler(.newData)
-            } else {
-                // Album/photo zone change → delta sync.
-                let changed = await SharedAlbumStore.shared.syncChanges()
-                completionHandler(changed ? .newData : .noData)
+            case DirectoryService.requestSubscriptionID:
+                await RequestStore.shared.refreshPendingRequests()
+                completionHandler(.newData)
+            default:
+                if notification is CKQueryNotification {
+                    // An unrecognized public-DB query push (schema/id skew):
+                    // refresh both public inboxes so nothing is missed.
+                    await InvitationStore.shared.refreshPendingInvitations()
+                    await RequestStore.shared.refreshPendingRequests()
+                    completionHandler(.newData)
+                } else {
+                    // Album/photo zone change → delta sync.
+                    let changed = await SharedAlbumStore.shared.syncChanges()
+                    completionHandler(changed ? .newData : .noData)
+                }
             }
         }
     }
