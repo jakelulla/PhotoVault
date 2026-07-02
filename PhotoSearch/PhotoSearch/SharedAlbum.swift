@@ -1,5 +1,20 @@
 import CloudKit
 import Foundation
+import os
+
+// MARK: - Diagnostics
+
+/// Unified-logging channel for the whole shared-albums stack. CloudKit is
+/// device-only (unavailable on the simulator / in tests), so when a real device
+/// run misbehaves the *only* signal we get is the Console. These logs pinpoint
+/// where a contribute/reload breaks — payload built (count), records to save,
+/// per-record save result + CKError code, fetched count, save-vs-fetch. We log
+/// counts, record names, zone names, DB scope, and error descriptions only —
+/// NEVER photo bytes, thumbnails, or face data.
+enum SharedAlbumLog {
+    static let logger = Logger(subsystem: "com.photovault.sharedalbums",
+                               category: "sharedalbums")
+}
 
 // MARK: - Errors
 
@@ -247,14 +262,22 @@ extension SharedPhoto {
     ///
     /// - The record ID is minted in `zoneID` so the photo lands in the album's
     ///   custom zone (the unit of sharing), never the default zone.
-    /// - `parent` is set to the album-root reference AND mirrored into the
-    ///   `album` field with action `.deleteSelf`, so deleting the album cascades
-    ///   to its photos. (CloudKit uses `parent` for the share hierarchy and a
-    ///   user-defined reference field for the cascade.)
+    /// - When `albumRootRef` is non-nil, `parent` is set to it AND the reference
+    ///   is mirrored into the `album` field with action `.deleteSelf`, so
+    ///   deleting the album cascades to its photos. (CloudKit uses `parent` for
+    ///   the share hierarchy and a user-defined reference field for the cascade.)
+    /// - When `albumRootRef` is nil (the album-root record isn't resolvable in
+    ///   the target zone/DB — e.g. an older album whose root save failed, or a
+    ///   participant whose shared-zone view lacks it), BOTH references are
+    ///   omitted: referencing a non-existent record would fail the whole save
+    ///   with `CKError.referenceViolation`. The photo still lands in the shared
+    ///   zone, so zone-wide sharing surfaces it regardless — it just won't
+    ///   cascade-delete with the album. Callers verify existence before upload
+    ///   (SharedAlbumStore.addPhotosReportingCount).
     /// - Both image fields are CKAssets pointing at the payload's temp files.
     static func makeRecord(from payload: SharedPhotoUploadPayload,
                            inZone zoneID: CKRecordZone.ID,
-                           albumRootRef: CKRecord.Reference) -> CKRecord {
+                           albumRootRef: CKRecord.Reference?) -> CKRecord {
         let recordID = CKRecord.ID(recordName: "photo-\(UUID().uuidString)", zoneID: zoneID)
         let rec = CKRecord(recordType: SharedAlbum.RecordType.photo, recordID: recordID)
 
@@ -262,10 +285,13 @@ extension SharedPhoto {
         // `.none` (CloudKit throws NSInvalidArgumentException synchronously, i.e.
         // an instant crash, if a `parent` reference carries any other action).
         // The cascade-on-album-delete is expressed via the separate `album`
-        // field reference, which may carry `.deleteSelf`.
-        rec.parent = CKRecord.Reference(recordID: albumRootRef.recordID, action: .none)
-        rec[SharedAlbum.PhotoField.album] =
-            CKRecord.Reference(recordID: albumRootRef.recordID, action: .deleteSelf)
+        // field reference, which may carry `.deleteSelf`. Both are set only when
+        // the album-root target is known to exist (see doc comment above).
+        if let albumRootRef {
+            rec.parent = CKRecord.Reference(recordID: albumRootRef.recordID, action: .none)
+            rec[SharedAlbum.PhotoField.album] =
+                CKRecord.Reference(recordID: albumRootRef.recordID, action: .deleteSelf)
+        }
 
         rec[SharedAlbum.PhotoField.fullImage] = CKAsset(fileURL: payload.fullImageURL)
         rec[SharedAlbum.PhotoField.thumbnail] = CKAsset(fileURL: payload.thumbnailURL)

@@ -196,6 +196,16 @@ final class CloudKitService {
         }
     }
 
+    /// True if a record with `id` currently exists in `database`. Used to verify
+    /// the album-root parent target exists BEFORE contributing photos: a missing
+    /// root would make the photo's `parent`/`album` reference a
+    /// `CKError.referenceViolation` and sink the whole save. Never throws — any
+    /// failure (including "unknown item") resolves to false so the caller can
+    /// decide to repair (re-save the root) or omit the parent reference.
+    func recordExists(_ id: CKRecord.ID, in database: CKDatabase) async -> Bool {
+        (try? await database.record(for: id)) != nil
+    }
+
     /// Save records to a database with retry handling for the transient,
     /// retryable CKErrors: `.serverRecordChanged` (resolve by re-applying the
     /// caller's intended field values onto the fetched server record before
@@ -316,45 +326,84 @@ final class CloudKitService {
     /// deleted after each chunk completes (success or hard failure), so a failed
     /// upload never leaks temp files.
     ///
-    /// - Returns: the count of successfully saved photo records (partial success
-    ///   is tolerated — a per-record failure does not sink the whole batch).
+    /// - Returns: a `PhotoUploadResult` — the SharedPhoto value types that saved
+    ///   (so the caller can render them optimistically without waiting for a
+    ///   re-fetch), their thumbnail bytes (read back from the payload temp files
+    ///   before cleanup), and every per-record CKError (so a partial or total
+    ///   reject surfaces a concrete cause instead of a silent empty grid).
+    ///   Partial success is tolerated — a per-record failure does not sink the
+    ///   whole batch — but if a chunk saves NOTHING the operation throws the
+    ///   concrete per-record error rather than silently returning zero.
     /// - Note: guards on availability, so it is inert on the simulator / in
     ///   tests, throwing `.unavailable` before any network work.
+    /// - Parameter albumRootRef: the album-root parent reference, or nil to omit
+    ///   the parent/cascade references (see `SharedPhoto.makeRecord`). The
+    ///   caller verifies the root exists in `database` first.
     @discardableResult
     func uploadPhotos(_ payloads: [SharedPhotoUploadPayload],
                       toZone zoneID: CKRecordZone.ID,
                       database: CKDatabase,
-                      albumRootRef: CKRecord.Reference,
-                      progress: (@MainActor (Int, Int) -> Void)? = nil) async throws -> Int {
+                      albumRootRef: CKRecord.Reference?,
+                      progress: (@MainActor (Int, Int) -> Void)? = nil) async throws -> PhotoUploadResult {
         try await requireAvailable()
-        guard !payloads.isEmpty else { return 0 }
+        guard !payloads.isEmpty else { return PhotoUploadResult() }
 
         let total = payloads.count
-        var savedCount = 0
+        var savedPhotos: [SharedPhoto] = []
+        var savedThumbnails: [String: Data] = [:]
+        var perRecordErrors: [(id: CKRecord.ID, error: Error)] = []
         // Track every temp file so we can clean up even if we throw mid-batch.
         let allTempURLs = payloads.flatMap { [$0.fullImageURL, $0.thumbnailURL] }
         defer { Self.removeTempFiles(allTempURLs) }
 
+        SharedAlbumLog.logger.info(
+            "uploadPhotos: \(total) payload(s) → zone \(zoneID.zoneName, privacy: .public), parent=\(albumRootRef != nil)")
+
         for chunk in payloads.chunked(into: Self.uploadChunkSize) {
-            let records = chunk.map {
-                SharedPhoto.makeRecord(from: $0, inZone: zoneID, albumRootRef: albumRootRef)
+            // Remember each record's thumbnail temp URL so we can read the bytes
+            // back for the optimistic cache after the save (the returned server
+            // record's CKAsset isn't guaranteed locally materialized yet).
+            var thumbURLByRecordID: [CKRecord.ID: URL] = [:]
+            let records = chunk.map { payload -> CKRecord in
+                let r = SharedPhoto.makeRecord(from: payload, inZone: zoneID, albumRootRef: albumRootRef)
+                thumbURLByRecordID[r.recordID] = payload.thumbnailURL
+                return r
             }
-            let saved = try await modifyLongLived(saving: records, in: database)
-            savedCount += saved
-            let done = savedCount
+            SharedAlbumLog.logger.info("uploadPhotos: saving chunk of \(records.count) record(s)")
+            let outcome = try await modifyLongLived(saving: records, in: database)
+            for rec in outcome.savedRecords {
+                guard let photo = SharedPhoto(record: rec) else { continue }
+                savedPhotos.append(photo)
+                if let url = thumbURLByRecordID[rec.recordID],
+                   let data = try? Data(contentsOf: url) {
+                    savedThumbnails[photo.id] = data
+                }
+            }
+            for entry in outcome.perRecordErrors {
+                perRecordErrors.append(entry)
+                let code = (entry.error as? CKError)?.code.rawValue ?? -1
+                SharedAlbumLog.logger.error(
+                    "uploadPhotos: per-record save FAILED id=\(entry.id.recordName, privacy: .public) code=\(code) \(entry.error.localizedDescription, privacy: .public)")
+            }
+            let done = savedPhotos.count
             if let progress { await MainActor.run { progress(done, total) } }
         }
-        return savedCount
+
+        SharedAlbumLog.logger.info(
+            "uploadPhotos: saved \(savedPhotos.count)/\(total), \(perRecordErrors.count) per-record failure(s)")
+        return PhotoUploadResult(savedPhotos: savedPhotos,
+                                 savedThumbnails: savedThumbnails,
+                                 perRecordErrors: perRecordErrors)
     }
 
     /// Save records via a `CKModifyRecordsOperation` (bridged to async, bounded
     /// by the foreground upload task — NOT long-lived), with the same
-    /// transient-error retry policy as `save(_:to:)`. Returns the count of
-    /// records that saved successfully; per-record failures are tolerated unless
-    /// the whole op fails with a non-retryable error.
+    /// transient-error retry policy as `save(_:to:)`. Returns the saved records
+    /// plus any per-record failures; per-record failures are tolerated unless
+    /// the whole op fails (or nothing saved), in which case it throws.
     private func modifyLongLived(saving records: [CKRecord],
                                  in database: CKDatabase,
-                                 maxAttempts: Int = 4) async throws -> Int {
+                                 maxAttempts: Int = 4) async throws -> ModifyOutcome {
         var attempt = 0
         var lastError: Error?
         while attempt < maxAttempts {
@@ -376,11 +425,14 @@ final class CloudKitService {
             (lastError.map { String(describing: $0) }) ?? "unknown")
     }
 
-    /// One pass of a modify operation, bridged to async. Tolerates per-record
-    /// failures (counts successes); rethrows the operation-level error so the
-    /// retry layer can decide.
+    /// One pass of a modify operation, bridged to async. Captures per-record
+    /// results: successes are returned as records, failures are collected with
+    /// their CKError so the caller can surface a concrete cause. Tolerates
+    /// partial failure (SOME saved); if NOTHING saved it rethrows the FIRST
+    /// per-record CKError (mapped) — not the generic partial-failure wrapper —
+    /// so a device run reveals the real reason (e.g. `.permissionFailure`).
     private func runModifyOperation(saving records: [CKRecord],
-                                    in database: CKDatabase) async throws -> Int {
+                                    in database: CKDatabase) async throws -> ModifyOutcome {
         let op = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: nil)
         op.savePolicy = .allKeys
         op.isAtomic = false
@@ -392,26 +444,47 @@ final class CloudKitService {
         // normal operation is the correct lifetime for this bridge.
 
         let guardBox = OneShotResume()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, Error>) in
-            // Count successes; we ignore per-record failures here (they show up
-            // as fewer saved records) and only fail the whole op on a hard error.
-            var successes = 0
-            op.perRecordSaveBlock = { _, result in
-                if case .success = result { successes += 1 }
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<ModifyOutcome, Error>) in
+            var saved: [CKRecord] = []
+            var perRecordErrors: [(id: CKRecord.ID, error: Error)] = []
+            op.perRecordSaveBlock = { id, result in
+                switch result {
+                case .success(let rec):
+                    saved.append(rec)
+                case .failure(let err):
+                    perRecordErrors.append((id, err))
+                }
             }
             op.modifyRecordsResultBlock = { [weak self] result in
                 guard guardBox.take() else { return }
                 switch result {
                 case .success:
-                    cont.resume(returning: successes)
+                    cont.resume(returning: ModifyOutcome(savedRecords: saved,
+                                                         perRecordErrors: perRecordErrors))
                 case .failure(let error):
                     // A partial failure where SOME records saved is not fatal:
-                    // return the success count so the caller keeps the progress.
-                    if let ck = error as? CKError, ck.code == .partialFailure, successes > 0 {
-                        cont.resume(returning: successes)
+                    // return what saved (plus the failures) so the caller keeps
+                    // the progress AND can report which records failed.
+                    if let ck = error as? CKError, ck.code == .partialFailure, !saved.isEmpty {
+                        cont.resume(returning: ModifyOutcome(savedRecords: saved,
+                                                             perRecordErrors: perRecordErrors))
+                    } else if let first = perRecordErrors.first {
+                        // Nothing saved: surface the concrete per-record CKError
+                        // (e.g. permissionFailure / referenceViolation) instead
+                        // of the opaque partialFailure wrapper. These are
+                        // non-retryable hard rejects, so mapping here is correct.
+                        cont.resume(throwing: self?.map(first.error)
+                            ?? SharedAlbumError.cloudKit(String(describing: first.error)))
                     } else {
-                        cont.resume(throwing: self?.map(error)
-                            ?? SharedAlbumError.cloudKit(String(describing: error)))
+                        // Op-level failure with no per-record breakdown (e.g.
+                        // .zoneBusy / .requestRateLimited / .serviceUnavailable
+                        // when two accounts hammer one zone). Rethrow the RAW
+                        // error UNMAPPED so modifyLongLived's `catch let error as
+                        // CKError` can classify it and honor the transient-error
+                        // retry policy (retryDelay + retryAfterSeconds). Mapping
+                        // it here would yield a SharedAlbumError that that catch
+                        // can never match, making the retry loop dead code.
+                        cont.resume(throwing: error)
                     }
                 }
             }
@@ -450,7 +523,12 @@ final class CloudKitService {
         do {
             // Full enumeration: nil previous token ⇒ all records in the zone.
             // (Same desiredKeys — thumbnail + metadata, no fullImage — as sync.)
+            // NOTE: this is deliberately a FULL fetch (nil token), NOT the
+            // incremental delta the push path uses, so an owner's just-written
+            // record is guaranteed to return on the post-upload reload.
             let zc = try await fetchZoneChanges(zoneID, in: database, since: nil)
+            SharedAlbumLog.logger.info(
+                "loadPhotos(cloud): zone \(zoneID.zoneName, privacy: .public) returned \(zc.changedRecords.count) record(s) [full token]")
 
             // Decode CKAsset thumbnail bytes OFF the main actor so a large album
             // doesn't jank the UI, then return the mapped value types. Sorting is
@@ -691,6 +769,14 @@ final class CloudKitService {
                 return .unavailable(reason: "Sign in to iCloud to use Shared Albums")
             case .networkUnavailable, .networkFailure:
                 return .cloudKit("iCloud is unreachable. Check your connection.")
+            case .permissionFailure:
+                // The classic participant-with-read-only-access failure. Keep the
+                // reason NEUTRAL (this mapper also serves read/refresh/accept/sync
+                // paths); the operation context comes from the call site's alert
+                // title (e.g. "Couldn't Add Photos" / "Couldn't Refresh Album").
+                return .cloudKit("You have view-only access to this album.")
+            case .quotaExceeded:
+                return .cloudKit("Your iCloud storage is full.")
             case .changeTokenExpired:
                 // Surfaced as a distinct case so the sync layer can clear the
                 // stale token and refetch from scratch instead of wedging.
@@ -731,6 +817,31 @@ final class CloudKitService {
             return false
         }
     }
+}
+
+// MARK: - Upload result types
+
+/// The outcome of one `CKModifyRecordsOperation` pass: the server records that
+/// saved, plus every per-record failure (id + CKError). Lets the upload layer
+/// report partial success AND surface the concrete cause when nothing saved.
+struct ModifyOutcome {
+    var savedRecords: [CKRecord]
+    var perRecordErrors: [(id: CKRecord.ID, error: Error)]
+}
+
+/// The outcome of an `uploadPhotos` call. Carries the saved photos as value
+/// types (for optimistic rendering), their thumbnail bytes (read back from the
+/// payload temp files before cleanup, keyed by SharedPhoto id), and any
+/// per-record CKErrors so the store can surface a precise reason.
+struct PhotoUploadResult {
+    var savedPhotos: [SharedPhoto] = []
+    var savedThumbnails: [String: Data] = [:]
+    var perRecordErrors: [(id: CKRecord.ID, error: Error)] = []
+
+    var savedCount: Int { savedPhotos.count }
+    /// The first per-record error, if any — the store maps it to a user-facing
+    /// message via `CloudKitService.map`.
+    var firstError: Error? { perRecordErrors.first?.error }
 }
 
 // MARK: - Delta-sync result types

@@ -232,7 +232,9 @@ struct AddToFolderSheet: View {
         NavigationStack {
             List {
                 Section {
-                    ForEach(store.folders.filter { !$0.isSmart }) { folder in
+                    // Smart folders are valid add targets now: adding routes to
+                    // the folder's manual-include set (layered over its query).
+                    ForEach(store.folders) { folder in
                         Button {
                             store.addPhotos(assetIDs, toFolder: folder.id)
                             dismiss()
@@ -614,6 +616,11 @@ struct FolderPhotosView: View {
         var minusQuery: String?
         var minScore: Float?
         var memberCount: Int
+        // For a smart folder photoAssetIDs stays empty, so memberCount never
+        // moves on a manual add/remove — include the manual-set counts so an
+        // include/exclude edit forces exactly one re-evaluation.
+        var manualIncludeCount: Int
+        var manualExcludeCount: Int
         var photoCount: Int
     }
     private var loadKey: LoadKey {
@@ -623,6 +630,8 @@ struct FolderPhotosView: View {
                 minusQuery: folder?.minusQuery,
                 minScore: folder?.minScore,
                 memberCount: folder?.photoAssetIDs.count ?? 0,
+                manualIncludeCount: folder?.manualIncludeAssetIDs?.count ?? 0,
+                manualExcludeCount: folder?.manualExcludeAssetIDs?.count ?? 0,
                 photoCount: store.photos.count)
     }
 
@@ -636,10 +645,14 @@ struct FolderPhotosView: View {
                         ? smartEmptyDescription
                         : "Select photos anywhere in the app and tap the folder button to add them here."))
             } else if isSmart {
-                // Membership is the query — no manual remove.
+                // Smart folders now support manual remove: Remove routes to the
+                // folder's manual-exclude set (a force-remove over the query).
                 PhotoResultsGrid(
                     results: photos,
-                    onDelete: { id in photos.removeAll { $0.photoID == id } }
+                    onDelete: { id in photos.removeAll { $0.photoID == id } },
+                    onRemoveSelected: { assetIDs in
+                        store.removePhotos(assetIDs, fromFolder: folderID)
+                    }
                 )
             } else {
                 PhotoResultsGrid(

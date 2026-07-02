@@ -33,8 +33,24 @@ final class SharedAlbumStore: ObservableObject {
         case error(message: String)
     }
 
+    /// A concrete, user-facing failure for ONE album's most recent contribute
+    /// or reload, keyed by album id. The detail view surfaces this as a
+    /// persistent alert so a failed "Add Photos" shows the real reason (a mapped
+    /// CKError message) instead of silently reverting to an empty grid. Settable
+    /// by the view (to dismiss); set by the store on every failure branch and
+    /// cleared on a clean contribute.
+    struct AlbumAlert: Identifiable {
+        let id = UUID()
+        var title: String
+        var message: String
+    }
+
     @Published private(set) var albums: [SharedAlbum] = []
     @Published private(set) var state: State = .idle
+
+    /// Per-album surfaced error (see `AlbumAlert`). Public-settable so the
+    /// detail view's alert binding can clear it on dismiss.
+    @Published var albumAlert: [String: AlbumAlert] = [:]
 
     /// iCloud user record names we have ever shared an album with — powers a
     /// future "share with the same people again" affordance. Persisted locally.
@@ -390,15 +406,19 @@ final class SharedAlbumStore: ObservableObject {
         guard cloud.isAvailable else {
             let reason = "Sign in to iCloud to use Shared Albums"
             state = .unavailable(reason: reason)
+            setAlbumAlert(album.id, title: "Couldn't Add Photos", message: reason)
             throw SharedAlbumError.unavailable(reason: reason)
         }
+
+        let scope = album.isOwnedByMe ? "private" : "shared"
+        SharedAlbumLog.logger.info(
+            "addPhotos: album=\(album.id, privacy: .public) requested=\(localAssetIDs.count) ownedByMe=\(album.isOwnedByMe) db=\(scope, privacy: .public)")
 
         uploadProgress[album.id] = 0
         defer { uploadProgress[album.id] = nil }
 
         // Resolve which database the album lives in.
         let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
-        let albumRootRef = CKRecord.Reference(recordID: album.recordID, action: .deleteSelf)
         let contributor = await currentUserDisplayName()
 
         // 1. Materialize bytes → temp files for each asset (skip failures).
@@ -406,21 +426,50 @@ final class SharedAlbumStore: ObservableObject {
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: localAssetIDs, options: nil)
         var phAssets: [PHAsset] = []
         assets.enumerateObjects { asset, _, _ in phAssets.append(asset) }
+        SharedAlbumLog.logger.info(
+            "addPhotos: resolved \(phAssets.count)/\(localAssetIDs.count) PHAsset(s)")
 
         for asset in phAssets {
             if let payload = await makePayload(for: asset, contributor: contributor) {
                 payloads.append(payload)
             }
         }
+        SharedAlbumLog.logger.info(
+            "addPhotos: built \(payloads.count)/\(phAssets.count) payload(s)")
 
         guard !payloads.isEmpty else {
-            state = .error(message: "Couldn't read the selected photos.")
-            throw SharedAlbumError.cloudKit("Couldn't read the selected photos.")
+            // Distinguish "assets vanished" from "bytes couldn't be read"
+            // (typically iCloud-optimized originals still downloading).
+            let msg = phAssets.isEmpty
+                ? "The selected photos couldn't be found in your library."
+                : "Couldn't read the selected photos. If they're stored in iCloud they may still be downloading — try again in a moment."
+            state = .error(message: msg)
+            setAlbumAlert(album.id, title: "Couldn't Add Photos", message: msg)
+            SharedAlbumLog.logger.error("addPhotos: no payloads (phAssets=\(phAssets.count))")
+            throw SharedAlbumError.cloudKit(msg)
         }
 
-        // 2. Upload. Progress callback updates the published fraction.
+        // 2. Verify the album-root parent target exists in the TARGET database
+        //    before we reference it (a missing root would make every photo's
+        //    parent/album reference a referenceViolation). Repair it for albums
+        //    we own by re-saving the root; for a participant we can't write the
+        //    root, so we omit the parent reference (makeRecord tolerates nil).
+        let rootID = CKRecord.ID(recordName: SharedAlbum.RecordType.albumRootRecordName,
+                                 zoneID: album.zoneID)
+        var rootExists = await cloud.recordExists(rootID, in: database)
+        if !rootExists && album.isOwnedByMe {
+            if (try? await cloud.save([album.toRecord()], to: database)) != nil {
+                rootExists = true
+                SharedAlbumLog.logger.info("addPhotos: repaired missing album-root record")
+            }
+        }
+        SharedAlbumLog.logger.info("addPhotos: albumRoot exists=\(rootExists) db=\(scope, privacy: .public)")
+        let albumRootRef: CKRecord.Reference? =
+            rootExists ? CKRecord.Reference(recordID: rootID, action: .none) : nil
+
+        // 3. Upload. Progress callback updates the published fraction.
         do {
-            let saved = try await cloud.uploadPhotos(
+            let result = try await cloud.uploadPhotos(
                 payloads,
                 toZone: album.zoneID,
                 database: database,
@@ -429,23 +478,99 @@ final class SharedAlbumStore: ObservableObject {
                     guard let self, total > 0 else { return }
                     self.uploadProgress[album.id] = Double(done) / Double(total)
                 })
+            SharedAlbumLog.logger.info("addPhotos: saved \(result.savedCount)/\(payloads.count)")
 
-            // 3. Optimistic count bump + cache.
-            if saved > 0, let idx = albums.firstIndex(where: { $0.id == album.id }) {
-                albums[idx].photoCount += saved
-                persistCache()
+            // 3a. Nothing saved despite readable payloads → surface the concrete
+            //     cause (a non-partial op throws above; this is the defensive
+            //     backstop for a 0-success op that reported .success).
+            guard result.savedCount > 0 else {
+                let msg = result.firstError.map { cloud.map($0).localizedDescription }
+                    ?? "The photos couldn't be added to iCloud. Please try again."
+                state = .error(message: msg)
+                setAlbumAlert(album.id, title: "Couldn't Add Photos", message: msg)
+                SharedAlbumLog.logger.error("addPhotos: zero saved. cause=\(msg, privacy: .public)")
+                throw SharedAlbumError.cloudKit(msg)
             }
-            // Pull the fresh list so the just-uploaded photos appear.
-            await loadPhotos(forAlbum: album)
-            if saved < payloads.count {
-                state = .error(message: "Some photos couldn't be uploaded.")
+
+            // 3b. Optimistically insert the just-saved photos + cache their
+            //     thumbnails so they appear IMMEDIATELY, independent of the
+            //     re-fetch (which can lag on a custom zone or fail transiently).
+            applyOptimisticSaved(result.savedPhotos,
+                                 thumbnails: result.savedThumbnails,
+                                 toAlbum: album)
+
+            // 3c. Reconcile with a FULL server fetch, preserving the just-saved
+            //     photos if the server hasn't surfaced them yet.
+            await loadPhotos(forAlbum: album,
+                             preservingRecentlySaved: result.savedPhotos,
+                             recentThumbnails: result.savedThumbnails)
+
+            // 3d. Report a partial failure (some saved, some rejected) with the
+            //     concrete reason; otherwise clear any stale alert.
+            if result.savedCount < payloads.count {
+                let detail = result.firstError.map { cloud.map($0).localizedDescription }
+                let msg = detail.map { "Some photos couldn't be added: \($0)" }
+                    ?? "Some photos couldn't be added."
+                state = .error(message: msg)
+                setAlbumAlert(album.id, title: "Some Photos Not Added", message: msg)
+            } else {
+                albumAlert[album.id] = nil
             }
-            return saved
+            return result.savedCount
         } catch {
             let mapped = cloud.map(error)
             state = .error(message: mapped.localizedDescription)
+            setAlbumAlert(album.id, title: "Couldn't Add Photos", message: mapped.localizedDescription)
+            SharedAlbumLog.logger.error("addPhotos: upload failed — \(mapped.localizedDescription, privacy: .public)")
             throw mapped
         }
+    }
+
+    /// Insert just-saved photos into `photosByAlbum` (deduped by id, newest
+    /// first) and cache their thumbnail bytes, so a successful contribute renders
+    /// immediately without depending on the re-fetch. Also bumps the album card
+    /// count to match. Idempotent: re-inserting an existing id is a no-op.
+    private func applyOptimisticSaved(_ saved: [SharedPhoto],
+                                      thumbnails: [String: Data],
+                                      toAlbum album: SharedAlbum) {
+        guard !saved.isEmpty else { return }
+        if !thumbnails.isEmpty {
+            thumbnailCache.merge(thumbnails) { _, new in new }
+        }
+        var current = photosByAlbum[album.id] ?? []
+        let existing = Set(current.map(\.id))
+        for photo in saved where !existing.contains(photo.id) {
+            current.append(photo)
+        }
+        current.sort(by: Self.newestFirst)
+        photosByAlbum[album.id] = current
+        if let idx = albums.firstIndex(where: { $0.id == album.id }) {
+            albums[idx].photoCount = current.count
+            persistCache()
+        }
+    }
+
+    /// Newest-first ordering matching CloudKitService.loadPhotos (records with
+    /// no captureDate sort last).
+    private static func newestFirst(_ a: SharedPhoto, _ b: SharedPhoto) -> Bool {
+        switch (a.captureDate, b.captureDate) {
+        case let (l?, r?): return l > r
+        case (nil, _?):    return false
+        case (_?, nil):    return true
+        case (nil, nil):   return false
+        }
+    }
+
+    /// Set the per-album user-facing alert. Centralized so every failure branch
+    /// records a concrete, persistent reason for the detail view.
+    private func setAlbumAlert(_ albumID: String, title: String, message: String) {
+        albumAlert[albumID] = AlbumAlert(title: title, message: message)
+    }
+
+    /// Map any thrown error to the user-facing string the view shows. Exposed so
+    /// the picker callback can present a thrown error directly.
+    func errorText(for error: Error) -> String {
+        cloud.map(error).localizedDescription
     }
 
     /// Build an upload payload from a PHAsset: full-res JPEG + ~256px thumbnail
@@ -455,7 +580,13 @@ final class SharedAlbumStore: ObservableObject {
     private func makePayload(for asset: PHAsset,
                             contributor: String?) async -> SharedPhotoUploadPayload? {
         let library = PhotoLibraryModel.uploadHelper
-        guard let fullData = await library.fullImageData(for: asset) else { return nil }
+        guard let fullData = await library.fullImageData(for: asset) else {
+            // Most likely an iCloud-optimized original that couldn't be
+            // materialized (or the download stalled and the timeout fired).
+            SharedAlbumLog.logger.error(
+                "makePayload: no full-image bytes for asset \(asset.localIdentifier, privacy: .public) (iCloud download failed or timed out)")
+            return nil
+        }
         let thumbData = await library.thumbnailData(for: asset, maxPixel: 256)
             ?? fullData   // fall back to full bytes if a separate thumb fails
 
@@ -467,6 +598,8 @@ final class SharedAlbumStore: ObservableObject {
             try fullData.write(to: fullURL, options: .atomic)
             try thumbData.write(to: thumbURL, options: .atomic)
         } catch {
+            SharedAlbumLog.logger.error(
+                "makePayload: temp-file write failed for asset \(asset.localIdentifier, privacy: .public): \(error.localizedDescription, privacy: .public)")
             try? FileManager.default.removeItem(at: fullURL)
             try? FileManager.default.removeItem(at: thumbURL)
             return nil
@@ -492,7 +625,19 @@ final class SharedAlbumStore: ObservableObject {
     /// Fetch an album's photos (metadata + thumbnail bytes; NOT the full image)
     /// and publish them for the detail view. Tolerant of availability failure
     /// (keeps whatever is cached). Caches thumbnail bytes in memory.
-    func loadPhotos(forAlbum album: SharedAlbum) async {
+    ///
+    /// This is always a FULL zone fetch (nil change token) — the incremental
+    /// tokens are reserved for the push/`syncChanges` path — so an owner's
+    /// just-written record is guaranteed to return.
+    ///
+    /// `preservingRecentlySaved` guards against custom-zone read-after-write
+    /// lag: any just-uploaded photo the server hasn't surfaced yet is re-added
+    /// from this list so a successful contribute never renders as an empty grid.
+    /// On a fetch error we KEEP whatever is already published (e.g. the
+    /// optimistic entries) and surface the error instead of clearing the grid.
+    func loadPhotos(forAlbum album: SharedAlbum,
+                    preservingRecentlySaved recent: [SharedPhoto] = [],
+                    recentThumbnails: [String: Data] = [:]) async {
         await cloud.accountStatus()
         guard cloud.isAvailable else {
             state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
@@ -501,31 +646,60 @@ final class SharedAlbumStore: ObservableObject {
         loadingPhotos.insert(album.id)
         defer { loadingPhotos.remove(album.id) }
 
+        let scope = album.isOwnedByMe ? "private" : "shared"
         let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
         do {
             let loaded = try await cloud.loadPhotos(inZone: album.zoneID, database: database)
+            SharedAlbumLog.logger.info(
+                "loadPhotos: fetched \(loaded.count) photo(s) album=\(album.id, privacy: .public) db=\(scope, privacy: .public) token=full recentToPreserve=\(recent.count)")
             // Accumulate thumbnails into a local dict and merge into the
             // @Published cache ONCE, so a big album triggers a single SwiftUI
             // invalidation instead of one per photo. (Asset bytes were already
             // decoded off the main actor inside CloudKitService.loadPhotos.)
             var photos: [SharedPhoto] = []
             var newThumbs: [String: Data] = [:]
+            var serverIDs = Set<String>()
             for (photo, thumb) in loaded {
                 photos.append(photo)
+                serverIDs.insert(photo.id)
                 if let thumb { newThumbs[photo.id] = thumb }
             }
+            // Read-after-write guard: re-add just-saved photos the server hasn't
+            // surfaced yet (custom-zone propagation lag), so the optimistic
+            // entries aren't clobbered by a short/empty re-fetch.
+            for photo in recent where !serverIDs.contains(photo.id) {
+                photos.append(photo)
+                if newThumbs[photo.id] == nil, let t = recentThumbnails[photo.id] {
+                    newThumbs[photo.id] = t
+                }
+            }
+            photos.sort(by: Self.newestFirst)
             if !newThumbs.isEmpty {
                 thumbnailCache.merge(newThumbs) { _, new in new }
             }
             photosByAlbum[album.id] = photos
-            // Keep the album card's count honest with what we actually fetched.
+            // Keep the album card's count honest with what we actually have.
             if let idx = albums.firstIndex(where: { $0.id == album.id }),
                albums[idx].photoCount != photos.count {
                 albums[idx].photoCount = photos.count
                 persistCache()
             }
         } catch {
-            state = .error(message: cloud.map(error).localizedDescription)
+            let mapped = cloud.map(error)
+            SharedAlbumLog.logger.error(
+                "loadPhotos: FAILED album=\(album.id, privacy: .public) db=\(scope, privacy: .public) — \(mapped.localizedDescription, privacy: .public)")
+            // Do NOT clear photosByAlbum here: keep any optimistic/cached entries
+            // so a reload failure doesn't erase a successful contribute. Surface
+            // the error so the empty/short grid isn't silent.
+            state = .error(message: mapped.localizedDescription)
+            // Only pop a modal on the POST-ADD reconcile path (recent non-empty).
+            // The passive load paths (.task on appear, pull-to-refresh) pass no
+            // `recent`, so a transient/offline fetch failure there degrades
+            // silently to the cached grid + state = .error instead of a modal
+            // alert on every open.
+            if !recent.isEmpty {
+                setAlbumAlert(album.id, title: "Couldn't Refresh Album", message: mapped.localizedDescription)
+            }
         }
     }
 

@@ -580,6 +580,111 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertTrue(store.folders.first { $0.id == f.id }!.isSmart)
         XCTAssertTrue(store.activeMemberAssetIDs(in: store.folders.first { $0.id == f.id }!).isEmpty)
     }
+
+    // MARK: - Smart-folder manual add/remove (query ∪ include) − exclude
+
+    private func folder(_ id: String) -> LocalFolder { store.folders.first { $0.id == id }! }
+
+    func testSmartFolderAddRoutesToIncludeSetNotStaticList() {
+        indexPhoto("x", emb: unitEmb(axis: 0))
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+        XCTAssertTrue(folder(f.id).isSmart)
+        let versionBefore = store.membershipVersion
+
+        store.addPhotos(["x"], toFolder: f.id)
+
+        // Routed to the manual-include overlay, NOT the static photoAssetIDs
+        // (which smart folders never read), and membershipVersion advanced so
+        // the folder view re-evaluates.
+        XCTAssertEqual(folder(f.id).manualIncludeAssetIDs, ["x"])
+        XCTAssertTrue((folder(f.id).manualExcludeAssetIDs ?? []).isEmpty)
+        XCTAssertTrue(folder(f.id).photoAssetIDs.isEmpty)
+        XCTAssertGreaterThan(store.membershipVersion, versionBefore)
+    }
+
+    func testSmartFolderRemoveRoutesToExcludeSet() {
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+        store.removePhotos(["y"], fromFolder: f.id)
+        XCTAssertEqual(folder(f.id).manualExcludeAssetIDs, ["y"])
+        XCTAssertTrue((folder(f.id).manualIncludeAssetIDs ?? []).isEmpty)
+    }
+
+    func testSmartFolderIncludeAndExcludeStayMutuallyExclusive() {
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+
+        store.addPhotos(["x"], toFolder: f.id)          // include=[x]
+        XCTAssertEqual(folder(f.id).manualIncludeAssetIDs, ["x"])
+
+        store.removePhotos(["x"], fromFolder: f.id)     // remove cancels the add
+        XCTAssertTrue((folder(f.id).manualIncludeAssetIDs ?? []).isEmpty)
+        XCTAssertEqual(folder(f.id).manualExcludeAssetIDs, ["x"])
+
+        store.addPhotos(["x"], toFolder: f.id)          // re-add un-excludes
+        XCTAssertEqual(folder(f.id).manualIncludeAssetIDs, ["x"])
+        XCTAssertTrue((folder(f.id).manualExcludeAssetIDs ?? []).isEmpty)
+    }
+
+    func testSmartFolderManualIncludeSurfacesInMembership() {
+        indexPhoto("x", emb: unitEmb(axis: 0))
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+        store.addPhotos(["x"], toFolder: f.id)
+        // Regardless of whether the on-device engine is available (which decides
+        // the query portion), a manually-added, non-deleted photo is appended.
+        let members = store.photosForFolder(folder(f.id))
+        XCTAssertTrue(members.contains { $0.assetID == "x" })
+    }
+
+    func testSmartFolderManualExcludeWinsOverQuery() {
+        indexPhoto("x", emb: unitEmb(axis: 0))
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+        // Add then remove: exclude=[x], include empty. The photo must be absent
+        // from membership whether or not the query would otherwise match it
+        // (exclude filters query hits; with no engine it isn't matched anyway).
+        store.addPhotos(["x"], toFolder: f.id)
+        store.removePhotos(["x"], fromFolder: f.id)
+        let members = store.photosForFolder(folder(f.id))
+        XCTAssertFalse(members.contains { $0.assetID == "x" })
+    }
+
+    func testSmartFolderManualIncludeSkipsDeletedPhotos() {
+        indexPhoto("x", emb: unitEmb(axis: 0))
+        let f = store.createFolder(name: "Dogs", query: "dogs")
+        store.addPhotos(["x"], toFolder: f.id)
+        store.deletePhoto(assetID: "x")   // soft-delete → excluded from membership
+        let members = store.photosForFolder(folder(f.id))
+        XCTAssertFalse(members.contains { $0.assetID == "x" })
+    }
+
+    func testStaticFolderAddRemoveUnaffectedByManualSets() {
+        // The static path must be byte-for-byte today's behavior: appends/removes
+        // on photoAssetIDs, never touching the manual sets.
+        indexPhoto("a", emb: unitEmb(axis: 0))
+        let f = store.createFolder(name: "Trip", query: nil)   // static
+        XCTAssertFalse(folder(f.id).isSmart)
+        store.addPhotos(["a"], toFolder: f.id)
+        XCTAssertEqual(folder(f.id).photoAssetIDs, ["a"])
+        XCTAssertNil(folder(f.id).manualIncludeAssetIDs)
+        XCTAssertNil(folder(f.id).manualExcludeAssetIDs)
+        store.removePhotos(["a"], fromFolder: f.id)
+        XCTAssertTrue(folder(f.id).photoAssetIDs.isEmpty)
+    }
+
+    func testLocalFolderManualSetsCodableRoundTripAndLegacyDecode() throws {
+        // Legacy folders.json (no manual keys) decodes with both nil.
+        let legacy = #"{"id":"F1","name":"Dogs","photoAssetIDs":[],"query":"dogs"}"#
+        let old = try JSONDecoder().decode(LocalFolder.self, from: Data(legacy.utf8))
+        XCTAssertNil(old.manualIncludeAssetIDs)
+        XCTAssertNil(old.manualExcludeAssetIDs)
+
+        // Round-trip preserves populated manual sets.
+        var f = old
+        f.manualIncludeAssetIDs = ["a", "b"]
+        f.manualExcludeAssetIDs = ["c"]
+        let data = try JSONEncoder().encode(f)
+        let back = try JSONDecoder().decode(LocalFolder.self, from: data)
+        XCTAssertEqual(back.manualIncludeAssetIDs, ["a", "b"])
+        XCTAssertEqual(back.manualExcludeAssetIDs, ["c"])
+    }
 }
 
 // Test-only convenience: the cluster id a single-face photo was assigned to.
@@ -644,6 +749,30 @@ final class SharedAlbumMappingTests: XCTestCase {
         XCTAssertEqual(photo?.id, record.recordID.recordName)
         // recordID rehydrates to the same identity it came from.
         XCTAssertEqual(photo?.recordID, record.recordID)
+    }
+
+    func testSharedPhotoRecordOmitsParentWhenRootMissing() {
+        // When the album-root target can't be resolved in the zone/DB (older
+        // album, or a participant's shared-zone view), makeRecord must OMIT the
+        // parent + album references — referencing a non-existent record would
+        // fail the whole save with a referenceViolation. Assets + metadata still
+        // land, and the value-type mapping still recovers.
+        let zone = zoneID()
+        let payload = SharedPhotoUploadPayload(
+            fullImageURL: URL(fileURLWithPath: "/tmp/f.jpg"),
+            thumbnailURL: URL(fileURLWithPath: "/tmp/t.jpg"),
+            contributorID: "user-abc", captureDate: nil, latitude: nil,
+            longitude: nil, originalFilename: nil, contentHash: "abc123")
+
+        let record = SharedPhoto.makeRecord(from: payload, inZone: zone, albumRootRef: nil)
+
+        XCTAssertNil(record.parent)
+        XCTAssertNil(record[SharedAlbum.PhotoField.album] as? CKRecord.Reference)
+        XCTAssertNotNil(record[SharedAlbum.PhotoField.fullImage] as? CKAsset)
+        XCTAssertNotNil(record[SharedAlbum.PhotoField.thumbnail] as? CKAsset)
+        let photo = SharedPhoto(record: record)
+        XCTAssertEqual(photo?.contributorID, "user-abc")
+        XCTAssertEqual(photo?.contentHash, "abc123")
     }
 
     func testSharedPhotoInitRejectsWrongRecordType() {

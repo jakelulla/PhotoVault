@@ -16,6 +16,13 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
     /// Live fetch result the change observer diffs against.
     private var fetchResult: PHFetchResult<PHAsset>?
 
+    /// Upper bound (seconds) on a single iCloud photo/thumbnail download in the
+    /// shared-album upload path. Past this we cancel the PHImageManager request
+    /// so a stuck "Optimize iPhone Storage" original resolves to nil (skip that
+    /// asset) instead of hanging the whole "Adding photos…" flow. Generous
+    /// enough for a real original over cellular; short enough to not wedge.
+    private static let iCloudDownloadTimeout: TimeInterval = 30
+
     /// Shared, observer-free instance used purely for byte extraction by the
     /// shared-albums uploader (fullImageData / thumbnailData). It does NOT
     /// register a library change observer (it skips the designated init), so it
@@ -229,6 +236,15 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
     /// one-shot continuation safety used elsewhere in this file.
     func fullImageData(for asset: PHAsset) async -> Data? {
         let state = PHRequestCancellationState(manager: imageManager)
+        // Watchdog: if a (possibly iCloud) download stalls — or Photos ever
+        // delivers ONLY a degraded callback — cancel the request after a bound
+        // so PHImageManager fires its terminal (nil) callback and the
+        // continuation resolves nil instead of hanging the upload forever.
+        let watchdog = Task { [weak state] in
+            try? await Task.sleep(for: .seconds(Self.iCloudDownloadTimeout))
+            state?.cancel()
+        }
+        defer { watchdog.cancel() }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 let options = PHImageRequestOptions()
@@ -266,6 +282,12 @@ final class PhotoLibraryModel: NSObject, ObservableObject {
     /// hang past its deadline.
     func thumbnailData(for asset: PHAsset, maxPixel: CGFloat) async -> Data? {
         let state = PHRequestCancellationState(manager: imageManager)
+        // Same stall/degraded-only watchdog as fullImageData (see there).
+        let watchdog = Task { [weak state] in
+            try? await Task.sleep(for: .seconds(Self.iCloudDownloadTimeout))
+            state?.cancel()
+        }
+        defer { watchdog.cancel() }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 let options = PHImageRequestOptions()

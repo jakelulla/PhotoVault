@@ -84,8 +84,39 @@ struct SharedAlbumDetailView: View {
         .sheet(isPresented: $showPicker) {
             SharedAlbumPhotoPicker { localIDs in
                 guard !localIDs.isEmpty else { return }
-                Task { await store.addPhotos(localAssetIDs: localIDs, toAlbum: album) }
+                // Call the THROWING variant so a failure surfaces a concrete,
+                // persistent reason (the store records it in `albumAlert`, which
+                // drives the alert below) instead of a transient "Adding…" that
+                // silently reverts to an empty grid.
+                Task {
+                    do {
+                        _ = try await store.addPhotosReportingCount(
+                            localAssetIDs: localIDs, toAlbum: album)
+                    } catch {
+                        // Backstop: ensure a message even if a future path throws
+                        // before recording one (the store normally already has).
+                        if store.albumAlert[album.id] == nil {
+                            store.albumAlert[album.id] = .init(
+                                title: "Couldn't Add Photos",
+                                message: store.errorText(for: error))
+                        }
+                    }
+                }
             }
+        }
+        // Surface the concrete failure (mapped CKError) for THIS album — the
+        // contribute or reload reason — as a persistent alert. Requirement:
+        // "Adding…" must be followed by a visible reason on failure.
+        .alert(
+            store.albumAlert[album.id]?.title ?? "",
+            isPresented: Binding(
+                get: { store.albumAlert[album.id] != nil },
+                set: { if !$0 { store.albumAlert[album.id] = nil } }),
+            presenting: store.albumAlert[album.id]
+        ) { _ in
+            Button("OK", role: .cancel) { store.albumAlert[album.id] = nil }
+        } message: { info in
+            Text(info.message)
         }
         .fullScreenCover(item: $opened) { photo in
             SharedPhotoViewer(photo: photo, album: album)

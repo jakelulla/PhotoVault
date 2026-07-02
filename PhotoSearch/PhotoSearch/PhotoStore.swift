@@ -92,6 +92,14 @@ struct LocalFolder: Identifiable, Codable {
     /// default (0.55 image-anchored, 0.25 text — see photosForFolder).
     var minScore: Float?
 
+    /// Smart-folder manual overrides, layered on top of the query in
+    /// photosForFolder: force-added photos the query misses, and force-removed
+    /// photos the query matches. Both optional (default nil) for Codable
+    /// back-compat with folders.json written before they existed; unused by
+    /// static folders (those still use photoAssetIDs).
+    var manualIncludeAssetIDs: [String]?
+    var manualExcludeAssetIDs: [String]?
+
     var isSmart: Bool { !(query ?? "").isEmpty || anchorAssetID != nil }
 }
 
@@ -1239,16 +1247,46 @@ final class PhotoStore: ObservableObject {
                 .map { String($0).trimmingCharacters(in: .whitespaces) } ?? []
             guard let emb = compositeQueryEmbedding(anchorAssetID: folder.anchorAssetID,
                                                     baseText: folder.query,
-                                                    minus: minus) else { return [] }
-            return searchByEmbedding(
+                                                    minus: minus) else {
+                // No engine (simulator) → the query contributes nothing, but any
+                // MANUAL includes should still surface (and are testable here).
+                return applyManualMembership(to: [], folder: folder)
+            }
+            let base = searchByEmbedding(
                 emb,
                 floor: folder.minScore ?? (folder.anchorAssetID != nil ? 0.55 : 0.25)
             ).map(\.photo)
+            return applyManualMembership(to: base, folder: folder)
         }
         if let q = folder.query, !q.isEmpty {
-            return searchPhotos(query: q)
+            return applyManualMembership(to: searchPhotos(query: q), folder: folder)
         }
         return allPhotos(folderID: folder.id)
+    }
+
+    /// (query ∪ manualInclude) − manualExclude for a smart folder. Query hits
+    /// keep their relevance/date order; force-added photos the query missed
+    /// follow, newest first. Query paths already filter isDeleted; extras are
+    /// re-checked here (and resolved through photoIndex). No-op when both sets
+    /// are empty, so ordinary smart folders are unaffected.
+    private func applyManualMembership(to queryResults: [LocalPhoto],
+                                       folder: LocalFolder) -> [LocalPhoto] {
+        let include = folder.manualIncludeAssetIDs ?? []
+        let exclude = Set(folder.manualExcludeAssetIDs ?? [])
+        guard !include.isEmpty || !exclude.isEmpty else { return queryResults }
+        var result = exclude.isEmpty
+            ? queryResults
+            : queryResults.filter { !exclude.contains($0.assetID) }
+        if !include.isEmpty {
+            let present = Set(result.map(\.assetID))
+            let extras = include
+                .filter { !present.contains($0) && !exclude.contains($0) }
+                .compactMap { photoIndex[$0].map { photos[$0] } }
+                .filter { !$0.isDeleted }
+                .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+            result.append(contentsOf: extras)
+        }
+        return result
     }
 
     /// Non-deleted member count, for folder badges. Soft-deleted photos
@@ -1300,17 +1338,50 @@ final class PhotoStore: ObservableObject {
         schedulePersist(.folders)
     }
 
+    /// Add photos to a folder. Static folders append to `photoAssetIDs` (their
+    /// membership); SMART folders route to `manualIncludeAssetIDs` (a force-add
+    /// layered over the query) and drop the id from `manualExcludeAssetIDs` so a
+    /// re-added photo un-excludes. The smart path bumps membershipVersion so
+    /// grids/caches keyed on it re-evaluate.
     func addPhotos(_ assetIDs: [String], toFolder id: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }) else { return }
-        for assetID in assetIDs where !folders[fi].photoAssetIDs.contains(assetID) {
-            folders[fi].photoAssetIDs.append(assetID)
+        if folders[fi].isSmart {
+            var include = folders[fi].manualIncludeAssetIDs ?? []
+            var exclude = folders[fi].manualExcludeAssetIDs ?? []
+            for a in assetIDs {
+                if !include.contains(a) { include.append(a) }
+                exclude.removeAll { $0 == a }   // un-exclude a re-added photo
+            }
+            folders[fi].manualIncludeAssetIDs = include
+            folders[fi].manualExcludeAssetIDs = exclude
+            membershipVersion += 1
+        } else {
+            for assetID in assetIDs where !folders[fi].photoAssetIDs.contains(assetID) {
+                folders[fi].photoAssetIDs.append(assetID)
+            }
         }
         schedulePersist(.folders)
     }
 
+    /// Remove photos from a folder. Static folders strip from `photoAssetIDs`;
+    /// SMART folders route to `manualExcludeAssetIDs` (a force-remove layered
+    /// over the query) and drop the id from `manualIncludeAssetIDs` so a removed
+    /// photo cancels a prior manual add. The smart path bumps membershipVersion.
     func removePhotos(_ assetIDs: [String], fromFolder id: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }) else { return }
-        let s = Set(assetIDs); folders[fi].photoAssetIDs.removeAll { s.contains($0) }
+        if folders[fi].isSmart {
+            var include = folders[fi].manualIncludeAssetIDs ?? []
+            var exclude = folders[fi].manualExcludeAssetIDs ?? []
+            for a in assetIDs {
+                if !exclude.contains(a) { exclude.append(a) }
+                include.removeAll { $0 == a }   // cancel a prior manual add
+            }
+            folders[fi].manualIncludeAssetIDs = include
+            folders[fi].manualExcludeAssetIDs = exclude
+            membershipVersion += 1
+        } else {
+            let s = Set(assetIDs); folders[fi].photoAssetIDs.removeAll { s.contains($0) }
+        }
         schedulePersist(.folders)
     }
 
