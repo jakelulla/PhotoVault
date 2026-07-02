@@ -1264,6 +1264,18 @@ final class PhotoStore: ObservableObject {
         }
     }
 
+    /// The folder's non-deleted member asset IDs, in membership order. Soft-
+    /// deleted photos stay in `photoAssetIDs` (so restore works) but are excluded
+    /// here — used by "Share Album" so we never upload a photo the user has
+    /// hidden. Smart folders have no static membership, so this returns [].
+    func activeMemberAssetIDs(in folder: LocalFolder) -> [String] {
+        guard !folder.isSmart else { return [] }
+        return folder.photoAssetIDs.filter { id in
+            guard let idx = photoIndex[id] else { return false }
+            return !photos[idx].isDeleted
+        }
+    }
+
     /// Most recent non-deleted member, for folder cover thumbnails (folder
     /// membership now survives soft-deletes, so .last alone may point at a
     /// hidden photo).

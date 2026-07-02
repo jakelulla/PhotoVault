@@ -301,6 +301,7 @@ struct FoldersGrid: View {
     @State private var renaming: LocalFolder?
     @State private var renameText = ""
     @State private var deleting: LocalFolder?
+    @State private var sharingFolder: LocalFolder?
 
     private let columns = [GridItem(.flexible(), spacing: 12),
                            GridItem(.flexible(), spacing: 12)]
@@ -362,6 +363,16 @@ struct FoldersGrid: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
+                        // Share a regular (non-smart) folder that has photos as a
+                        // CloudKit shared album. Smart folders have no static
+                        // membership to upload, so the action is hidden for them.
+                        if !folder.isSmart && store.activeCount(in: folder) > 0 {
+                            Button {
+                                sharingFolder = folder
+                            } label: {
+                                Label("Share Album", systemImage: "person.2.badge.plus")
+                            }
+                        }
                         Button {
                             renameText = folder.name
                             renaming = folder
@@ -456,6 +467,13 @@ struct FoldersGrid: View {
             Text(deleting?.isSmart == true
                  ? "The smart folder is deleted. Your photos stay in your library and index."
                  : "Delete just the folder, or also delete its photos from the index?")
+        }
+        // Share a folder as a CloudKit shared album (create + upload + invite).
+        // We pass the folder's ACTIVE (non-soft-deleted) members so we never try
+        // to upload photos the user has hidden.
+        .sheet(item: $sharingFolder) { folder in
+            ShareFolderView(folderName: folder.name,
+                            assetIDs: store.activeMemberAssetIDs(in: folder))
         }
         .task {
             // Zero-shot CLIP categorization over stored embeddings — cached
@@ -569,6 +587,7 @@ struct FolderPhotosView: View {
     @State private var renameText = ""
     @State private var showEditor = false
     @State private var confirmDelete = false
+    @State private var showShare = false
     @State private var photos: [LocalPhoto] = []
 
     private var folder: LocalFolder? { store.folders.first { $0.id == folderID } }
@@ -639,6 +658,14 @@ struct FolderPhotosView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    // Share a regular folder that has photos as a shared album.
+                    if folder?.isSmart != true, !photos.isEmpty {
+                        Button {
+                            showShare = true
+                        } label: {
+                            Label("Share Album", systemImage: "person.2.badge.plus")
+                        }
+                    }
                     Button {
                         renameText = folder?.name ?? ""
                         showRename = true
@@ -674,6 +701,13 @@ struct FolderPhotosView: View {
             SmartFolderEditor(folderID: folderID,
                               initialQuery: folder?.query ?? "",
                               initialAnchor: folder?.anchorAssetID)
+        }
+        // Share this folder as a CloudKit shared album. The visible grid is the
+        // folder's active (non-deleted) membership, so its asset IDs are exactly
+        // what should be uploaded.
+        .sheet(isPresented: $showShare) {
+            ShareFolderView(folderName: folder?.name ?? "Shared Album",
+                            assetIDs: photos.map(\.assetID))
         }
         .confirmationDialog(
             "Delete \"\(folder?.name ?? "")\"?",

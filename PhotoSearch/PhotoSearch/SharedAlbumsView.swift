@@ -285,14 +285,6 @@ struct SharedAlbumsView: View {
     }
 }
 
-/// A resolved invite: an album plus the LIVE server CKShare to present. Held in
-/// SwiftUI state so the sheet always receives a real, saved share.
-private struct InviteTarget: Identifiable {
-    let album: SharedAlbum
-    let share: CKShare
-    var id: String { album.id }
-}
-
 /// One album row: name, owner badge, photo count.
 private struct SharedAlbumRow: View {
     let album: SharedAlbum

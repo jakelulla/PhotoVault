@@ -18,6 +18,7 @@ struct FriendsView: View {
     @State private var addError: String?
     @State private var showAvatarPicker = false
     @State private var showFacePhotoPicker = false
+    @State private var showCompose = false
 
     var body: some View {
         Group {
@@ -31,10 +32,23 @@ struct FriendsView: View {
         .toolbar {
             if !store.needsOnboarding {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showAddFriend = true
+                    Menu {
+                        Button {
+                            showAddFriend = true
+                        } label: {
+                            Label("Add Friend", systemImage: "person.badge.plus")
+                        }
+                        // Compose a photo request (pick a friend → description →
+                        // date/range → face filter → send). Reachable here AND from
+                        // the Shared Albums "+" menu.
+                        Button {
+                            showCompose = true
+                        } label: {
+                            Label("Request Photos", systemImage: "square.and.arrow.down.on.square")
+                        }
+                        .disabled(store.friends.isEmpty)
                     } label: {
-                        Image(systemName: "person.badge.plus")
+                        Image(systemName: "plus")
                     }
                 }
             }
@@ -46,6 +60,9 @@ struct FriendsView: View {
         }
         .sheet(isPresented: $showAddFriend) {
             AddFriendView()
+        }
+        .sheet(isPresented: $showCompose) {
+            ComposeRequestView()
         }
         .sheet(isPresented: $showAvatarPicker) {
             FacePhotoPickerView(mode: .publicAvatar)

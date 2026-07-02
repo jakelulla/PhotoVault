@@ -553,6 +553,33 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertEqual(saved.photoAssetIDs, ["b", "a"])   // order preserved
         XCTAssertFalse(saved.isSmart)                      // static folder
     }
+
+    // MARK: - Share-a-folder membership (feeds "Share Album")
+
+    func testActiveMemberAssetIDsExcludesDeletedAndPreservesOrder() {
+        indexPhoto("a", emb: unitEmb(axis: 0))
+        indexPhoto("b", emb: unitEmb(axis: 1))
+        indexPhoto("c", emb: unitEmb(axis: 2))
+        let folder = store.buildFolder(named: "Trip", assetIDs: ["c", "a", "b"])
+
+        // All present → returned in membership order (what gets uploaded).
+        XCTAssertEqual(store.activeMemberAssetIDs(in: store.folders.first { $0.id == folder.id }!),
+                       ["c", "a", "b"])
+
+        // Soft-deleting a member keeps it in photoAssetIDs (restore-safe) but it
+        // must NOT be offered for upload — a hidden photo shouldn't be shared.
+        store.deletePhoto(assetID: "a")
+        XCTAssertTrue(store.folders.first { $0.id == folder.id }!.photoAssetIDs.contains("a"))
+        XCTAssertEqual(store.activeMemberAssetIDs(in: store.folders.first { $0.id == folder.id }!),
+                       ["c", "b"])
+    }
+
+    func testActiveMemberAssetIDsEmptyForSmartFolder() {
+        // Smart folders have no static membership to upload.
+        let f = store.createFolder(name: "Smart", query: "beach")
+        XCTAssertTrue(store.folders.first { $0.id == f.id }!.isSmart)
+        XCTAssertTrue(store.activeMemberAssetIDs(in: store.folders.first { $0.id == f.id }!).isEmpty)
+    }
 }
 
 // Test-only convenience: the cluster id a single-face photo was assigned to.
@@ -650,6 +677,21 @@ final class SharedAlbumMappingTests: XCTestCase {
         XCTAssertEqual([Int]().chunked(into: 3), [])
         // A zero/negative size must not loop forever: clamp to 1.
         XCTAssertEqual([1, 2].chunked(into: 0), [[1], [2]])
+    }
+
+    /// `resolvableAssetIDs` filters a folder's stored PHAsset identifiers down to
+    /// the ones still present in the library before "Share Album" uploads them.
+    /// Empty input is a deterministic []; arbitrary (non-real) identifiers resolve
+    /// to nothing in the test host's photo library, so they're all filtered out —
+    /// proving the "skip missing" behavior without needing real assets.
+    func testResolvableAssetIDsFiltersEmptyAndMissing() {
+        XCTAssertEqual(SharedAlbumStore.resolvableAssetIDs(from: []), [])
+        // These identifiers don't correspond to any real library asset, so none
+        // resolve → all skipped (the caller then treats [] as "nothing to share").
+        XCTAssertEqual(
+            SharedAlbumStore.resolvableAssetIDs(from: ["not-a-real-id/L0/001",
+                                                       "also-fake/L0/001"]),
+            [])
     }
 }
 

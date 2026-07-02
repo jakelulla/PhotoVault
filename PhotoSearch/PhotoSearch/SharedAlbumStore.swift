@@ -203,6 +203,62 @@ final class SharedAlbumStore: ObservableObject {
         }
     }
 
+    // MARK: - Share an existing folder
+
+    /// Turn one of the user's normal (non-smart) folders into a shared album:
+    /// create a shared album named after the folder, then upload the folder's
+    /// member photos into it. Returns the created album so the caller can present
+    /// the invite UI (in-app friend invite / share link) — the SAME affordances a
+    /// freshly created shared album gets. Reuses `createAlbum` +
+    /// `addPhotosReportingCount` verbatim; adds no new upload/invite logic.
+    ///
+    /// `localAssetIDs` are the folder's `photoAssetIDs` (device-local PHAsset
+    /// identifiers). We filter them down to the ones that still resolve to real
+    /// PHAssets (so a folder member that has since been removed from the library
+    /// is silently skipped rather than failing the whole upload).
+    ///
+    /// Gated identically to the rest of the stack: fails fast with `.unavailable`
+    /// on the simulator / signed out (via `createAlbum`), so it stays inert in the
+    /// regression gate. Throws `SharedAlbumError` on any failure. On an
+    /// empty/all-missing input it throws `.cloudKit` with a friendly message
+    /// rather than creating an empty album with nothing in it — but note the album
+    /// HAS already been created at that point (its records live in the owner's
+    /// private DB); the caller surfaces the message and the empty album can be
+    /// managed like any other from the Shared Albums screen.
+    @discardableResult
+    func shareFolder(named rawName: String, localAssetIDs: [String]) async throws -> SharedAlbum {
+        // Filter to asset IDs that still resolve to real library assets, skipping
+        // any that have since been deleted from the photo library.
+        let resolvable = Self.resolvableAssetIDs(from: localAssetIDs)
+        guard !resolvable.isEmpty else {
+            throw SharedAlbumError.cloudKit(
+                "This folder has no photos still in your library to share.")
+        }
+        // 1. Create the album (this is also the availability gate — throws
+        //    `.unavailable` on the simulator / signed out before any upload work).
+        let album = try await createAlbum(named: rawName)
+        // 2. Upload the folder's members. Reuses the count-reporting variant so a
+        //    hard failure throws; partial failures are tolerated inside it.
+        _ = try await addPhotosReportingCount(localAssetIDs: resolvable, toAlbum: album)
+        return album
+    }
+
+    /// Filter a list of PHAsset local identifiers down to the ones that still
+    /// resolve to a real asset in the photo library, preserving order and dropping
+    /// duplicates. Pure Photos lookup (no CloudKit); returns everything unchanged
+    /// when nothing resolves is impossible to distinguish from an empty library,
+    /// so callers treat an empty result as "nothing to share". `nonisolated static`
+    /// so it can run off the main actor and be unit-tested with a trivial input.
+    nonisolated static func resolvableAssetIDs(from ids: [String]) -> [String] {
+        guard !ids.isEmpty else { return [] }
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var present = Set<String>()
+        fetch.enumerateObjects { asset, _, _ in present.insert(asset.localIdentifier) }
+        // Preserve the folder's order; keep only resolvable, de-duplicated IDs.
+        var seen = Set<String>()
+        return ids.filter { present.contains($0) && seen.insert($0).inserted }
+    }
+
     // MARK: - Load
 
     /// Fetch zones from both databases and map them to `SharedAlbum`s. Tolerant
