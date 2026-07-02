@@ -258,22 +258,25 @@ extension SharedPhoto {
     }
 
     /// Materialize a "SharedPhoto" CKRecord from an upload payload, into the
-    /// album's zone, with a parent reference to the album-root record.
+    /// album's zone. Cascade-links it to the album-root record via a field
+    /// reference (NOT a parent reference — see below).
     ///
     /// - The record ID is minted in `zoneID` so the photo lands in the album's
     ///   custom zone (the unit of sharing), never the default zone.
-    /// - When `albumRootRef` is non-nil, `parent` is set to it AND the reference
-    ///   is mirrored into the `album` field with action `.deleteSelf`, so
-    ///   deleting the album cascades to its photos. (CloudKit uses `parent` for
-    ///   the share hierarchy and a user-defined reference field for the cascade.)
-    /// - When `albumRootRef` is nil (the album-root record isn't resolvable in
-    ///   the target zone/DB — e.g. an older album whose root save failed, or a
-    ///   participant whose shared-zone view lacks it), BOTH references are
-    ///   omitted: referencing a non-existent record would fail the whole save
-    ///   with `CKError.referenceViolation`. The photo still lands in the shared
-    ///   zone, so zone-wide sharing surfaces it regardless — it just won't
-    ///   cascade-delete with the album. Callers verify existence before upload
-    ///   (SharedAlbumStore.addPhotosReportingCount).
+    /// - We do NOT set `record.parent`. These albums use ZONE-WIDE sharing
+    ///   (`CKShare(recordZoneID:)`), where every record in the zone is shared by
+    ///   virtue of living in the zone. `parent` is record *chaining*, which
+    ///   CloudKit permits ONLY under hierarchical sharing (`CKShare(rootRecord:)`)
+    ///   — setting a parent in a zone-wide-shared zone fails the save with
+    ///   "Chaining supported for hierarchical sharing only". So sharing is
+    ///   carried entirely by the zone; no parent hierarchy is needed or allowed.
+    /// - When `albumRootRef` is non-nil we still set the user-defined `album`
+    ///   field to a `.deleteSelf` reference (a normal cascade reference, not
+    ///   chaining) so deleting the album-root deletes its photos. When it's nil
+    ///   (the album-root isn't resolvable in the target zone/DB) the reference is
+    ///   omitted — referencing a non-existent record would fail the save with
+    ///   `CKError.referenceViolation`; the photo still lands in the zone and is
+    ///   shared, it just won't cascade-delete with the album.
     /// - Both image fields are CKAssets pointing at the payload's temp files.
     static func makeRecord(from payload: SharedPhotoUploadPayload,
                            inZone zoneID: CKRecordZone.ID,
@@ -281,14 +284,11 @@ extension SharedPhoto {
         let recordID = CKRecord.ID(recordName: "photo-\(UUID().uuidString)", zoneID: zoneID)
         let rec = CKRecord(recordType: SharedAlbum.RecordType.photo, recordID: recordID)
 
-        // Parent reference drives the share hierarchy — it MUST use action
-        // `.none` (CloudKit throws NSInvalidArgumentException synchronously, i.e.
-        // an instant crash, if a `parent` reference carries any other action).
-        // The cascade-on-album-delete is expressed via the separate `album`
-        // field reference, which may carry `.deleteSelf`. Both are set only when
-        // the album-root target is known to exist (see doc comment above).
+        // Cascade-delete link only. NO `rec.parent` — parent chaining is illegal
+        // in a zone-wide-shared zone (CloudKit: "Chaining supported for
+        // hierarchical sharing only"). The `album` field is an ordinary
+        // `.deleteSelf` reference, which is allowed and gives the cascade.
         if let albumRootRef {
-            rec.parent = CKRecord.Reference(recordID: albumRootRef.recordID, action: .none)
             rec[SharedAlbum.PhotoField.album] =
                 CKRecord.Reference(recordID: albumRootRef.recordID, action: .deleteSelf)
         }

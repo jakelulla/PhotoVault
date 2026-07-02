@@ -725,15 +725,19 @@ final class SharedAlbumMappingTests: XCTestCase {
         let record = SharedPhoto.makeRecord(from: payload, inZone: zone, albumRootRef: rootRef)
 
         // The record lands in the album's zone, with both assets + the cascade
-        // reference set.
+        // reference set. Crucially `parent` is NOT set: these albums use
+        // zone-wide sharing, where parent chaining is illegal (CloudKit:
+        // "Chaining supported for hierarchical sharing only"). Sharing is carried
+        // by the zone; the cascade uses the ordinary `album` field reference.
         XCTAssertEqual(record.recordType, SharedAlbum.RecordType.photo)
         XCTAssertEqual(record.recordID.zoneID, zone)
         XCTAssertNotNil(record[SharedAlbum.PhotoField.fullImage] as? CKAsset)
         XCTAssertNotNil(record[SharedAlbum.PhotoField.thumbnail] as? CKAsset)
-        XCTAssertEqual(record.parent?.recordID.recordName,
-                       SharedAlbum.RecordType.albumRootRecordName)
+        XCTAssertNil(record.parent)
         let albumRef = record[SharedAlbum.PhotoField.album] as? CKRecord.Reference
         XCTAssertEqual(albumRef?.action, .deleteSelf)
+        XCTAssertEqual(albumRef?.recordID.recordName,
+                       SharedAlbum.RecordType.albumRootRecordName)
 
         // Mapping the record back recovers the metadata (assets are not read by
         // the value-type init, by design).
