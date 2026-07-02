@@ -296,6 +296,7 @@ final class SharedAlbumStore: ObservableObject {
         // Albums we own (private DB).
         do {
             let zones = try await cloud.fetchPrivateAlbumZones()
+            SharedAlbumLog.logger.info("loadAlbums: \(zones.count) private zone(s)")
             for zone in zones {
                 if let album = await albumFromZone(zone, in: cloud.privateDB, ownedByMe: true) {
                     collected.append(album)
@@ -303,11 +304,14 @@ final class SharedAlbumStore: ObservableObject {
             }
         } catch {
             sawAnyError = true
+            SharedAlbumLog.logger.error("loadAlbums: private-zone fetch FAILED — \(self.cloud.map(error).localizedDescription, privacy: .public)")
         }
 
-        // Albums shared with us (shared DB).
+        // Albums shared with us (shared DB) — this is the path a just-accepted
+        // invite lands on.
         do {
             let zones = try await cloud.fetchSharedAlbumZones()
+            SharedAlbumLog.logger.info("loadAlbums: \(zones.count) shared zone(s)")
             for zone in zones {
                 if let album = await albumFromZone(zone, in: cloud.sharedDB, ownedByMe: false) {
                     collected.append(album)
@@ -315,7 +319,9 @@ final class SharedAlbumStore: ObservableObject {
             }
         } catch {
             sawAnyError = true
+            SharedAlbumLog.logger.error("loadAlbums: shared-zone fetch FAILED — \(self.cloud.map(error).localizedDescription, privacy: .public)")
         }
+        SharedAlbumLog.logger.info("loadAlbums: \(collected.count) album(s) total")
 
         // If we got nothing AND every fetch errored, keep the cache and report
         // an error; otherwise adopt the fresh (possibly partial) server view.
@@ -339,20 +345,43 @@ final class SharedAlbumStore: ObservableObject {
                                ownedByMe: Bool) async -> SharedAlbum? {
         let rootID = CKRecord.ID(recordName: SharedAlbum.RecordType.albumRootRecordName,
                                  zoneID: zone.zoneID)
-        guard let record = try? await cloud.fetchRecord(rootID, from: database) else {
-            return nil
-        }
-        // Best-effort: fetch the zone-wide share so we can show the owner badge
-        // and hand a CKShare to the invite sheet later. Tolerate its absence.
+        // Best-effort: the zone-wide share carries the album title + owner and is
+        // needed for the invite sheet later. Tolerate its absence.
         var share: CKShare?
         let shareID = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zone.zoneID)
         if let fetched = try? await cloud.fetchRecord(shareID, from: database) as? CKShare {
             share = fetched
         }
-        // Photo count is deferred to the upload phase; report the cached value
-        // when we already know this album, else 0.
-        let count = albums.first { $0.id == zone.zoneID.zoneName }?.photoCount ?? 0
-        return SharedAlbum(record: record, share: share, ownedByMe: ownedByMe, photoCount: count)
+        let cached = albums.first { $0.id == zone.zoneID.zoneName }
+        let count = cached?.photoCount ?? 0
+
+        // Preferred: full metadata from the album-root record.
+        if let record = try? await cloud.fetchRecord(rootID, from: database),
+           let album = SharedAlbum(record: record, share: share, ownedByMe: ownedByMe, photoCount: count) {
+            return album
+        }
+
+        // Fallback: the album-root record couldn't be fetched/mapped — common for
+        // a JUST-ACCEPTED participant before the shared zone's records propagate,
+        // or a transient read failure. The zone genuinely EXISTS in this DB, so
+        // do NOT drop the album (the old bug: an accepted share silently never
+        // appeared). Synthesize it from the zone + the share's title; it fills in
+        // with the real record on the next refresh once the root is reachable.
+        SharedAlbumLog.logger.info(
+            "loadAlbums: album-root not fetchable for zone \(zone.zoneID.zoneName, privacy: .public) db=\(ownedByMe ? "private" : "shared", privacy: .public) — showing fallback")
+        let title = share?[CKShare.SystemFieldKey.title] as? String
+        let ownerName = share?.owner.userIdentity.nameComponents
+            .map { PersonNameComponentsFormatter().string(from: $0) }
+        return SharedAlbum(
+            id: zone.zoneID.zoneName,
+            name: cached?.name ?? (title?.isEmpty == false ? title! : "Shared Album"),
+            ownerName: ownedByMe ? nil : (cached?.ownerName ?? ownerName),
+            isOwnedByMe: ownedByMe,
+            recordName: SharedAlbum.RecordType.albumRootRecordName,
+            zoneName: zone.zoneID.zoneName,
+            zoneOwnerName: zone.zoneID.ownerName,
+            shareRecordName: share?.recordID.recordName,
+            photoCount: count)
     }
 
     // MARK: - Accept share
@@ -367,9 +396,17 @@ final class SharedAlbumStore: ObservableObject {
         }
         do {
             try await cloud.acceptShare(metadata)
+            SharedAlbumLog.logger.info("acceptShare: accepted, reloading albums")
+            await loadAlbums()
+            // The accepted zone can take a moment to surface in the shared DB;
+            // reload once more after a short delay so the new album appears
+            // without the user needing to pull-to-refresh.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
             await loadAlbums()
         } catch {
-            state = .error(message: cloud.map(error).localizedDescription)
+            let msg = cloud.map(error).localizedDescription
+            SharedAlbumLog.logger.error("acceptShare: FAILED — \(msg, privacy: .public)")
+            state = .error(message: msg)
         }
     }
 
