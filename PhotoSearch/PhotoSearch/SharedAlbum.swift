@@ -258,9 +258,12 @@ extension SharedPhoto {
         let recordID = CKRecord.ID(recordName: "photo-\(UUID().uuidString)", zoneID: zoneID)
         let rec = CKRecord(recordType: SharedAlbum.RecordType.photo, recordID: recordID)
 
-        // Parent reference drives the share hierarchy; the explicit album
-        // reference with `.deleteSelf` makes album deletion cascade to photos.
-        rec.parent = albumRootRef
+        // Parent reference drives the share hierarchy — it MUST use action
+        // `.none` (CloudKit throws NSInvalidArgumentException synchronously, i.e.
+        // an instant crash, if a `parent` reference carries any other action).
+        // The cascade-on-album-delete is expressed via the separate `album`
+        // field reference, which may carry `.deleteSelf`.
+        rec.parent = CKRecord.Reference(recordID: albumRootRef.recordID, action: .none)
         rec[SharedAlbum.PhotoField.album] =
             CKRecord.Reference(recordID: albumRootRef.recordID, action: .deleteSelf)
 
