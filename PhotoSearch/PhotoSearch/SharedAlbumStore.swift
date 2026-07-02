@@ -282,9 +282,17 @@ final class SharedAlbumStore: ObservableObject {
     /// albums. On total availability failure, falls back to the local cache and
     /// sets `.unavailable`.
     func loadAlbums() async {
-        await cloud.accountStatus()
+        let status = await cloud.accountStatus()
+        // .notice so it's visible in Console (not just the Xcode debugger).
+        // CKAccountStatus rawValue: 0 couldNotDetermine, 1 available,
+        // 2 restricted, 3 noAccount, 4 temporarilyUnavailable.
+        SharedAlbumLog.logger.notice(
+            "loadAlbums: accountStatus=\(status.rawValue) available=\(self.cloud.isAvailable)")
         guard cloud.isAvailable else {
-            // Keep whatever the local cache gave us; just mark unavailable.
+            // iCloud not usable → we can't load; surface it loudly so this
+            // isn't mistaken for "no albums".
+            SharedAlbumLog.logger.error(
+                "loadAlbums: iCloud UNAVAILABLE (status \(status.rawValue)) — not loading shared albums")
             state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
             return
         }
@@ -296,7 +304,7 @@ final class SharedAlbumStore: ObservableObject {
         // Albums we own (private DB).
         do {
             let zones = try await cloud.fetchPrivateAlbumZones()
-            SharedAlbumLog.logger.info("loadAlbums: \(zones.count) private zone(s)")
+            SharedAlbumLog.logger.notice("loadAlbums: \(zones.count) private zone(s)")
             for zone in zones {
                 if let album = await albumFromZone(zone, in: cloud.privateDB, ownedByMe: true) {
                     collected.append(album)
@@ -311,7 +319,7 @@ final class SharedAlbumStore: ObservableObject {
         // invite lands on.
         do {
             let zones = try await cloud.fetchSharedAlbumZones()
-            SharedAlbumLog.logger.info("loadAlbums: \(zones.count) shared zone(s)")
+            SharedAlbumLog.logger.notice("loadAlbums: \(zones.count) shared zone(s)")
             for zone in zones {
                 if let album = await albumFromZone(zone, in: cloud.sharedDB, ownedByMe: false) {
                     collected.append(album)
@@ -321,7 +329,7 @@ final class SharedAlbumStore: ObservableObject {
             sawAnyError = true
             SharedAlbumLog.logger.error("loadAlbums: shared-zone fetch FAILED — \(self.cloud.map(error).localizedDescription, privacy: .public)")
         }
-        SharedAlbumLog.logger.info("loadAlbums: \(collected.count) album(s) total")
+        SharedAlbumLog.logger.notice("loadAlbums: \(collected.count) album(s) total")
 
         // If we got nothing AND every fetch errored, keep the cache and report
         // an error; otherwise adopt the fresh (possibly partial) server view.
@@ -396,7 +404,7 @@ final class SharedAlbumStore: ObservableObject {
         }
         do {
             try await cloud.acceptShare(metadata)
-            SharedAlbumLog.logger.info("acceptShare: accepted, reloading albums")
+            SharedAlbumLog.logger.notice("acceptShare: accepted, reloading albums")
             await loadAlbums()
             // The accepted zone can take a moment to surface in the shared DB;
             // reload once more after a short delay so the new album appears
