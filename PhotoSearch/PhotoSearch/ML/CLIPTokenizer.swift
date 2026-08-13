@@ -46,7 +46,7 @@ final class CLIPTokenizer {
         // GPT-2 bytes→unicode mapping (identical in CLIP): printable bytes map
         // to themselves; the rest map to 256+n in registration order.
         var be: [UInt8: Character] = [:]
-        var printable: [Int] = Array(33...126) + Array(161...172) + Array(174...255)
+        let printable: [Int] = Array(33...126) + Array(161...172) + Array(174...255)
         var extra = 0
         for b in 0...255 {
             if printable.contains(b) {

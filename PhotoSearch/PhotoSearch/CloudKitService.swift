@@ -27,6 +27,13 @@ final class CloudKitService {
     /// touch the network — so this is safe to evaluate on the simulator.
     static let containerIdentifier = "iCloud.com.jakelulla.PhotoSearch"
 
+    /// Prefix that distinguishes ALBUM zones from every other custom zone we
+    /// create (notably the ephemeral "facereq-" zones that carry a photo-request
+    /// face payload). Load-bearing: the album loaders filter on this so a face
+    /// zone never surfaces as a ghost "Shared Album" in the UI, on either the
+    /// requester's device (private DB) or the friend's (shared DB).
+    static let albumZonePrefix = "album-"
+
     let container: CKContainer
     var privateDB: CKDatabase { container.privateCloudDatabase }
     var sharedDB: CKDatabase { container.sharedCloudDatabase }
@@ -110,25 +117,53 @@ final class CloudKitService {
         }
     }
 
-    /// Fetch the user's custom record zones in the PRIVATE database (the albums
-    /// we own). Tolerant: returns [] on availability failure rather than
-    /// throwing, so the loader can still show shared-in albums.
+    /// Fetch the user's ALBUM zones in the PRIVATE database (the albums we own).
+    /// Filters to the "album-" prefix so the default zone AND the ephemeral
+    /// "facereq-" face-payload zones never surface as albums.
     func fetchPrivateAlbumZones() async throws -> [CKRecordZone] {
         try await requireAvailable()
         do {
             let zonesByID = try await privateDB.allRecordZones()
-            // Exclude the default zone — albums always live in a custom zone.
-            return zonesByID.filter { $0.zoneID != CKRecordZone.default().zoneID }
+            return zonesByID.filter { $0.zoneID.zoneName.hasPrefix(Self.albumZonePrefix) }
         } catch {
             throw map(error)
         }
     }
 
-    /// Fetch the zones in the SHARED database (albums others shared with us).
+    /// Fetch the ALBUM zones in the SHARED database (albums others shared with
+    /// us). Same "album-" prefix filter as the private side: an accepted
+    /// photo-request face share also lands a zone here, and it must never render
+    /// as a ghost album.
     func fetchSharedAlbumZones() async throws -> [CKRecordZone] {
         try await requireAvailable()
         do {
+            let zones = try await sharedDB.allRecordZones()
+            return zones.filter { $0.zoneID.zoneName.hasPrefix(Self.albumZonePrefix) }
+        } catch {
+            throw map(error)
+        }
+    }
+
+    /// Fetch EVERY zone in the SHARED database, unfiltered. The photo-request
+    /// face path needs this (its ephemeral zones are "facereq-", which the album
+    /// loaders deliberately exclude).
+    func fetchAllSharedZones() async throws -> [CKRecordZone] {
+        try await requireAvailable()
+        do {
             return try await sharedDB.allRecordZones()
+        } catch {
+            throw map(error)
+        }
+    }
+
+    /// Delete a record zone (and with it every record + the zone-wide share).
+    /// Owners call this on the private DB to delete an album for everyone;
+    /// participants call it on the shared DB to LEAVE an album (removing only
+    /// their own participation — the owner's copy is untouched).
+    func deleteZone(_ zoneID: CKRecordZone.ID, in database: CKDatabase) async throws {
+        try await requireAvailable()
+        do {
+            _ = try await database.deleteRecordZone(withID: zoneID)
         } catch {
             throw map(error)
         }
@@ -291,14 +326,31 @@ final class CloudKitService {
     /// because `CKAcceptSharesOperation` is completion-handler based and fires
     /// on an arbitrary queue. Guards on availability so it is inert without an
     /// account.
+    ///
+    /// We wire BOTH result blocks: the op-level result can be `.success` (or an
+    /// opaque `.partialFailure`) even when the individual share failed — the
+    /// REAL cause (e.g. `.participantMayNeedVerification` when the device is
+    /// signed into a different Apple ID than the invited identity) arrives in
+    /// the per-share block. Surfacing it is the difference between "nothing
+    /// happened" and an actionable message.
     func acceptShare(_ metadata: CKShare.Metadata) async throws {
         try await requireAvailable()
         let op = CKAcceptSharesOperation(shareMetadatas: [metadata])
         let guardBox = OneShotResume()
+        let perShareBox = ErrorBox()
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            op.perShareResultBlock = { _, result in
+                if case .failure(let error) = result { perShareBox.store(error) }
+            }
             op.acceptSharesResultBlock = { [weak self] result in
                 guard guardBox.take() else { return }
+                // Prefer the concrete per-share error over the op-level wrapper.
+                if let perShare = perShareBox.value {
+                    cont.resume(throwing: self?.map(perShare)
+                        ?? SharedAlbumError.cloudKit(String(describing: perShare)))
+                    return
+                }
                 switch result {
                 case .success:
                     cont.resume()
@@ -516,8 +568,15 @@ final class CloudKitService {
     /// such indexes. We sort client-side by `captureDate` descending (nil dates
     /// last), reusing `fetchZoneChanges` and the asset-decode helper. Malformed
     /// records are skipped. Guards on availability.
+    /// The result of a full zone load: photo metadata + thumbnails, plus every
+    /// NON-photo record in the zone (reactions/comments) for the store to parse.
+    struct ZoneLoad {
+        var photos: [(photo: SharedPhoto, thumbnail: Data?)] = []
+        var socialRecords: [CKRecord] = []
+    }
+
     func loadPhotos(inZone zoneID: CKRecordZone.ID,
-                    database: CKDatabase) async throws -> [(photo: SharedPhoto, thumbnail: Data?)] {
+                    database: CKDatabase) async throws -> ZoneLoad {
         try await requireAvailable()
 
         do {
@@ -544,7 +603,12 @@ final class CloudKitService {
                     }
                 }.value
 
-            return mapped.sorted { lhs, rhs in
+            let social = records.filter {
+                $0.recordType == SharedSocial.RecordType.reaction
+                    || $0.recordType == SharedSocial.RecordType.comment
+            }
+
+            let sorted = mapped.sorted { lhs, rhs in
                 switch (lhs.photo.captureDate, rhs.photo.captureDate) {
                 case let (l?, r?): return l > r          // newest first
                 case (nil, _?):    return false           // nils sort last
@@ -552,6 +616,17 @@ final class CloudKitService {
                 case (nil, nil):   return false
                 }
             }
+            return ZoneLoad(photos: sorted, socialRecords: social)
+        } catch {
+            throw map(error)
+        }
+    }
+
+    /// Delete a single record (used to remove one's own reaction). Maps errors.
+    func deleteRecord(_ id: CKRecord.ID, from database: CKDatabase) async throws {
+        try await requireAvailable()
+        do {
+            _ = try await database.deleteRecord(withID: id)
         } catch {
             throw map(error)
         }
@@ -590,7 +665,11 @@ final class CloudKitService {
         guard let asset = record?[SharedAlbum.PhotoField.fullImage] as? CKAsset else {
             return nil
         }
-        return Self.assetData(asset)
+        // Read the (potentially multi-MB) asset bytes OFF the main actor — a
+        // synchronous Data(contentsOf:) here would jank the viewer on every tap.
+        return await Task.detached(priority: .userInitiated) {
+            Self.assetData(asset)
+        }.value
     }
 
     /// Read a CKAsset's bytes off its on-disk file URL. Returns nil if the asset
@@ -599,6 +678,51 @@ final class CloudKitService {
     nonisolated static func assetData(_ asset: CKAsset) -> Data? {
         guard let url = asset.fileURL else { return nil }
         return try? Data(contentsOf: url)
+    }
+
+    /// Fetch a photo's FULL asset as a temp FILE URL (not Data) — the right
+    /// shape for videos, which can be hundreds of MB and are handed straight to
+    /// AVPlayer / PHAssetCreationRequest. The CKAsset's staging file is copied
+    /// to our own temp path (CloudKit may reclaim its staging area); the CALLER
+    /// owns the returned file. Returns nil when the record/asset is gone.
+    func fullAssetFileURL(for photo: SharedPhoto, database: CKDatabase) async throws -> URL? {
+        try await requireAvailable()
+        let op = CKFetchRecordsOperation(recordIDs: [photo.recordID])
+        op.desiredKeys = [SharedAlbum.PhotoField.fullImage]
+        op.qualityOfService = .userInitiated
+
+        let guardBox = OneShotResume()
+        let record: CKRecord? = try await withCheckedThrowingContinuation { cont in
+            var fetched: CKRecord?
+            op.perRecordResultBlock = { _, result in
+                if case .success(let rec) = result { fetched = rec }
+            }
+            op.fetchRecordsResultBlock = { [weak self] result in
+                guard guardBox.take() else { return }
+                switch result {
+                case .success:
+                    cont.resume(returning: fetched)
+                case .failure(let error):
+                    cont.resume(throwing: self?.map(error)
+                        ?? SharedAlbumError.cloudKit(String(describing: error)))
+                }
+            }
+            database.add(op)
+        }
+        guard let asset = record?[SharedAlbum.PhotoField.fullImage] as? CKAsset,
+              let source = asset.fileURL else { return nil }
+        let ext = photo.isVideo ? "mov" : "jpg"
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shared-\(UUID().uuidString).\(ext)")
+        // Copy OFF the main actor — the file can be large.
+        return await Task.detached(priority: .userInitiated) {
+            do {
+                try FileManager.default.copyItem(at: source, to: dest)
+                return dest
+            } catch {
+                return nil
+            }
+        }.value
     }
 
     // MARK: - Subscriptions + delta sync (Phase 4)
@@ -618,9 +742,17 @@ final class CloudKitService {
             _ = try await database.save(subscription)
         } catch let error as CKError {
             // A duplicate subscription (same subscriptionID) is rejected with
-            // .serverRejectedRequest — treat it as success so re-registration
-            // on every launch is idempotent.
-            if error.code == .serverRejectedRequest || Self.indicatesAlreadyExists(error) { return }
+            // .serverRejectedRequest — but so is a GENUINELY rejected one
+            // (container misconfig, unsupported database). Disambiguate by
+            // fetching the subscription: if it exists, this was the benign
+            // duplicate; if not, the push channel is really broken — surface it
+            // instead of silently never syncing.
+            if error.code == .serverRejectedRequest || Self.indicatesAlreadyExists(error) {
+                if (try? await database.subscription(for: id)) != nil { return }
+                SharedAlbumLog.logger.error(
+                    "ensureDatabaseSubscription: \(id, privacy: .public) REJECTED and absent — pushes will not arrive")
+                throw map(error)
+            }
             throw map(error)
         } catch {
             throw map(error)
@@ -648,21 +780,45 @@ final class CloudKitService {
         //    clearing it (refetch from scratch with a nil token). The new token
         //    returned replaces the stale one in the store's cache, so this also
         //    un-wedges persisted state.
+        //
+        //    Per-zone errors are ISOLATED: one bad zone must not abort the whole
+        //    sync (which would discard every other zone's delta AND stall the
+        //    database token forever). `.zoneNotFound`/`.userDeletedZone` means the
+        //    zone vanished between the DB pass and the zone fetch — e.g. the owner
+        //    revoked our access — so report it as deleted; anything else is
+        //    skipped (its token doesn't advance, so nothing is lost) and logged.
         var zoneChanges: [ZoneChangeResult] = []
+        var deletedZones = zoneResult.deletedZones
+        var failedZones: [CKRecordZone.ID] = []
         for zoneID in zoneResult.changedZones {
             do {
                 let rc = try await fetchZoneChanges(zoneID, in: database, since: zoneToken(zoneID))
                 zoneChanges.append(rc)
             } catch SharedAlbumError.changeTokenExpired {
-                let rc = try await fetchZoneChanges(zoneID, in: database, since: nil)
-                zoneChanges.append(rc)
+                do {
+                    let rc = try await fetchZoneChanges(zoneID, in: database, since: nil)
+                    zoneChanges.append(rc)
+                } catch {
+                    failedZones.append(zoneID)
+                    SharedAlbumLog.logger.error(
+                        "fetchDatabaseChanges: zone \(zoneID.zoneName, privacy: .public) refetch failed — \(error.localizedDescription, privacy: .public)")
+                }
+            } catch SharedAlbumError.zoneNotFound {
+                // Zone vanished between the DB pass and the zone fetch (owner
+                // deleted it / revoked us) — report as deleted.
+                deletedZones.append(zoneID)
+            } catch {
+                failedZones.append(zoneID)
+                SharedAlbumLog.logger.error(
+                    "fetchDatabaseChanges: zone \(zoneID.zoneName, privacy: .public) fetch failed — \(error.localizedDescription, privacy: .public)")
             }
         }
 
         return DatabaseChangeResult(
             newDatabaseToken: zoneResult.newToken,
-            deletedZoneIDs: zoneResult.deletedZones,
-            zoneChanges: zoneChanges)
+            deletedZoneIDs: deletedZones,
+            zoneChanges: zoneChanges,
+            failedZoneIDs: failedZones)
     }
 
     /// Run CKFetchDatabaseChangesOperation, bridged to async. Returns the set of
@@ -698,25 +854,78 @@ final class CloudKitService {
         }
     }
 
+    /// The default per-record keys for zone sync/loads: metadata + thumbnail
+    /// only — the full image stays lazy (fetched on tap via `fullImage`).
+    /// Includes the social record types' fields (reactions/comments live in the
+    /// same zone and ride the same fetches; keys absent on a record type are
+    /// simply omitted).
+    private static let syncDesiredKeys: [CKRecord.FieldKey] = [
+        SharedAlbum.PhotoField.thumbnail,
+        SharedAlbum.PhotoField.contributorID,
+        SharedAlbum.PhotoField.captureDate,
+        SharedAlbum.PhotoField.latitude,
+        SharedAlbum.PhotoField.longitude,
+        SharedAlbum.PhotoField.originalFilename,
+        SharedAlbum.PhotoField.contentHash,
+        SharedAlbum.PhotoField.mediaType,
+        SharedAlbum.PhotoField.duration,
+        SharedSocial.Field.photoRef,
+        SharedSocial.Field.emoji,
+        SharedSocial.Field.commentText,
+        SharedSocial.Field.authorID,
+        SharedSocial.Field.authorName,
+        SharedSocial.Field.createdAt,
+    ]
+
+    /// The contentHash of every photo currently in a zone. A cheap, asset-free
+    /// enumeration (desiredKeys = contentHash only) used to dedupe uploads: a
+    /// retried or repeated "add photos" skips photos whose bytes are already in
+    /// the album instead of duplicating them.
+    func existingContentHashes(inZone zoneID: CKRecordZone.ID,
+                               database: CKDatabase) async throws -> Set<String> {
+        try await requireAvailable()
+        do {
+            let zc = try await fetchZoneChanges(
+                zoneID, in: database, since: nil,
+                desiredKeys: [SharedAlbum.PhotoField.contentHash])
+            var hashes = Set<String>()
+            for record in zc.changedRecords where record.recordType == SharedAlbum.RecordType.photo {
+                if let hash = record[SharedAlbum.PhotoField.contentHash] as? String {
+                    hashes.insert(hash)
+                }
+            }
+            return hashes
+        } catch {
+            throw map(error)
+        }
+    }
+
     /// Run CKFetchRecordZoneChangesOperation for one zone, bridged to async.
     /// Returns changed records, deleted record IDs, and the zone's new token.
+    /// Fetch EVERY record in a zone with ALL fields (no desiredKeys filter).
+    /// Used by the settings-sync layer, whose records aren't photo-shaped.
+    func allRecords(inZone zoneID: CKRecordZone.ID,
+                    database: CKDatabase) async throws -> [CKRecord] {
+        try await requireAvailable()
+        do {
+            let zc = try await fetchZoneChanges(zoneID, in: database, since: nil, allFields: true)
+            return zc.changedRecords
+        } catch {
+            throw map(error)
+        }
+    }
+
     private func fetchZoneChanges(
         _ zoneID: CKRecordZone.ID,
         in database: CKDatabase,
-        since token: CKServerChangeToken?
+        since token: CKServerChangeToken?,
+        desiredKeys: [CKRecord.FieldKey]? = nil,
+        allFields: Bool = false
     ) async throws -> ZoneChangeResult {
         let config = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
         config.previousServerChangeToken = token
         // Metadata + thumbnail only on sync; full image stays lazy.
-        config.desiredKeys = [
-            SharedAlbum.PhotoField.thumbnail,
-            SharedAlbum.PhotoField.contributorID,
-            SharedAlbum.PhotoField.captureDate,
-            SharedAlbum.PhotoField.latitude,
-            SharedAlbum.PhotoField.longitude,
-            SharedAlbum.PhotoField.originalFilename,
-            SharedAlbum.PhotoField.contentHash,
-        ]
+        config.desiredKeys = allFields ? nil : (desiredKeys ?? Self.syncDesiredKeys)
         let op = CKFetchRecordZoneChangesOperation(
             recordZoneIDs: [zoneID],
             configurationsByRecordZoneID: [zoneID: config])
@@ -764,6 +973,15 @@ final class CloudKitService {
     nonisolated func map(_ error: Error) -> SharedAlbumError {
         if let already = error as? SharedAlbumError { return already }
         if let ck = error as? CKError {
+            // A partialFailure is an opaque wrapper ("Failed to modify some
+            // records") — the REAL cause lives in partialErrorsByItemID. Unwrap
+            // to the first underlying CKError so the user sees something
+            // actionable (e.g. a permission or verification failure).
+            if ck.code == .partialFailure,
+               let first = ck.partialErrorsByItemID?.values
+                   .compactMap({ $0 as? CKError }).first {
+                return map(first)
+            }
             switch ck.code {
             case .notAuthenticated, .accountTemporarilyUnavailable:
                 return .unavailable(reason: "Sign in to iCloud to use Shared Albums")
@@ -781,6 +999,11 @@ final class CloudKitService {
                 // Surfaced as a distinct case so the sync layer can clear the
                 // stale token and refetch from scratch instead of wedging.
                 return .changeTokenExpired
+            case .zoneNotFound, .userDeletedZone:
+                // Distinct case: the zone (album) is gone or our access was
+                // revoked — the sync layer treats this as a deletion, not a
+                // failure.
+                return .zoneNotFound
             default:
                 return .cloudKit(ck.localizedDescription)
             }
@@ -856,10 +1079,18 @@ struct ZoneChangeResult {
 
 /// The full delta for one database: which zones were deleted, the per-zone
 /// record changes, and the new database-level change token to persist.
+///
+/// `failedZoneIDs`: zones the DB pass reported as changed but whose record
+/// fetch failed. LOAD-BEARING for the store: CKFetchDatabaseChangesOperation
+/// only re-reports a zone for changes AFTER the supplied database token — so if
+/// the store persisted `newDatabaseToken` despite a failed zone, that zone's
+/// delta would never be re-delivered (until some future unrelated write). The
+/// store must NOT advance the database token when this is non-empty.
 struct DatabaseChangeResult {
     let newDatabaseToken: CKServerChangeToken?
     let deletedZoneIDs: [CKRecordZone.ID]
     let zoneChanges: [ZoneChangeResult]
+    var failedZoneIDs: [CKRecordZone.ID] = []
 }
 
 extension Array {
@@ -886,5 +1117,21 @@ private final class OneShotResume: @unchecked Sendable {
         if resumed { return false }
         resumed = true
         return true
+    }
+}
+
+/// Lock-guarded first-error capture for CKOperations whose per-item blocks fire
+/// on arbitrary queues before the op-level result block. Stores the FIRST error
+/// only (the concrete cause); later errors are ignored.
+private final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Error?
+    func store(_ error: Error) {
+        lock.lock(); defer { lock.unlock() }
+        if stored == nil { stored = error }
+    }
+    var value: Error? {
+        lock.lock(); defer { lock.unlock() }
+        return stored
     }
 }

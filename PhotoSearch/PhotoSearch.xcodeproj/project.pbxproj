@@ -6,6 +6,11 @@
 	objectVersion = 71;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		1000000000000000000000EB /* PhotoVaultWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 1000000000000000000000E0 /* PhotoVaultWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		1000000000000000000000FB /* PhotoVaultShare.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 1000000000000000000000F0 /* PhotoVaultShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		1000000000000000000000D5 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -14,11 +19,42 @@
 			remoteGlobalIDString = 1000000000000000000000A5;
 			remoteInfo = PhotoSearch;
 		};
+		218680EE3008188B00113A04 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1000000000000000000000A7 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1000000000000000000000E3;
+			remoteInfo = PhotoVaultWidget;
+		};
+		218680EF3008188B00113A04 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1000000000000000000000A7 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1000000000000000000000F3;
+			remoteInfo = PhotoVaultShare;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		1000000000000000000000EA /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				1000000000000000000000EB /* PhotoVaultWidget.appex in Embed Foundation Extensions */,
+				1000000000000000000000FB /* PhotoVaultShare.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		1000000000000000000000A4 /* PhotoSearch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoSearch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1000000000000000000000D0 /* PhotoSearchTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoSearchTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		1000000000000000000000E0 /* PhotoVaultWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PhotoVaultWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		1000000000000000000000F0 /* PhotoVaultShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PhotoVaultShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -29,11 +65,27 @@
 			);
 			target = 1000000000000000000000A5 /* PhotoSearch */;
 		};
+		1000000000000000000000E2 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 1000000000000000000000E3 /* PhotoVaultWidget */;
+		};
+		1000000000000000000000F2 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 1000000000000000000000F3 /* PhotoVaultShare */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		1000000000000000000000A3 /* PhotoSearch */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (1000000000000000000000C0 /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = PhotoSearch; sourceTree = "<group>"; };
 		1000000000000000000000D1 /* PhotoSearchTests */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = PhotoSearchTests; sourceTree = "<group>"; };
+		1000000000000000000000E1 /* PhotoVaultWidget */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (1000000000000000000000E2 /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = PhotoVaultWidget; sourceTree = "<group>"; };
+		1000000000000000000000F1 /* PhotoVaultShare */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (1000000000000000000000F2 /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = PhotoVaultShare; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -51,6 +103,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		1000000000000000000000E5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -59,6 +125,8 @@
 			children = (
 				1000000000000000000000A3 /* PhotoSearch */,
 				1000000000000000000000D1 /* PhotoSearchTests */,
+				1000000000000000000000E1 /* PhotoVaultWidget */,
+				1000000000000000000000F1 /* PhotoVaultShare */,
 				1000000000000000000000A2 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -68,6 +136,8 @@
 			children = (
 				1000000000000000000000A4 /* PhotoSearch.app */,
 				1000000000000000000000D0 /* PhotoSearchTests.xctest */,
+				1000000000000000000000E0 /* PhotoVaultWidget.appex */,
+				1000000000000000000000F0 /* PhotoVaultShare.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -82,10 +152,13 @@
 				1000000000000000000000B1 /* Sources */,
 				1000000000000000000000A9 /* Frameworks */,
 				1000000000000000000000B0 /* Resources */,
+				1000000000000000000000EA /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				1000000000000000000000EC /* PBXTargetDependency */,
+				1000000000000000000000FC /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				1000000000000000000000A3 /* PhotoSearch */,
@@ -115,6 +188,46 @@
 			productReference = 1000000000000000000000D0 /* PhotoSearchTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		1000000000000000000000E3 /* PhotoVaultWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1000000000000000000000E7 /* Build configuration list for PBXNativeTarget "PhotoVaultWidget" */;
+			buildPhases = (
+				1000000000000000000000E4 /* Sources */,
+				1000000000000000000000E5 /* Frameworks */,
+				1000000000000000000000E6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				1000000000000000000000E1 /* PhotoVaultWidget */,
+			);
+			name = PhotoVaultWidget;
+			productName = PhotoVaultWidget;
+			productReference = 1000000000000000000000E0 /* PhotoVaultWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		1000000000000000000000F3 /* PhotoVaultShare */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1000000000000000000000F7 /* Build configuration list for PBXNativeTarget "PhotoVaultShare" */;
+			buildPhases = (
+				1000000000000000000000F4 /* Sources */,
+				1000000000000000000000F5 /* Frameworks */,
+				1000000000000000000000F6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				1000000000000000000000F1 /* PhotoVaultShare */,
+			);
+			name = PhotoVaultShare;
+			productName = PhotoVaultShare;
+			productReference = 1000000000000000000000F0 /* PhotoVaultShare.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -131,6 +244,12 @@
 					1000000000000000000000D7 = {
 						CreatedOnToolsVersion = 26.5;
 						TestTargetID = 1000000000000000000000A5;
+					};
+					1000000000000000000000E3 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					1000000000000000000000F3 = {
+						CreatedOnToolsVersion = 26.5;
 					};
 				};
 			};
@@ -149,12 +268,28 @@
 			targets = (
 				1000000000000000000000A5 /* PhotoSearch */,
 				1000000000000000000000D7 /* PhotoSearchTests */,
+				1000000000000000000000E3 /* PhotoVaultWidget */,
+				1000000000000000000000F3 /* PhotoVaultShare */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		1000000000000000000000B0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000E6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F6 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -178,6 +313,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		1000000000000000000000E4 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F4 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -185,6 +334,16 @@
 			isa = PBXTargetDependency;
 			target = 1000000000000000000000A5 /* PhotoSearch */;
 			targetProxy = 1000000000000000000000D5 /* PBXContainerItemProxy */;
+		};
+		1000000000000000000000EC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1000000000000000000000E3 /* PhotoVaultWidget */;
+			targetProxy = 218680EE3008188B00113A04 /* PBXContainerItemProxy */;
+		};
+		1000000000000000000000FC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1000000000000000000000F3 /* PhotoVaultShare */;
+			targetProxy = 218680EF3008188B00113A04 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -404,6 +563,110 @@
 			};
 			name = Release;
 		};
+		1000000000000000000000E8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PhotoVaultWidget/PhotoVaultWidget.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 468N7YCDF7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PhotoVaultWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PhotoVault;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jakelulla.PhotoSearch.Widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		1000000000000000000000E9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PhotoVaultWidget/PhotoVaultWidget.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 468N7YCDF7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PhotoVaultWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PhotoVault;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jakelulla.PhotoSearch.Widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		1000000000000000000000F8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PhotoVaultShare/PhotoVaultShare.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 468N7YCDF7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PhotoVaultShare/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Add to Shared Album";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jakelulla.PhotoSearch.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		1000000000000000000000F9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PhotoVaultShare/PhotoVaultShare.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 468N7YCDF7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PhotoVaultShare/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Add to Shared Album";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jakelulla.PhotoSearch.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -430,6 +693,24 @@
 			buildConfigurations = (
 				1000000000000000000000D9 /* Debug */,
 				1000000000000000000000DA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1000000000000000000000E7 /* Build configuration list for PBXNativeTarget "PhotoVaultWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1000000000000000000000E8 /* Debug */,
+				1000000000000000000000E9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1000000000000000000000F7 /* Build configuration list for PBXNativeTarget "PhotoVaultShare" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1000000000000000000000F8 /* Debug */,
+				1000000000000000000000F9 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

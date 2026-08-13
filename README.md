@@ -64,9 +64,11 @@ Fully on-device. Key pieces (under `PhotoSearch/PhotoSearch/`):
   `InvitationStore.swift`, `RequestStore.swift` — the CloudKit shared-albums,
   friends, and photo-request layer.
 
-The former Python backend (`backend/`, `algorithm_scripting/`) is **retired
-reference material** — its tuned thresholds and pipeline were ported to
-on-device CoreML.
+The former Python backend and all other retired material (benchmark harnesses,
+exploration notebooks, old test data) live under **`unused/`** — see
+`unused/README.md`. Nothing there is built or run by the app; the LFW /
+embedding-parity benchmarks in it remain the tool to reach for after any model
+regeneration.
 
 ## Build & run
 
@@ -103,4 +105,15 @@ Shared albums require the **paid Apple Developer Program** and CloudKit config:
 
 Public-DB record types: `UserProfile` (username directory), `Invitation`,
 `PhotoRequest`. Private/shared zones carry albums and photos; `FacePayload`
-(ephemeral, private database) carries the face-match embedding for a request.
+(ephemeral, private database) carries the face-match embedding for a request;
+`MyProfilePointer` (private database, default zone) remembers the claimed
+username so a reinstall / second device recovers its identity. All record
+types auto-create in the Development environment on first use — remember to
+deploy the schema (including the two Queryable indexes) to **Production**
+before shipping.
+
+Share links (`https://www.icloud.com/share/…`) require the app's scene
+delegate (`SceneDelegate` in `PhotoSearchApp.swift`) — iOS delivers CloudKit
+share acceptance ONLY to the window-scene delegate in a SwiftUI app, both warm
+(`windowScene(_:userDidAcceptCloudKitShareWith:)`) and at cold launch
+(`connectionOptions.cloudKitShareMetadata`). Do not remove it.

@@ -685,6 +685,75 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertEqual(back.manualIncludeAssetIDs, ["a", "b"])
         XCTAssertEqual(back.manualExcludeAssetIDs, ["c"])
     }
+
+    // MARK: - Saved slideshows
+
+    func testSaveSlideshowDefaultsNameToCapitalizedQuery() {
+        let show = store.saveSlideshow(query: "  beach  ")
+        XCTAssertEqual(show?.query, "beach")          // trimmed
+        XCTAssertEqual(show?.name, "Beach")           // capitalized for display
+        XCTAssertEqual(store.savedSlideshows.count, 1)
+    }
+
+    func testEmptyQueryIsNotSaved() {
+        XCTAssertNil(store.saveSlideshow(query: "   "))
+        XCTAssertTrue(store.savedSlideshows.isEmpty)
+    }
+
+    /// Re-saving the same search must update in place, not stack duplicates —
+    /// the hub's bookmark button is easy to tap twice.
+    func testResavingSameQueryUpdatesInPlace() {
+        store.saveSlideshow(query: "beach")
+        store.saveSlideshow(query: "  BEACH ", name: "Summer", mood: .bright)
+        XCTAssertEqual(store.savedSlideshows.count, 1)
+        XCTAssertEqual(store.savedSlideshows[0].name, "Summer")
+        XCTAssertEqual(store.savedSlideshows[0].mood, .bright)
+        // The original query text is kept; only presentation changed.
+        XCTAssertEqual(store.savedSlideshows[0].query, "beach")
+    }
+
+    func testIsSlideshowSavedIgnoresCaseAndWhitespace() {
+        store.saveSlideshow(query: "beach")
+        XCTAssertTrue(store.isSlideshowSaved(query: " Beach "))
+        XCTAssertFalse(store.isSlideshowSaved(query: "mountains"))
+        XCTAssertFalse(store.isSlideshowSaved(query: "  "))
+    }
+
+    func testDistinctQueriesEachSaveNewestFirst() {
+        store.saveSlideshow(query: "beach")
+        store.saveSlideshow(query: "mountains")
+        XCTAssertEqual(store.savedSlideshows.map(\.query), ["mountains", "beach"])
+    }
+
+    func testRenameChangesNameNotQuery() {
+        let show = store.saveSlideshow(query: "beach")!
+        store.renameSlideshow(id: show.id, name: "  Summer at the lake  ")
+        XCTAssertEqual(store.savedSlideshows[0].name, "Summer at the lake")
+        XCTAssertEqual(store.savedSlideshows[0].query, "beach")
+        // An all-whitespace rename is rejected rather than blanking the row.
+        store.renameSlideshow(id: show.id, name: "   ")
+        XCTAssertEqual(store.savedSlideshows[0].name, "Summer at the lake")
+    }
+
+    func testDeleteSlideshow() {
+        let show = store.saveSlideshow(query: "beach")!
+        store.saveSlideshow(query: "mountains")
+        store.deleteSlideshow(id: show.id)
+        XCTAssertEqual(store.savedSlideshows.map(\.query), ["mountains"])
+        store.deleteSlideshow(id: "no-such-id")   // no-op
+        XCTAssertEqual(store.savedSlideshows.count, 1)
+    }
+
+    func testSavedSlideshowsSurviveReload() {
+        store.saveSlideshow(query: "beach", name: "Summer", mood: .warm)
+        store.persist()
+        store.load()
+        XCTAssertEqual(store.savedSlideshows.count, 1)
+        let show = store.savedSlideshows[0]
+        XCTAssertEqual(show.query, "beach")
+        XCTAssertEqual(show.name, "Summer")
+        XCTAssertEqual(show.mood, .warm)
+    }
 }
 
 // Test-only convenience: the cluster id a single-face photo was assigned to.

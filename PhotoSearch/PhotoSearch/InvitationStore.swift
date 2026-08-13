@@ -1,5 +1,6 @@
 import CloudKit
 import Foundation
+import UIKit
 
 /// Owns the FRIENDS / PROFILE / INVITATION state for the view layer. Mirrors
 /// SharedAlbumStore's idiom exactly: a `@MainActor` `ObservableObject` singleton,
@@ -29,6 +30,12 @@ final class InvitationStore: ObservableObject {
     /// handled-set, newest first. Drives the inbox banner/sheet.
     @Published private(set) var pendingInvitations: [Invitation] = []
 
+    /// The most recent inbox-fetch failure, user-facing. Load-bearing signal:
+    /// a missing Queryable index on `Invitation.toUserRecordID` (the classic
+    /// production misconfiguration) makes every fetch fail — silently swallowing
+    /// that rendered the whole invite flow as "no invitations" with no clue.
+    @Published private(set) var inboxError: String?
+
     /// True while a public-DB op (claim, add friend, send invite, fetch inbox)
     /// is in flight — for spinners. Coarse-grained on purpose.
     @Published private(set) var isWorking = false
@@ -44,6 +51,11 @@ final class InvitationStore: ObservableObject {
     /// True once the invitation subscription has been registered this launch, so
     /// we don't re-register on every appearance. Reset only on relaunch.
     private var subscriptionRegistered = false
+
+    /// True once profile recovery has been attempted this launch, so the
+    /// app-activation hook doesn't hit the private DB on every foreground for
+    /// users who simply never claimed a username.
+    private var profileRecoveryAttempted = false
 
     /// Mirrors ContentView.runningTests — skip launch/push-reachable CloudKit
     /// work in the XCTest host even if some entry point is exercised.
@@ -118,7 +130,44 @@ final class InvitationStore: ObservableObject {
         let profile = try await directory.claimUsername(username, displayName: displayName)
         myProfile = profile
         persistProfile()
+        // Best-effort private-DB pointer so a reinstall / second device can
+        // recover this identity instead of demanding a new username.
+        await directory.saveUsernamePointer(profile.username)
         return profile
+    }
+
+    /// Recover this account's claimed username from the private-DB pointer when
+    /// the local profile cache is missing (reinstall, second device). Without
+    /// this, that device would prompt for a NEW username and never register the
+    /// invitation subscription. Gated in tests and on availability; no-op when a
+    /// profile is already known.
+    func recoverProfileIfNeeded() async {
+        guard !Self.runningTests, myProfile == nil, !profileRecoveryAttempted else { return }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return }
+        profileRecoveryAttempted = true
+        if let profile = await directory.recoverMyProfile() {
+            myProfile = profile
+            persistProfile()
+        }
+    }
+
+    /// Called when the app becomes active. Hydrates the local cache and — when
+    /// the user actually uses the social layer (a LOCAL profile exists) —
+    /// refreshes the invitation inbox and ensures its push subscription is
+    /// registered. This is what lets invitations surface without a manual trip
+    /// to the Shared Albums screen every launch.
+    ///
+    /// Deliberately NO profile recovery here: recovery hits CloudKit, and this
+    /// hook fires at every cold launch — for a user who never used sharing that
+    /// would violate the no-CloudKit-at-launch rule. Recovery runs only at
+    /// explicit feature entry (SharedAlbumsView / InviteFriendView).
+    func onAppActivate() async {
+        guard !Self.runningTests else { return }
+        if myProfile == nil { loadLocalCache() }
+        guard myProfile != nil else { return }
+        await refreshPendingInvitations()
+        await registerInvitationSubscriptionIfNeeded()
     }
 
     /// Set my PUBLIC avatar (decorative; never used for face matching). Updates
@@ -214,7 +263,6 @@ final class InvitationStore: ObservableObject {
             fromUsername: me.username,
             album: album,
             shareURL: shareURL)
-        SharedAlbumStore.shared.noteShared(with: [friend.userRecordID])
     }
 
     // MARK: - Invitation inbox
@@ -232,9 +280,15 @@ final class InvitationStore: ObservableObject {
         do {
             let fetched = try await directory.fetchPendingInvitations()
             pendingInvitations = handled.unhandled(fetched)
+            inboxError = nil
+            // Widget badge stays honest with the inbox.
+            AppGroupSummaryWriter.refresh()
         } catch {
-            // Inbox is best-effort; a fetch failure shows no invitations rather
-            // than an error banner.
+            // Surface the failure (small banner in the UI) instead of silently
+            // rendering an empty inbox — a missing Queryable index on
+            // toUserRecordID fails EVERY fetch and was invisible before.
+            inboxError = (error as? SharedAlbumError)?.localizedDescription
+                ?? error.localizedDescription
             #if DEBUG
             print("[Invitations] fetch failed: \(error)")
             #endif
@@ -242,24 +296,29 @@ final class InvitationStore: ObservableObject {
     }
 
     /// Accept an invitation: resolve + accept the share, mark it handled locally,
-    /// remove it from the published list, and reload albums so it appears.
-    func accept(_ invitation: Invitation) async {
+    /// remove it from the published list, and reload albums (with the same
+    /// zone-propagation retry the link path gets) so it actually appears.
+    /// THROWS on failure so the inbox UI can show why — a silent no-op here left
+    /// the user staring at a spinner that "did nothing".
+    func accept(_ invitation: Invitation) async throws {
         await cloud.accountStatus()
-        guard cloud.isAvailable else { return }
+        guard cloud.isAvailable else {
+            throw SharedAlbumError.unavailable(
+                reason: "Sign in to iCloud to accept invitations")
+        }
         isWorking = true
         defer { isWorking = false }
-        do {
-            try await directory.acceptInvitation(invitation)
-            markHandled(invitation)
-            // The album now lives in the shared DB — refresh the album list.
-            await SharedAlbumStore.shared.loadAlbums()
-            // Best-effort sender-side cleanup hint is the sender's job; we just
-            // stop showing it locally (handled-set above).
-        } catch {
-            #if DEBUG
-            print("[Invitations] accept failed: \(error)")
-            #endif
-        }
+        try await directory.acceptInvitation(invitation)
+        markHandled(invitation)
+        // The album now lives in the shared DB — refresh with the propagation
+        // retry so the new album shows without a manual pull-to-refresh.
+        // Deliberately NO acceptedShareToast here: that alert lives at the tab
+        // root and can't present over the open inbox sheet — and the user is
+        // already watching the invitation disappear and the album appear.
+        await SharedAlbumStore.shared.reloadAfterAccept()
+        // Sync pushes should flow even if the user never opens the Shared
+        // Albums screen this launch. Idempotent + internally gated.
+        await SharedAlbumStore.shared.registerSubscriptionsIfNeeded()
     }
 
     /// Decline an invitation: mark it handled locally so it stops re-showing.
@@ -288,6 +347,11 @@ final class InvitationStore: ObservableObject {
         guard myProfile != nil else { return }   // no inbox without a profile
         await cloud.accountStatus()
         guard cloud.isAvailable else { return }
+        // The CKQuerySubscription only delivers if the app is registered for
+        // remote notifications. SharedAlbumsView's flow registers via
+        // SharedAlbumStore, but THIS path is also reachable from onAppActivate
+        // alone — without this call, an invitation push would never arrive.
+        UIApplication.shared.registerForRemoteNotifications()
         do {
             try await directory.registerInvitationSubscription()
             subscriptionRegistered = true

@@ -39,10 +39,17 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
     /// from scratch rather than wedging on the stale token. Kept as a distinct
     /// case (not folded into `.cloudKit`) so the store can detect it.
     case changeTokenExpired
+    /// The record zone is gone (`CKError.zoneNotFound` / `.userDeletedZone`) —
+    /// deleted by its owner, or our access was revoked. Distinct case so the
+    /// sync layer can treat it as "album deleted" instead of a generic failure.
+    case zoneNotFound
     /// The requested username already belongs to a DIFFERENT iCloud user, so the
     /// directory claim was refused. Distinct case so the onboarding UI can show
     /// a "try another name" message rather than a generic CloudKit error.
     case usernameTaken
+    /// An add-photos call is already running for this album. Distinct case so
+    /// the share-folder flow can show "still adding…" instead of an error.
+    case uploadAlreadyInProgress
 
     var errorDescription: String? {
         switch self {
@@ -51,7 +58,9 @@ enum SharedAlbumError: Error, LocalizedError, Equatable {
         case .cloudKit(let msg):             return msg
         case .retryExhausted(let msg):       return "iCloud kept failing: \(msg)"
         case .changeTokenExpired:            return "iCloud sync needs a full refresh."
+        case .zoneNotFound:                  return "This shared album is no longer available."
         case .usernameTaken:                 return "That username is already taken. Try another."
+        case .uploadAlreadyInProgress:       return "Photos are still being added to this album. Try again when that finishes."
         }
     }
 }
@@ -131,6 +140,18 @@ struct SharedPhoto: Identifiable, Codable, Equatable {
     var originalFilename: String?
     /// Content hash for dedupe on upload (sha256 hex of the full-res bytes).
     var contentHash: String?
+    /// "video" when the fullImage asset is a movie file; nil/"image" otherwise.
+    /// Optional String (not Bool) for Codable/CKRecord back-compat with photos
+    /// uploaded before video support existed.
+    var mediaType: String?
+    /// Seconds, videos only.
+    var duration: Double?
+
+    var isVideo: Bool { mediaType == "video" }
+    var durationText: String {
+        let s = Int(duration ?? 0)
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
 
     var albumZoneID: CKRecordZone.ID {
         CKRecordZone.ID(zoneName: albumZoneName, ownerName: albumZoneOwnerName)
@@ -141,13 +162,35 @@ struct SharedPhoto: Identifiable, Codable, Equatable {
     }
 }
 
+// MARK: - AlbumParticipant value type
+
+/// One person on an album's zone-wide CKShare, as the view layer sees it. Pure
+/// value type (no CKShare.Participant reference escapes the store) so the
+/// People sheet stays cheap to diff and trivially previewable.
+struct AlbumParticipant: Identifiable, Equatable {
+    /// Stable identity: the participant's user record name when known, else a
+    /// minted UUID (pending email/phone invitees have no record ID yet).
+    let id: String
+    /// Best display name CloudKit gives us (name components → email → phone).
+    /// The view layer upgrades this to a friend's @username when it can.
+    var displayName: String
+    /// The participant's iCloud user record name, when resolved.
+    var userRecordID: String?
+    var isOwner: Bool
+    var isMe: Bool
+    /// Human-readable acceptance state: "Joined", "Invited", or "" (unknown).
+    var status: String
+    var canWrite: Bool
+}
+
 /// The bytes + metadata for ONE photo about to be uploaded. Built by the store
 /// from a local PHAsset (full-res JPEG + thumbnail written to temp files) and
 /// handed to CloudKitService, which materializes the CKRecord + CKAssets. Kept
 /// separate from `SharedPhoto` so the value type the view sees never holds file
 /// URLs or CloudKit handles.
 struct SharedPhotoUploadPayload {
-    /// Temp-file URL of the full-resolution JPEG. Deleted after upload.
+    /// Temp-file URL of the full-resolution JPEG (or the movie file for
+    /// videos). Deleted after upload.
     let fullImageURL: URL
     /// Temp-file URL of the ~256px thumbnail JPEG. Deleted after upload.
     let thumbnailURL: URL
@@ -157,6 +200,8 @@ struct SharedPhotoUploadPayload {
     var longitude: Double?
     var originalFilename: String?
     var contentHash: String?
+    var isVideo: Bool = false
+    var duration: Double?
 }
 
 // MARK: - CKRecord <-> value mapping
@@ -182,14 +227,16 @@ extension SharedAlbum {
     /// dashboard schema and both the read/write sites stay in lockstep.
     enum PhotoField {
         static let album = "album"               // CKRecord.Reference -> album root
-        static let fullImage = "fullImage"       // CKAsset (full-res JPEG)
-        static let thumbnail = "thumbnail"       // CKAsset (~256px JPEG)
+        static let fullImage = "fullImage"       // CKAsset (full-res JPEG, or the movie file for videos)
+        static let thumbnail = "thumbnail"       // CKAsset (~256px JPEG; poster frame for videos)
         static let contributorID = "contributorID"
         static let captureDate = "captureDate"
         static let latitude = "latitude"
         static let longitude = "longitude"
         static let originalFilename = "originalFilename"
         static let contentHash = "contentHash"
+        static let mediaType = "mediaType"       // "image" / "video"
+        static let duration = "duration"         // Double seconds, videos only
     }
 
     /// Build a value from the album's root record. Failable so a malformed /
@@ -255,6 +302,8 @@ extension SharedPhoto {
         self.longitude = record[SharedAlbum.PhotoField.longitude] as? Double
         self.originalFilename = record[SharedAlbum.PhotoField.originalFilename] as? String
         self.contentHash = record[SharedAlbum.PhotoField.contentHash] as? String
+        self.mediaType = record[SharedAlbum.PhotoField.mediaType] as? String
+        self.duration = record[SharedAlbum.PhotoField.duration] as? Double
     }
 
     /// Materialize a "SharedPhoto" CKRecord from an upload payload, into the
@@ -302,6 +351,8 @@ extension SharedPhoto {
         if let v = payload.longitude { rec[SharedAlbum.PhotoField.longitude] = v as CKRecordValue }
         if let v = payload.originalFilename { rec[SharedAlbum.PhotoField.originalFilename] = v as CKRecordValue }
         if let v = payload.contentHash { rec[SharedAlbum.PhotoField.contentHash] = v as CKRecordValue }
+        rec[SharedAlbum.PhotoField.mediaType] = (payload.isVideo ? "video" : "image") as CKRecordValue
+        if let v = payload.duration { rec[SharedAlbum.PhotoField.duration] = v as CKRecordValue }
 
         return rec
     }

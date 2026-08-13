@@ -100,7 +100,31 @@ struct LocalFolder: Identifiable, Codable {
     var manualIncludeAssetIDs: [String]?
     var manualExcludeAssetIDs: [String]?
 
+    /// Last local edit, for cross-device last-writer-wins sync
+    /// (SettingsSyncService). Optional for Codable back-compat; nil sorts
+    /// oldest. Remote-applied folders carry the REMOTE edit time.
+    var modifiedAt: Date?
+
     var isSmart: Bool { !(query ?? "").isEmpty || anchorAssetID != nil }
+}
+
+/// A slideshow the user typed and kept. Stores the QUERY, not a frozen list of
+/// asset IDs — replayed through the same search engine on every open, exactly
+/// like a smart folder. A saved "beach" show therefore picks up beach photos
+/// taken after it was saved, instead of aging into a stale snapshot.
+struct SavedSlideshow: Identifiable, Codable, Equatable {
+    let id: String
+    /// User-facing name. Defaults to the query, but renameable — so "beach"
+    /// can become "Summer at the lake" without changing what it matches.
+    var name: String
+    /// The natural-language search replayed to build the show.
+    var query: String
+    /// Music mood, stored as the raw value so a future mood picker persists.
+    var mood: SlideshowMusic.Mood
+    var createdAt: Date
+    /// Last local edit (rename). Mirrors LocalFolder.modifiedAt; optional for
+    /// Codable back-compat with files written before it existed.
+    var modifiedAt: Date?
 }
 
 /// One representative face of a person per calendar year — the result row
@@ -140,6 +164,7 @@ final class PhotoStore: ObservableObject {
     @Published private(set) var clusters:  [PersonCluster]  = []
     @Published private(set) var locations: [LocalLocation]  = []
     @Published private(set) var folders:   [LocalFolder]    = []
+    @Published private(set) var savedSlideshows: [SavedSlideshow] = []
 
     // CLIP embeddings stored separately (not in LocalPhoto) for efficiency
     private(set) var clipEmbeddings: [String: [Float]] = [:]
@@ -169,6 +194,7 @@ final class PhotoStore: ObservableObject {
     private static var clustersURL:   URL { storeDir.appendingPathComponent("clusters.json") }
     private static var locationsURL:  URL { storeDir.appendingPathComponent("locations.json") }
     private static var foldersURL:    URL { storeDir.appendingPathComponent("folders.json") }
+    private static var slideshowsURL: URL { storeDir.appendingPathComponent("slideshows.json") }
     private static var embeddingsURL: URL { storeDir.appendingPathComponent("embeddings.json") }      // legacy JSON
     private static var clipBinURL:    URL { storeDir.appendingPathComponent("clip_embeddings.bin") }
     private static var videoFramesURL: URL { storeDir.appendingPathComponent("videoframes.bin") }
@@ -228,6 +254,9 @@ final class PhotoStore: ObservableObject {
         }
         if let arr = loadStore(Self.foldersURL, { try? dec.decode([LocalFolder].self, from: $0) }) {
             folders = arr
+        }
+        if let arr = loadStore(Self.slideshowsURL, { try? dec.decode([SavedSlideshow].self, from: $0) }) {
+            savedSlideshows = arr
         }
         // CLIP embeddings: binary store, with one-time migration from the
         // legacy JSON file (JSON cost 100MB+ encodes and slow launches at
@@ -319,7 +348,8 @@ final class PhotoStore: ObservableObject {
         static let folders    = DirtyStores(rawValue: 1 << 3)  // folders.json
         static let embeddings = DirtyStores(rawValue: 1 << 4)  // clip_embeddings.bin + videoframes.bin (always change together — both written at index time)
         static let geocode    = DirtyStores(rawValue: 1 << 5)  // geocode_cache.json + geocode_pending.json
-        static let all: DirtyStores = [.photos, .clusters, .locations, .folders, .embeddings, .geocode]
+        static let slideshows = DirtyStores(rawValue: 1 << 6)  // slideshows.json
+        static let all: DirtyStores = [.photos, .clusters, .locations, .folders, .embeddings, .geocode, .slideshows]
     }
 
     private var dirty: DirtyStores = []
@@ -362,6 +392,9 @@ final class PhotoStore: ObservableObject {
         if toWrite.contains(.folders) {
             try? enc.encode(folders).write(to: Self.foldersURL, options: .atomic)
         }
+        if toWrite.contains(.slideshows) {
+            try? enc.encode(savedSlideshows).write(to: Self.slideshowsURL, options: .atomic)
+        }
         if toWrite.contains(.geocode) {
             try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
             try? JSONEncoder().encode(geocodePending).write(to: Self.geocodePendingURL, options: .atomic)
@@ -385,6 +418,7 @@ final class PhotoStore: ObservableObject {
         try? enc.encode(clusters).write(to: Self.clustersURL, options: .atomic)
         try? enc.encode(locations).write(to: Self.locationsURL, options: .atomic)
         try? enc.encode(folders).write(to: Self.foldersURL, options: .atomic)
+        try? enc.encode(savedSlideshows).write(to: Self.slideshowsURL, options: .atomic)
         try? BinaryEmbeddingCodec.encode(clipEmbeddings).write(to: Self.clipBinURL, options: .atomic)
         try? BinaryFrameEmbeddingCodec.encode(videoFrameEmbeddings).write(to: Self.videoFramesURL, options: .atomic)
         try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
@@ -1211,10 +1245,12 @@ final class PhotoStore: ObservableObject {
 
     @discardableResult
     func createFolder(name: String, query: String? = nil) -> LocalFolder {
-        let f = LocalFolder(id: UUID().uuidString, name: name, photoAssetIDs: [],
+        var f = LocalFolder(id: UUID().uuidString, name: name, photoAssetIDs: [],
                             query: (query?.isEmpty == true) ? nil : query)
+        f.modifiedAt = Date()
         folders.append(f)
         schedulePersist(.folders)
+        noteFolderChanged()
         return f
     }
 
@@ -1228,6 +1264,44 @@ final class PhotoStore: ObservableObject {
         folders[fi].anchorAssetID = anchorAssetID
         folders[fi].minusQuery = (minusQuery?.isEmpty == true) ? nil : minusQuery
         folders[fi].minScore = minScore
+        folders[fi].modifiedAt = Date()
+        schedulePersist(.folders)
+        noteFolderChanged()
+    }
+
+    // MARK: - Cross-device folder sync hooks (SettingsSyncService)
+
+    /// Suppresses the change signal while a REMOTE folder state is applied, so
+    /// sync-applied edits don't echo straight back into a push.
+    private var applyingSyncedFolders = false
+
+    /// Posted (debounced by the observer) after any LOCAL folder mutation.
+    private func noteFolderChanged() {
+        guard !applyingSyncedFolders else { return }
+        NotificationCenter.default.post(name: .photoVaultFoldersChanged, object: nil)
+    }
+
+    /// Upsert a folder as delivered by cross-device sync. Preserves the REMOTE
+    /// modifiedAt (last-writer-wins bookkeeping), persists, and does NOT re-post
+    /// the change signal.
+    func applySyncedFolder(_ folder: LocalFolder) {
+        applyingSyncedFolders = true
+        defer { applyingSyncedFolders = false }
+        if let fi = folders.firstIndex(where: { $0.id == folder.id }) {
+            folders[fi] = folder
+        } else {
+            folders.append(folder)
+        }
+        membershipVersion += 1
+        schedulePersist(.folders)
+    }
+
+    /// Remove a folder deleted on another device (sync tombstone). Photos are
+    /// never touched — deletion of members is a deliberate local-only action.
+    func removeSyncedFolder(id: String) {
+        applyingSyncedFolders = true
+        defer { applyingSyncedFolders = false }
+        folders.removeAll { $0.id == id }
         schedulePersist(.folders)
     }
 
@@ -1327,7 +1401,9 @@ final class PhotoStore: ObservableObject {
     func renameFolder(id: String, name: String) {
         guard let fi = folders.firstIndex(where: { $0.id == id }), !name.isEmpty else { return }
         folders[fi].name = name
+        folders[fi].modifiedAt = Date()
         schedulePersist(.folders)
+        noteFolderChanged()
     }
 
     func deleteFolder(id: String, deletePhotos: Bool) {
@@ -1336,6 +1412,72 @@ final class PhotoStore: ObservableObject {
         }
         folders.removeAll { $0.id == id }
         schedulePersist(.folders)
+        noteFolderChanged()
+    }
+
+    // MARK: - Saved slideshows
+
+    /// Normalized form used to decide whether two saved shows are "the same
+    /// search" — trimmed and case-folded, so "Beach" and "beach " collapse.
+    private static func slideshowKey(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether this exact search is already saved — lets the UI show a filled
+    /// bookmark instead of silently stacking duplicates of one query.
+    func isSlideshowSaved(query: String) -> Bool {
+        let key = Self.slideshowKey(query)
+        return !key.isEmpty && savedSlideshows.contains { Self.slideshowKey($0.query) == key }
+    }
+
+    /// Save a typed slideshow. Saving the same search twice UPDATES the
+    /// existing entry (name/mood) rather than adding a duplicate, so repeatedly
+    /// tapping save on "beach" leaves exactly one show. Newest first.
+    @discardableResult
+    func saveSlideshow(query rawQuery: String,
+                       name rawName: String? = nil,
+                       mood: SlideshowMusic.Mood = .calm) -> SavedSlideshow? {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return nil }
+        let trimmedName = rawName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Default name: the query, capitalized the same way the player titles
+        // an unsaved custom show.
+        let name = (trimmedName?.isEmpty == false)
+            ? trimmedName!
+            : query.prefix(1).uppercased() + query.dropFirst()
+
+        let key = Self.slideshowKey(query)
+        if let i = savedSlideshows.firstIndex(where: { Self.slideshowKey($0.query) == key }) {
+            savedSlideshows[i].name = name
+            savedSlideshows[i].mood = mood
+            savedSlideshows[i].modifiedAt = Date()
+            schedulePersist(.slideshows)
+            return savedSlideshows[i]
+        }
+
+        let show = SavedSlideshow(id: UUID().uuidString,
+                                  name: name,
+                                  query: query,
+                                  mood: mood,
+                                  createdAt: Date(),
+                                  modifiedAt: Date())
+        savedSlideshows.insert(show, at: 0)
+        schedulePersist(.slideshows)
+        return show
+    }
+
+    func renameSlideshow(id: String, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let i = savedSlideshows.firstIndex(where: { $0.id == id }), !trimmed.isEmpty else { return }
+        savedSlideshows[i].name = trimmed
+        savedSlideshows[i].modifiedAt = Date()
+        schedulePersist(.slideshows)
+    }
+
+    func deleteSlideshow(id: String) {
+        guard savedSlideshows.contains(where: { $0.id == id }) else { return }
+        savedSlideshows.removeAll { $0.id == id }
+        schedulePersist(.slideshows)
     }
 
     /// Add photos to a folder. Static folders append to `photoAssetIDs` (their
@@ -1360,7 +1502,9 @@ final class PhotoStore: ObservableObject {
                 folders[fi].photoAssetIDs.append(assetID)
             }
         }
+        folders[fi].modifiedAt = Date()
         schedulePersist(.folders)
+        noteFolderChanged()
     }
 
     /// Remove photos from a folder. Static folders strip from `photoAssetIDs`;
@@ -1382,7 +1526,9 @@ final class PhotoStore: ObservableObject {
         } else {
             let s = Set(assetIDs); folders[fi].photoAssetIDs.removeAll { s.contains($0) }
         }
+        folders[fi].modifiedAt = Date()
         schedulePersist(.folders)
+        noteFolderChanged()
     }
 
     // MARK: - Duplicates
@@ -2162,6 +2308,7 @@ final class PhotoStore: ObservableObject {
         geocodePending = [:]
 
         photos = []; clusters = []; locations = []; folders = []
+        savedSlideshows = []
         clipEmbeddings = [:]; videoFrameEmbeddings = [:]
         photoIndex = [:]; nextPhotoID = 0; nextClusterID = 0
         // The cluster ID space is gone; a SharpnessBackfill mid-run matched

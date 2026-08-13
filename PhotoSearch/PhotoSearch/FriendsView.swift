@@ -339,6 +339,11 @@ struct AddFriendView: View {
 
 /// Sheet listing the user's friends so they can be invited to a specific album,
 /// fully in-app (programmatic share + public-DB invitation, no share sheet).
+///
+/// Seamlessness: friends who already JOINED the album (live share participants)
+/// are marked and not re-invitable; a friend invited THIS session shows
+/// "Invited ✓"; the no-friends state offers Add Friend right here instead of a
+/// dead-end pointer at another screen.
 struct InviteFriendView: View {
     let album: SharedAlbum
 
@@ -348,6 +353,12 @@ struct InviteFriendView: View {
     @State private var inviting: String?       // friend.id currently being invited
     @State private var statusMessage: String?
     @State private var isError = false
+    @State private var showOnboarding = false
+    @State private var showAddFriend = false
+    /// Friends invited during THIS sheet's lifetime (userRecordIDs).
+    @State private var invitedIDs: Set<String> = []
+    /// userRecordIDs already on the share (owner-side fetch; empty when unknown).
+    @State private var joinedIDs: Set<String> = []
 
     var body: some View {
         NavigationStack {
@@ -356,13 +367,27 @@ struct InviteFriendView: View {
                     ContentUnavailableView {
                         Label("Set up your username first", systemImage: "person.crop.circle.badge.plus")
                     } description: {
-                        Text("Claim a username in Friends before inviting people.")
+                        Text("Claim a username so friends can find you, then invite them.")
+                    } actions: {
+                        Button {
+                            showOnboarding = true
+                        } label: {
+                            Label("Choose Username", systemImage: "at")
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
                 } else if store.friends.isEmpty {
                     ContentUnavailableView {
                         Label("No friends to invite", systemImage: "person.2")
                     } description: {
-                        Text("Add friends by username in the Friends screen, then invite them here.")
+                        Text("Add a friend by username — then invite them to \u{201C}\(album.name)\u{201D}.")
+                    } actions: {
+                        Button {
+                            showAddFriend = true
+                        } label: {
+                            Label("Add Friend", systemImage: "person.badge.plus")
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
                 } else {
                     List {
@@ -376,21 +401,14 @@ struct InviteFriendView: View {
                         }
                         Section("Invite to \(album.name)") {
                             ForEach(store.friends) { friend in
-                                Button {
-                                    Task { await invite(friend) }
-                                } label: {
-                                    HStack {
-                                        FriendLabel(friend: friend)
-                                        Spacer()
-                                        if inviting == friend.id {
-                                            ProgressView()
-                                        } else {
-                                            Image(systemName: "paperplane")
-                                                .foregroundStyle(.tint)
-                                        }
-                                    }
-                                }
-                                .disabled(inviting != nil)
+                                friendRow(friend)
+                            }
+                        }
+                        Section {
+                            Button {
+                                showAddFriend = true
+                            } label: {
+                                Label("Add Friend…", systemImage: "person.badge.plus")
                             }
                         }
                     }
@@ -403,8 +421,65 @@ struct InviteFriendView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .sheet(isPresented: $showOnboarding) {
+                UsernameOnboardingView()
+            }
+            .sheet(isPresented: $showAddFriend) {
+                AddFriendView()
+            }
         }
-        .task { store.loadLocalCache() }
+        .task {
+            store.loadLocalCache()
+            await store.recoverProfileIfNeeded()
+            // Owner-side: learn who has already joined / been invited so the
+            // rows reflect reality instead of offering blind re-invites.
+            if album.isOwnedByMe,
+               let participants = await SharedAlbumStore.shared.participants(for: album) {
+                joinedIDs = Set(participants.compactMap {
+                    $0.status == "Joined" && !$0.isOwner ? $0.userRecordID : nil
+                })
+                invitedIDs.formUnion(participants.compactMap {
+                    $0.status == "Invited" ? $0.userRecordID : nil
+                })
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func friendRow(_ friend: Friend) -> some View {
+        let joined = joinedIDs.contains(friend.userRecordID)
+        let invited = invitedIDs.contains(friend.userRecordID)
+        Button {
+            Task { await invite(friend) }
+        } label: {
+            HStack {
+                FriendLabel(friend: friend)
+                Spacer()
+                if inviting == friend.id {
+                    ProgressView()
+                } else if joined {
+                    Label("Joined", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+                        .labelStyle(.titleAndIcon)
+                } else if invited {
+                    // Tappable on purpose: the invite is TWO CloudKit writes
+                    // (share participant + public Invitation record). If the
+                    // second failed, the friend shows "Invited" but has no
+                    // invitation in their inbox — resending writes a fresh
+                    // Invitation record and is harmless when one already exists
+                    // (the participant grant is reused, not duplicated).
+                    Label("Invited · Resend", systemImage: "paperplane.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
+                        .labelStyle(.titleAndIcon)
+                } else {
+                    Image(systemName: "paperplane")
+                        .foregroundStyle(.tint)
+                }
+            }
+        }
+        .disabled(inviting != nil || joined)
     }
 
     private func invite(_ friend: Friend) async {
@@ -414,7 +489,8 @@ struct InviteFriendView: View {
         do {
             try await store.invite(friend, to: album)
             isError = false
-            statusMessage = "Invited @\(friend.username)."
+            statusMessage = "Invited @\(friend.username). They'll see it in their Shared Albums."
+            invitedIDs.insert(friend.userRecordID)
         } catch {
             isError = true
             statusMessage = (error as? SharedAlbumError)?.localizedDescription
@@ -436,12 +512,15 @@ private struct FriendLabel: View {
 // MARK: - Invitation inbox
 
 /// A sheet listing pending invitations with Accept / Decline. Presented from
-/// SharedAlbumsView when invitations exist.
+/// SharedAlbumsView when invitations exist. Accept failures surface in an alert
+/// (they used to be swallowed — a spinner that "did nothing"); accepting the
+/// last invitation dismisses the sheet so the new album is immediately visible.
 struct InvitationInboxView: View {
     @ObservedObject private var store = InvitationStore.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var busy: String?           // invitation.id being accepted
+    @State private var acceptError: String?
 
     var body: some View {
         NavigationStack {
@@ -471,13 +550,27 @@ struct InvitationInboxView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .alert("Couldn't Accept Invitation",
+                   isPresented: Binding(get: { acceptError != nil },
+                                        set: { if !$0 { acceptError = nil } })) {
+                Button("OK", role: .cancel) { acceptError = nil }
+            } message: {
+                Text(acceptError ?? "")
+            }
         }
     }
 
     private func accept(_ invitation: Invitation) async {
         busy = invitation.id
         defer { busy = nil }
-        await store.accept(invitation)
+        do {
+            try await store.accept(invitation)
+            // Last one handled → close the inbox so the album list shows.
+            if store.pendingInvitations.isEmpty { dismiss() }
+        } catch {
+            acceptError = (error as? SharedAlbumError)?.localizedDescription
+                ?? error.localizedDescription
+        }
     }
 }
 

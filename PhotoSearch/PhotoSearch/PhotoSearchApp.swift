@@ -38,6 +38,51 @@ struct PhotoSearchApp: App {
                 PhotoStore.shared.persist()
                 BackgroundIndexer.scheduleIfWorkRemains()
             }
+            // Foregrounding: keep the SOCIAL layer fresh without requiring a
+            // manual trip to the Shared Albums screen — refresh the invitation
+            // inbox, ensure push subscriptions, and delta-sync shared albums.
+            // Both hooks are no-ops unless the user actually uses the feature
+            // (local profile / cached albums exist), are gated on runningTests
+            // internally, and short-circuit when iCloud is unavailable — so
+            // launch, the simulator, and the test host stay inert.
+            if phase == .active {
+                Task { @MainActor in
+                    await InvitationStore.shared.onAppActivate()
+                    await SharedAlbumStore.shared.onAppActivate()
+                    // Cross-device folder/smart-folder sync (own private DB;
+                    // gated internally: tests, availability, has-folders).
+                    await SettingsSyncService.shared.syncOnActivateIfWorthwhile()
+                }
+            }
+        }
+    }
+}
+
+/// Scene delegate — REQUIRED for CloudKit share links to work in a SwiftUI
+/// scene-based app. iOS delivers share acceptance to the WINDOW SCENE delegate
+/// (`windowScene(_:userDidAcceptCloudKitShareWith:)` when the app is running,
+/// `connectionOptions.cloudKitShareMetadata` on a cold launch from the link) —
+/// NOT to the app delegate's `userDidAcceptCloudKitShareWith`, which is dead
+/// code under scenes. Without this class, tapping a share link opened the app
+/// and silently did nothing. SwiftUI still owns the window/UI: we implement no
+/// window management here, only the CloudKit hand-off.
+final class SceneDelegate: NSObject, UIWindowSceneDelegate {
+    /// Cold launch from a share link: the metadata rides the connection options.
+    func scene(_ scene: UIScene,
+               willConnectTo session: UISceneSession,
+               options connectionOptions: UIScene.ConnectionOptions) {
+        if let metadata = connectionOptions.cloudKitShareMetadata {
+            Task { @MainActor in
+                await SharedAlbumStore.shared.acceptShare(metadata)
+            }
+        }
+    }
+
+    /// Warm path: the app is running (or suspended) and the user taps a link.
+    func windowScene(_ windowScene: UIWindowScene,
+                     userDidAcceptCloudKitShareWith cloudKitShareMetadata: CKShare.Metadata) {
+        Task { @MainActor in
+            await SharedAlbumStore.shared.acceptShare(cloudKitShareMetadata)
         }
     }
 }
@@ -48,11 +93,46 @@ struct PhotoSearchApp: App {
 /// response to a user action after launch — never at startup and never during
 /// the in-host XCTest run — so it has no effect on launch or the test suite.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Wire the notification-center delegate (banner policy + tap routing).
+    /// Pure delegate assignment: no prompt, no network, test-safe.
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        MainActor.assumeIsolated {
+            NotificationManager.shared.install()
+        }
+        return true
+    }
+
+    /// Route every window scene through SceneDelegate — the ONLY way iOS
+    /// delivers CloudKit share-acceptance metadata to a scene-based app. SwiftUI
+    /// keeps managing the window/content as usual.
+    func application(_ application: UIApplication,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
+        if connectingSceneSession.role == .windowApplication {
+            config.delegateClass = SceneDelegate.self
+        }
+        return config
+    }
+
+    /// Legacy fallback (non-scene contexts). Under scenes iOS calls the SCENE
+    /// delegate instead — see SceneDelegate. Kept because it is harmless and
+    /// covers any path where a scene delegate isn't consulted.
     func application(_ application: UIApplication,
                      userDidAcceptCloudKitShareWith metadata: CKShare.Metadata) {
         Task { @MainActor in
             await SharedAlbumStore.shared.acceptShare(metadata)
         }
+    }
+
+    /// Diagnostics: a failed APNs registration means CloudKit's silent pushes
+    /// (album sync + invitation inbox) will never arrive — worth a loud log
+    /// instead of silence, since the UI then depends entirely on manual refresh.
+    func application(_ application: UIApplication,
+                     didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        SharedAlbumLog.logger.error(
+            "remote-notification registration FAILED: \(error.localizedDescription, privacy: .public) — shared-album pushes will not arrive")
     }
 
     /// Silent CloudKit push: a shared-albums database subscription fired because
@@ -82,10 +162,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         let subID = notification.subscriptionID
         Task { @MainActor in
             switch subID {
-            case DirectoryService.invitationSubscriptionID:
+            case DirectoryService.invitationSubscriptionID,
+                 DirectoryService.legacyInvitationSubscriptionID:
                 await InvitationStore.shared.refreshPendingInvitations()
                 completionHandler(.newData)
-            case DirectoryService.requestSubscriptionID:
+            case DirectoryService.requestSubscriptionID,
+                 DirectoryService.legacyRequestSubscriptionID:
                 await RequestStore.shared.refreshPendingRequests()
                 completionHandler(.newData)
             default:
@@ -96,9 +178,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                     await RequestStore.shared.refreshPendingRequests()
                     completionHandler(.newData)
                 } else {
-                    // Album/photo zone change → delta sync.
-                    let changed = await SharedAlbumStore.shared.syncChanges()
-                    completionHandler(changed ? .newData : .noData)
+                    // Album/photo zone change → delta sync. When the sync ran
+                    // in the BACKGROUND and brought in photos from other
+                    // people, surface a visible local notification — the UI
+                    // isn't on screen to show them.
+                    let news = await SharedAlbumStore.shared.syncChanges()
+                    if news.totalNewPhotos > 0,
+                       application.applicationState != .active {
+                        NotificationManager.shared.postNewPhotos(
+                            count: news.totalNewPhotos,
+                            albumNames: Array(news.newPhotosByAlbumName.keys))
+                    }
+                    completionHandler(news.changed ? .newData : .noData)
                 }
             }
         }

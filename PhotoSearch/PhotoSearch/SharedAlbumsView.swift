@@ -25,8 +25,23 @@ struct SharedAlbumsView: View {
     @State private var friendInviteAlbum: SharedAlbum?
     @State private var showFriends = false
     @State private var showInbox = false
+    /// A just-created album, driving the "what next?" dialog (invite a friend /
+    /// share a link / later) so creation flows straight into inviting.
+    @State private var createdAlbum: SharedAlbum?
+    @State private var showPostCreateOptions = false
+    /// The album pending a Delete (owner) / Leave (participant) confirmation.
+    @State private var deleteTarget: SharedAlbum?
+    /// Failure of a delete/leave, surfaced in an alert.
+    @State private var actionError: String?
 
+    // The full modifier stack exceeded the type-checker's budget as ONE
+    // expression, so the body is assembled from smaller, individually
+    // type-checked pieces (core → alerts/dialogs → sheets → banners).
     var body: some View {
+        attachBanners(to: attachSheets(to: attachAlertsAndDialogs(to: core)))
+    }
+
+    private var core: some View {
         Group {
             switch store.state {
             case .unavailable(let reason):
@@ -78,10 +93,19 @@ struct SharedAlbumsView: View {
         // CloudKit is only ever touched from here. Load the local cache first
         // for an instant offline view, then check availability + refresh.
         .task {
-            store.loadLocalCache()
+            // Hydrate from disk only when nothing is loaded yet — re-entering
+            // the screen must not clobber a fresher in-memory server view with
+            // the stale cache (loadAlbums below refreshes either way).
+            if store.albums.isEmpty { store.loadLocalCache() }
             invitations.loadLocalCache()
             await store.refreshAvailability()
             if case .unavailable = store.state { return }
+            // A reinstall / second device lost the local profile — recover it
+            // from the private-DB pointer so invites keep working.
+            await invitations.recoverProfileIfNeeded()
+            // First entry into the sharing feature = the contextual moment to
+            // ask for notification permission (invites/new photos alerts).
+            await NotificationManager.shared.requestAuthorizationIfNeeded()
             await store.loadAlbums()
             // Register silent push subscriptions for delta sync. Internally
             // gated on isAvailable AND not-running-tests, and idempotent — so
@@ -98,6 +122,10 @@ struct SharedAlbumsView: View {
             requests.loadLocalCache()
             await requests.refreshPendingRequests()
             await requests.registerRequestSubscriptionIfNeeded()
+            // Resume any interrupted upload (dedupe-safe) and recompute the
+            // "add new photos of X?" suggestions from local state.
+            await store.resumePendingUploads()
+            store.refreshSuggestions()
             // Durable ephemeral-face-zone cleanup: tear down any face zones a prior
             // send created but the fast-path 600s timer never reached (app
             // suspension). Gated on isAvailable AND not-running-tests internally, so
@@ -105,6 +133,19 @@ struct SharedAlbumsView: View {
             // privacy guarantee for the biometric embedding.
             await requests.sweepPendingEphemeralFaceZones()
         }
+    }
+
+    /// The delete/leave confirmation title, extracted — inline it was a
+    /// ternary-with-interpolations the type-checker choked on.
+    private var deleteDialogTitle: String {
+        guard let album = deleteTarget else { return "" }
+        return album.isOwnedByMe
+            ? "Delete \u{201C}\(album.name)\u{201D} for everyone?"
+            : "Leave \u{201C}\(album.name)\u{201D}?"
+    }
+
+    private func attachAlertsAndDialogs<V: View>(to view: V) -> some View {
+        view
         .alert("New Shared Album", isPresented: $showCreate) {
             TextField("Album name", text: $newName)
             Button("Create") { Task { await create() } }
@@ -119,6 +160,63 @@ struct SharedAlbumsView: View {
         } message: {
             Text(createError ?? "")
         }
+        .alert("Couldn't Complete That",
+               isPresented: Binding(get: { actionError != nil },
+                                    set: { if !$0 { actionError = nil } })) {
+            Button("OK", role: .cancel) { actionError = nil }
+        } message: {
+            Text(actionError ?? "")
+        }
+        // Creation flows straight into inviting: friend invite (primary),
+        // share link (secondary), or later.
+        .confirmationDialog(
+            "\u{201C}\(createdAlbum?.name ?? "")\u{201D} created",
+            isPresented: $showPostCreateOptions,
+            titleVisibility: .visible,
+            presenting: createdAlbum
+        ) { album in
+            Button {
+                friendInviteAlbum = album
+            } label: {
+                Label("Invite Friend", systemImage: "person.badge.plus")
+            }
+            Button {
+                Task { await presentInvite(for: album) }
+            } label: {
+                Label("Share via Link", systemImage: "link")
+            }
+            Button("Later", role: .cancel) {}
+        } message: { _ in
+            Text("Invite people so they can view and add their own photos.")
+        }
+        // Delete (owner) / Leave (participant) confirmation.
+        .confirmationDialog(
+            deleteDialogTitle,
+            isPresented: Binding(get: { deleteTarget != nil },
+                                 set: { if !$0 { deleteTarget = nil } }),
+            titleVisibility: .visible,
+            presenting: deleteTarget
+        ) { album in
+            Button(album.isOwnedByMe ? "Delete Album" : "Leave Album", role: .destructive) {
+                deleteTarget = nil
+                Task {
+                    do { try await store.deleteAlbum(album) }
+                    catch {
+                        actionError = (error as? SharedAlbumError)?.localizedDescription
+                            ?? error.localizedDescription
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { deleteTarget = nil }
+        } message: { album in
+            Text(album.isOwnedByMe
+                 ? "The album, its photos, and everyone's access are removed. Photos stay in contributors' own libraries."
+                 : "The album disappears from your list. The owner and other members keep it.")
+        }
+    }
+
+    private func attachSheets<V: View>(to view: V) -> some View {
+        view
         // Present the invite (UICloudSharingController) once we have resolved the
         // album's LIVE CKShare from the server. This is the SECONDARY
         // "Share via Link" path; the primary path is the in-app friend invite.
@@ -142,7 +240,13 @@ struct SharedAlbumsView: View {
         .sheet(isPresented: $showRequestInbox) {
             RequestInboxView()
         }
-        // Pending banners: invitation + photo-request, each a tappable bar.
+    }
+
+    private func attachBanners<V: View>(to view: V) -> some View {
+        view
+        // Pending banners: invitation + photo-request, each a tappable bar,
+        // plus visible failure strips (inbox fetch + album load) — every prior
+        // failure here rendered as a cheerful empty state.
         .safeAreaInset(edge: .top) {
             VStack(spacing: 0) {
                 if !invitations.pendingInvitations.isEmpty {
@@ -158,6 +262,22 @@ struct SharedAlbumsView: View {
                         showRequestInbox = true
                     } label: {
                         bannerLabel(icon: "square.and.arrow.down.on.square.fill", text: requestBannerText)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if let inboxError = invitations.inboxError {
+                    Button {
+                        Task { await invitations.refreshPendingInvitations() }
+                    } label: {
+                        warningLabel(text: "Couldn't check invitations — tap to retry. (\(inboxError))")
+                    }
+                    .buttonStyle(.plain)
+                }
+                if case .error(let message) = store.state {
+                    Button {
+                        Task { await store.loadAlbums() }
+                    } label: {
+                        warningLabel(text: "\(message) Tap to retry.")
                     }
                     .buttonStyle(.plain)
                 }
@@ -190,6 +310,21 @@ struct SharedAlbumsView: View {
         .background(.bar)
     }
 
+    /// A thin, tappable warning strip for failures that would otherwise be
+    /// mistaken for "nothing here".
+    private func warningLabel(text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            Text(text).font(.caption)
+            Spacer()
+            Image(systemName: "arrow.clockwise").font(.caption)
+        }
+        .foregroundStyle(.orange)
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
     @ViewBuilder
     private var content: some View {
         if store.albums.isEmpty {
@@ -206,9 +341,31 @@ struct SharedAlbumsView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(creating)
+                // The empty state must be refreshable too — a just-accepted
+                // album otherwise required leaving and re-entering the screen.
+                Button {
+                    Task { await refreshEverything() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
             }
         } else {
             List {
+                // On-device auto-share suggestions: "12 new photos of Mom —
+                // add to Family?" Computed locally from face clusters ∩ the
+                // folder behind each shared album; photos upload only on Add.
+                if !store.suggestions.isEmpty {
+                    Section {
+                        ForEach(store.suggestions) { suggestion in
+                            SuggestionRow(suggestion: suggestion)
+                        }
+                    } header: {
+                        Text("Suggestions")
+                    } footer: {
+                        Text("Found on this device by the people in each album. Nothing uploads until you tap Add.")
+                    }
+                }
                 ForEach(store.albums) { album in
                     NavigationLink {
                         SharedAlbumDetailView(album: album)
@@ -217,8 +374,15 @@ struct SharedAlbumsView: View {
                     }
                     // Owners can invite a FRIEND in-app (primary) or share via a
                     // system link (secondary) — tapping the row OPENS the album
-                    // (Phase 4) rather than presenting an invite.
+                    // (Phase 4) rather than presenting an invite. Owners can
+                    // also DELETE the album; participants can LEAVE it.
                     .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            deleteTarget = album
+                        } label: {
+                            Label(album.isOwnedByMe ? "Delete" : "Leave",
+                                  systemImage: album.isOwnedByMe ? "trash" : "rectangle.portrait.and.arrow.right")
+                        }
                         if album.isOwnedByMe {
                             Button {
                                 friendInviteAlbum = album
@@ -241,6 +405,12 @@ struct SharedAlbumsView: View {
                                 Label("Share via Link", systemImage: "link")
                             }
                         }
+                        Button(role: .destructive) {
+                            deleteTarget = album
+                        } label: {
+                            Label(album.isOwnedByMe ? "Delete Album" : "Leave Album",
+                                  systemImage: album.isOwnedByMe ? "trash" : "rectangle.portrait.and.arrow.right")
+                        }
                     }
                 }
             }
@@ -248,8 +418,16 @@ struct SharedAlbumsView: View {
             .overlay {
                 if creating { ProgressView().controlSize(.large) }
             }
-            .refreshable { await store.loadAlbums() }
+            .refreshable { await refreshEverything() }
         }
+    }
+
+    /// One refresh to rule them all: albums AND both public inboxes, so a pull
+    /// (or the empty-state Refresh button) catches everything that can arrive.
+    private func refreshEverything() async {
+        await store.loadAlbums()
+        await invitations.refreshPendingInvitations()
+        await requests.refreshPendingRequests()
     }
 
     private func create() async {
@@ -260,8 +438,10 @@ struct SharedAlbumsView: View {
         defer { creating = false }
         do {
             let album = try await store.createAlbum(named: name)
-            // On success, resolve the share and present the invite sheet.
-            await presentInvite(for: album)
+            // Flow straight into inviting: friend invite (primary), link
+            // (secondary), or later — creation without an invite is a dead end.
+            createdAlbum = album
+            showPostCreateOptions = true
         } catch {
             createError = (error as? SharedAlbumError)?.localizedDescription
                 ?? error.localizedDescription
@@ -269,8 +449,8 @@ struct SharedAlbumsView: View {
     }
 
     /// Resolve the album's live CKShare, then present the invite sheet. Failures
-    /// (offline, unavailable) surface in the create-error alert and simply don't
-    /// open the sheet — no crash.
+    /// (offline, unavailable) surface in the generic action alert and simply
+    /// don't open the sheet — no crash.
     private func presentInvite(for album: SharedAlbum) async {
         preparingInvite = true
         defer { preparingInvite = false }
@@ -279,24 +459,88 @@ struct SharedAlbumsView: View {
                 for: album.zoneID, title: album.name)
             inviteTarget = InviteTarget(album: album, share: share)
         } catch {
-            createError = (error as? SharedAlbumError)?.localizedDescription
+            actionError = (error as? SharedAlbumError)?.localizedDescription
                 ?? error.localizedDescription
         }
     }
 }
 
-/// One album row: name, owner badge, photo count.
+/// One auto-share suggestion row: who + how many + Add / dismiss.
+private struct SuggestionRow: View {
+    let suggestion: SharedAlbumStore.ShareSuggestion
+    @ObservedObject private var store = SharedAlbumStore.shared
+    @State private var confirmAdd = false
+    @State private var adding = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.crop.rectangle.stack.fill")
+                .font(.title3)
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(suggestion.assetIDs.count) new photo\(suggestion.assetIDs.count == 1 ? "" : "s") of \(suggestion.peopleLabel)")
+                    .font(.subheadline.weight(.medium))
+                Text("Add to \u{201C}\(suggestion.albumName)\u{201D}?")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if adding {
+                ProgressView()
+            } else {
+                Button("Add") { confirmAdd = true }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                Button {
+                    store.dismissSuggestion(suggestion)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .confirmationDialog(
+            "Add \(suggestion.assetIDs.count) photo\(suggestion.assetIDs.count == 1 ? "" : "s") to \u{201C}\(suggestion.albumName)\u{201D}?",
+            isPresented: $confirmAdd, titleVisibility: .visible
+        ) {
+            Button("Add to Album") {
+                adding = true
+                Task {
+                    await store.acceptSuggestion(suggestion)
+                    adding = false
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They'll upload to the shared album and everyone in it can see them.")
+        }
+    }
+}
+
+/// One album row: cover (newest photo), name, owner badge, photo count.
 private struct SharedAlbumRow: View {
     let album: SharedAlbum
+    @ObservedObject private var store = SharedAlbumStore.shared
 
     var body: some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(.secondarySystemBackground))
-                Image(systemName: album.isOwnedByMe ? "person.2.fill" : "tray.and.arrow.down.fill")
-                    .font(.title3)
-                    .foregroundStyle(.tint)
+                if let data = store.coverThumbnail(for: album.id),
+                   let cover = UIImage(data: data) {
+                    Image(uiImage: cover)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 52, height: 52)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                } else {
+                    Image(systemName: album.isOwnedByMe ? "person.2.fill" : "tray.and.arrow.down.fill")
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                }
             }
             .frame(width: 52, height: 52)
 
@@ -366,9 +610,12 @@ struct CloudSharingControllerView: UIViewControllerRepresentable {
         func itemTitle(for csc: UICloudSharingController) -> String? { album.name }
 
         func itemThumbnailData(for csc: UICloudSharingController) -> Data? {
-            // TODO(upload-phase): use the album's cover photo bytes. Nil is valid
-            // — the system shows a generic icon.
-            nil
+            // The album's cover (newest photo thumbnail), when one exists —
+            // the invite sheet then shows a real preview instead of a generic
+            // icon. Delegate callbacks arrive on the main thread.
+            MainActor.assumeIsolated {
+                SharedAlbumStore.shared.coverThumbnail(for: album.id)
+            }
         }
 
         func cloudSharingController(_ csc: UICloudSharingController,
@@ -381,23 +628,8 @@ struct CloudSharingControllerView: UIViewControllerRepresentable {
         }
 
         func cloudSharingControllerDidSaveShare(_ csc: UICloudSharingController) {
-            // Record the participants we shared with for the "same people again"
-            // affordance, then refresh. A freshly invited (pending) participant
-            // has NO userRecordID yet — CloudKit only associates an iCloud user
-            // record once they accept — so we also key off the participant's
-            // lookupInfo (email / phone), which is populated at invite time. Once
-            // they accept and we re-fetch, the recordName path fills in too.
-            let participantIDs: [String] = (csc.share?.participants ?? [])
-                .compactMap { p -> String? in
-                    if let rec = p.userIdentity.userRecordID?.recordName { return rec }
-                    if let lookup = p.userIdentity.lookupInfo {
-                        if let email = lookup.emailAddress { return "email:\(email)" }
-                        if let phone = lookup.phoneNumber { return "phone:\(phone)" }
-                    }
-                    return nil
-                }
+            // Refresh so the new participant shows up in the People sheet.
             Task { @MainActor in
-                SharedAlbumStore.shared.noteShared(with: participantIDs)
                 await SharedAlbumStore.shared.loadAlbums()
             }
         }
@@ -414,7 +646,11 @@ struct CloudSharingControllerView: UIViewControllerRepresentable {
 
 /// A card consistent with FoldersGrid's other cards that navigates to the
 /// Shared Albums screen. Dropped into FoldersGrid as a "Shared Albums" section.
+/// Badges the count of pending invitations / photo requests so incoming shares
+/// are visible WITHOUT digging into the screen first.
 struct SharedAlbumsEntryCard: View {
+    var pendingCount: Int = 0
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Color(.secondarySystemBackground)
@@ -424,14 +660,27 @@ struct SharedAlbumsEntryCard: View {
                         .font(.system(size: 40))
                         .foregroundStyle(.tint)
                 }
+                .overlay(alignment: .topTrailing) {
+                    if pendingCount > 0 {
+                        Text("\(pendingCount)")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.red, in: Capsule())
+                            .padding(8)
+                    }
+                }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             Text("Shared Albums")
                 .font(.subheadline.bold())
                 .lineLimit(1)
                 .foregroundStyle(.primary)
-            Text("Share with people")
+            Text(pendingCount > 0
+                 ? "\(pendingCount) waiting for you"
+                 : "Share with people")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(pendingCount > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                 .lineLimit(1)
         }
         .contentShape(Rectangle())

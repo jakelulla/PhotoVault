@@ -494,8 +494,9 @@ enum RequestFulfillment {
         // partial/failed upload throws (or returns 0), so we NEVER invite + report
         // success while leaving the requester an empty album and the request gone.
         let album = try await albumStore.createAlbum(named: albumName)
-        let saved = try await albumStore.addPhotosReportingCount(
+        let outcome = try await albumStore.addPhotosReportingCount(
             localAssetIDs: keptAssetIDs, toAlbum: album)
+        let saved = outcome.saved
         guard saved > 0 else {
             throw SharedAlbumError.cloudKit(
                 "Couldn't upload the photos. Your request is still pending — try sharing again.")

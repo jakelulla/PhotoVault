@@ -1,4 +1,5 @@
 import CloudKit
+import CoreLocation
 import CryptoKit
 import Foundation
 import Photos
@@ -52,10 +53,6 @@ final class SharedAlbumStore: ObservableObject {
     /// detail view's alert binding can clear it on dismiss.
     @Published var albumAlert: [String: AlbumAlert] = [:]
 
-    /// iCloud user record names we have ever shared an album with — powers a
-    /// future "share with the same people again" affordance. Persisted locally.
-    @Published private(set) var knownParticipantIDs: Set<String> = []
-
     /// Photos currently loaded for the OPEN album, keyed by album id. Thumbnails
     /// are stored alongside as in-memory bytes; full images are pulled lazily.
     /// The detail view observes this; only the album it opened is populated.
@@ -72,9 +69,59 @@ final class SharedAlbumStore: ObservableObject {
     /// Albums currently performing a network load of their photos.
     @Published private(set) var loadingPhotos: Set<String> = []
 
+    /// Set when a share was just accepted (via link tap or in-app invite) so the
+    /// UI can confirm it — carries the album title. The view clears it.
+    @Published var acceptedShareToast: String?
+
+    /// Per-album save-to-library progress in [0, 1]; absent when idle.
+    @Published private(set) var savingToLibrary: [String: Double] = [:]
+
+    /// Resolved display names for share participants, keyed by userRecordID.
+    /// Populated lazily per album (viewer attribution, comments). "You" is
+    /// handled by the caller via `myRecordName`.
+    @Published private(set) var participantNames: [String: String] = [:]
+
+    /// The current user's CloudKit record name, cached after first resolve —
+    /// used to render "you" in attribution and to key reactions.
+    @Published private(set) var myRecordName: String?
+
+    /// In-memory album cover thumbnails (JPEG bytes), persisted per album to
+    /// disk so the list shows covers across launches without opening albums.
+    @Published private(set) var coverCache: [String: Data] = [:]
+
+    /// Reactions/comments on shared photos, keyed by photo record name. Loaded
+    /// with the album's photos (same zone) and updated by delta sync.
+    @Published private(set) var reactionsByPhoto: [String: [SharedReaction]] = [:]
+    @Published private(set) var commentsByPhoto: [String: [SharedComment]] = [:]
+
     /// True once CKDatabaseSubscriptions have been registered this launch, so we
     /// don't re-register on every view appearance. Reset only on relaunch.
     private var subscriptionsRegistered = false
+
+    /// Share metadata whose accepts failed on a TRANSIENT account status (e.g.
+    /// keychain still locked right after cold launch). iOS never redelivers the
+    /// metadata, so we queue them (a user can tap several links while iCloud is
+    /// waking up) and retry when availability recovers — from BOTH
+    /// `refreshAvailability()` (Shared Albums screen) and `onAppActivate()`
+    /// (next foregrounding), so the retry doesn't depend on a manual visit.
+    private var pendingAcceptMetadatas: [CKShare.Metadata] = []
+
+    /// Album ids whose photos have been FULLY loaded (a whole-zone fetch this
+    /// launch). Guards the photo-count bookkeeping: a delta sync into an album
+    /// we never fully loaded must not clobber the count with the delta's size.
+    private var fullyLoadedAlbums: Set<String> = []
+
+    /// Monotonic generation for loadAlbums. Concurrent loads (accept-triggered,
+    /// pull-to-refresh, the delayed post-accept reload) can finish out of order;
+    /// only the NEWEST load may overwrite `albums`, or a stale fetch would
+    /// visibly erase a just-accepted album. Local mutations (create, delete,
+    /// sync-inserted albums) ALSO bump it, so an in-flight load can't publish a
+    /// pre-mutation snapshot that resurrects a deleted album or drops a new one.
+    private var loadEpoch = 0
+
+    /// Albums with an add-photos call currently in flight. Guards against
+    /// concurrent uploads into one album racing the contentHash dedupe.
+    private var uploadsInFlight: Set<String> = []
 
     private let cloud = CloudKitService.shared
 
@@ -95,8 +142,16 @@ final class SharedAlbumStore: ObservableObject {
     }()
 
     private static var albumsCacheURL: URL { storeDir.appendingPathComponent("shared_albums.json") }
-    private static var participantsURL: URL { storeDir.appendingPathComponent("shared_participants.json") }
     private static var changeTokensURL: URL { storeDir.appendingPathComponent("shared_change_tokens.json") }
+    private static var folderLinksURL: URL { storeDir.appendingPathComponent("folder_share_links.json") }
+
+    /// folderID → albumID for folders that were shared as albums. Lets a
+    /// re-share (or a retry after a failed upload) REUSE the existing album
+    /// instead of minting a duplicate zone every time. Persisted locally;
+    /// hydrated lazily (`loadFolderLinksIfNeeded`) so the reuse check works even
+    /// when the user goes straight to a folder without visiting Shared Albums.
+    private var folderAlbumLinks: [String: String] = [:]
+    private var folderLinksLoaded = false
 
     /// In-memory copy of the persisted server-change-token cache. Loaded lazily
     /// (and only when CloudKit is available), so it never touches disk at launch
@@ -110,7 +165,7 @@ final class SharedAlbumStore: ObservableObject {
 
     // MARK: - Local cache
 
-    /// Hydrate `albums` + `knownParticipantIDs` from disk. Pure local I/O; never
+    /// Hydrate `albums` + folder links from disk. Pure local I/O; never
     /// touches CloudKit. Tolerant of missing/corrupt files (treats as empty).
     func loadLocalCache() {
         let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
@@ -118,22 +173,30 @@ final class SharedAlbumStore: ObservableObject {
            let cached = try? dec.decode([SharedAlbum].self, from: data) {
             albums = cached
         }
-        if let data = try? Data(contentsOf: Self.participantsURL),
-           let ids = try? JSONDecoder().decode(Set<String>.self, from: data) {
-            knownParticipantIDs = ids
+        if let data = try? Data(contentsOf: Self.folderLinksURL),
+           let links = try? JSONDecoder().decode([String: String].self, from: data) {
+            folderAlbumLinks = links
+        }
+        folderLinksLoaded = true
+    }
+
+    /// Hydrate just the folder→album links from disk, once. Pure local I/O.
+    private func loadFolderLinksIfNeeded() {
+        guard !folderLinksLoaded else { return }
+        folderLinksLoaded = true
+        if let data = try? Data(contentsOf: Self.folderLinksURL),
+           let links = try? JSONDecoder().decode([String: String].self, from: data) {
+            folderAlbumLinks = links
         }
     }
 
     private func persistCache() {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
         try? enc.encode(albums).write(to: Self.albumsCacheURL, options: .atomic)
-        try? JSONEncoder().encode(knownParticipantIDs).write(to: Self.participantsURL, options: .atomic)
     }
 
-    private func rememberParticipants(_ ids: [String]) {
-        let before = knownParticipantIDs.count
-        knownParticipantIDs.formUnion(ids)
-        if knownParticipantIDs.count != before { persistCache() }
+    private func persistFolderLinks() {
+        try? JSONEncoder().encode(folderAlbumLinks).write(to: Self.folderLinksURL, options: .atomic)
     }
 
     // MARK: - Availability
@@ -149,6 +212,10 @@ final class SharedAlbumStore: ObservableObject {
             // out of an `.unavailable` state so the UI can offer actions; leave
             // any in-flight `.loading`/`.ready`/`.error` state untouched.
             if case .unavailable = state { state = .idle }
+            // Share accepts that failed on a transient account status are
+            // parked (iOS never redelivers the metadata). Availability just
+            // recovered — retry them now.
+            await retryParkedAccepts()
         } else {
             state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
         }
@@ -202,7 +269,10 @@ final class SharedAlbumStore: ObservableObject {
             let share = try await cloud.fetchOrCreateShare(for: zone.zoneID, title: name)
             album.shareRecordName = share.recordID.recordName
 
-            // 5. Reflect locally.
+            // 5. Reflect locally. Bump the load epoch so an in-flight
+            //    loadAlbums (started before this create) can't publish a
+            //    pre-create snapshot that drops the new album.
+            loadEpoch += 1
             albums.append(album)
             persistCache()
             state = .ready
@@ -221,42 +291,79 @@ final class SharedAlbumStore: ObservableObject {
 
     // MARK: - Share an existing folder
 
-    /// Turn one of the user's normal (non-smart) folders into a shared album:
-    /// create a shared album named after the folder, then upload the folder's
-    /// member photos into it. Returns the created album so the caller can present
-    /// the invite UI (in-app friend invite / share link) — the SAME affordances a
-    /// freshly created shared album gets. Reuses `createAlbum` +
-    /// `addPhotosReportingCount` verbatim; adds no new upload/invite logic.
+    /// Resolve the shared album a folder should upload into: the album this
+    /// folder was ALREADY shared as (via the persisted folderID → albumID link),
+    /// or a freshly created one. This is the anti-duplication keystone — every
+    /// "Share Album" tap, retry, and re-share of the same folder lands on ONE
+    /// album instead of minting a new zone each time.
     ///
-    /// `localAssetIDs` are the folder's `photoAssetIDs` (device-local PHAsset
-    /// identifiers). We filter them down to the ones that still resolve to real
-    /// PHAssets (so a folder member that has since been removed from the library
-    /// is silently skipped rather than failing the whole upload).
+    /// The caller uploads separately (`addPhotosReportingCount`, which dedupes by
+    /// contentHash), so a retried/repeated share adds only NEW photos. Gated
+    /// identically to the rest of the stack: fails fast with `.unavailable` on
+    /// the simulator / signed out, so it stays inert in the regression gate.
     ///
-    /// Gated identically to the rest of the stack: fails fast with `.unavailable`
-    /// on the simulator / signed out (via `createAlbum`), so it stays inert in the
-    /// regression gate. Throws `SharedAlbumError` on any failure. On an
-    /// empty/all-missing input it throws `.cloudKit` with a friendly message
-    /// rather than creating an empty album with nothing in it — but note the album
-    /// HAS already been created at that point (its records live in the owner's
-    /// private DB); the caller surfaces the message and the empty album can be
-    /// managed like any other from the Shared Albums screen.
+    /// A stale link (the album was deleted from another device / the Dashboard)
+    /// is detected by checking the server's zone list and dropped, falling
+    /// through to a fresh create.
     @discardableResult
-    func shareFolder(named rawName: String, localAssetIDs: [String]) async throws -> SharedAlbum {
-        // Filter to asset IDs that still resolve to real library assets, skipping
-        // any that have since been deleted from the photo library.
-        let resolvable = Self.resolvableAssetIDs(from: localAssetIDs)
-        guard !resolvable.isEmpty else {
-            throw SharedAlbumError.cloudKit(
-                "This folder has no photos still in your library to share.")
+    func shareFolder(folderID: String?, named rawName: String) async throws -> SharedAlbum {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else {
+            let reason = "Sign in to iCloud to use Shared Albums"
+            state = .unavailable(reason: reason)
+            throw SharedAlbumError.unavailable(reason: reason)
         }
-        // 1. Create the album (this is also the availability gate — throws
-        //    `.unavailable` on the simulator / signed out before any upload work).
+
+        // Reuse the album this folder was previously shared as, if it still
+        // exists server-side.
+        loadFolderLinksIfNeeded()
+        if let folderID, let linkedID = folderAlbumLinks[folderID] {
+            // PROPAGATE a zone-list fetch failure (flaky network etc.) instead
+            // of `try?`-swallowing it: a transient error must surface as a
+            // retryable failure, NOT be mistaken for "the album is gone" — that
+            // would erase the link and mint a duplicate album on the retry.
+            let zones: [CKRecordZone]
+            do {
+                zones = try await cloud.fetchPrivateAlbumZones()
+            } catch {
+                throw cloud.map(error)
+            }
+            if let zone = zones.first(where: { $0.zoneID.zoneName == linkedID }) {
+                if let cached = albums.first(where: { $0.id == linkedID && $0.isOwnedByMe }) {
+                    return cached
+                }
+                if let album = await albumFromZone(zone.zoneID, in: cloud.privateDB, ownedByMe: true) {
+                    upsertAlbum(album)
+                    return album
+                }
+            }
+            // The fetch SUCCEEDED and the linked zone is genuinely absent
+            // (deleted from another device / the Dashboard) — drop the stale
+            // link and fall through to a fresh create.
+            folderAlbumLinks[folderID] = nil
+            persistFolderLinks()
+        }
+
         let album = try await createAlbum(named: rawName)
-        // 2. Upload the folder's members. Reuses the count-reporting variant so a
-        //    hard failure throws; partial failures are tolerated inside it.
-        _ = try await addPhotosReportingCount(localAssetIDs: resolvable, toAlbum: album)
+        if let folderID {
+            folderAlbumLinks[folderID] = album.id
+            persistFolderLinks()
+        }
         return album
+    }
+
+    /// Insert or replace an album in the published list, keeping the name sort.
+    /// Bumps the load epoch: an in-flight loadAlbums started before this upsert
+    /// must not publish a snapshot that lacks it.
+    private func upsertAlbum(_ album: SharedAlbum) {
+        loadEpoch += 1
+        if let idx = albums.firstIndex(where: { $0.id == album.id }) {
+            albums[idx] = album
+        } else {
+            albums.append(album)
+        }
+        albums.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        persistCache()
     }
 
     /// Filter a list of PHAsset local identifiers down to the ones that still
@@ -297,6 +404,12 @@ final class SharedAlbumStore: ObservableObject {
             return
         }
 
+        // Re-entrancy guard: several loads can be in flight (accept-triggered,
+        // pull-to-refresh, the delayed post-accept reload). Only the NEWEST may
+        // publish, or a stale fetch finishing last would erase newer albums.
+        loadEpoch += 1
+        let myEpoch = loadEpoch
+
         state = .loading
         var collected: [SharedAlbum] = []
         var sawAnyError = false
@@ -305,11 +418,7 @@ final class SharedAlbumStore: ObservableObject {
         do {
             let zones = try await cloud.fetchPrivateAlbumZones()
             SharedAlbumLog.logger.notice("loadAlbums: \(zones.count) private zone(s)")
-            for zone in zones {
-                if let album = await albumFromZone(zone, in: cloud.privateDB, ownedByMe: true) {
-                    collected.append(album)
-                }
-            }
+            collected += await albumsFromZones(zones, in: cloud.privateDB, ownedByMe: true)
         } catch {
             sawAnyError = true
             SharedAlbumLog.logger.error("loadAlbums: private-zone fetch FAILED — \(self.cloud.map(error).localizedDescription, privacy: .public)")
@@ -320,16 +429,15 @@ final class SharedAlbumStore: ObservableObject {
         do {
             let zones = try await cloud.fetchSharedAlbumZones()
             SharedAlbumLog.logger.notice("loadAlbums: \(zones.count) shared zone(s)")
-            for zone in zones {
-                if let album = await albumFromZone(zone, in: cloud.sharedDB, ownedByMe: false) {
-                    collected.append(album)
-                }
-            }
+            collected += await albumsFromZones(zones, in: cloud.sharedDB, ownedByMe: false)
         } catch {
             sawAnyError = true
             SharedAlbumLog.logger.error("loadAlbums: shared-zone fetch FAILED — \(self.cloud.map(error).localizedDescription, privacy: .public)")
         }
         SharedAlbumLog.logger.notice("loadAlbums: \(collected.count) album(s) total")
+
+        // A newer load started while we were fetching — discard this result.
+        guard myEpoch == loadEpoch else { return }
 
         // If we got nothing AND every fetch errored, keep the cache and report
         // an error; otherwise adopt the fresh (possibly partial) server view.
@@ -343,24 +451,47 @@ final class SharedAlbumStore: ObservableObject {
         state = sawAnyError
             ? .error(message: "Some Shared Albums couldn't be loaded.")
             : .ready
+        // Keep the widget / share extension's snapshot fresh.
+        AppGroupSummaryWriter.refresh()
+    }
+
+    /// Map a batch of zones to albums CONCURRENTLY (each album costs up to two
+    /// record fetches — share + root — and doing 2N round-trips serially made
+    /// every refresh feel slow). Order is restored to the input zone order;
+    /// callers re-sort by name anyway.
+    private func albumsFromZones(_ zones: [CKRecordZone],
+                                 in database: CKDatabase,
+                                 ownedByMe: Bool) async -> [SharedAlbum] {
+        await withTaskGroup(of: (Int, SharedAlbum?).self) { group in
+            for (idx, zone) in zones.enumerated() {
+                group.addTask { @MainActor [weak self] in
+                    (idx, await self?.albumFromZone(zone.zoneID, in: database, ownedByMe: ownedByMe))
+                }
+            }
+            var indexed: [(Int, SharedAlbum)] = []
+            for await (idx, album) in group {
+                if let album { indexed.append((idx, album)) }
+            }
+            return indexed.sorted { $0.0 < $1.0 }.map(\.1)
+        }
     }
 
     /// Map one zone to a SharedAlbum by reading its root album record. Returns
     /// nil (skipping the album) if the root record is missing/malformed, so a
     /// single bad zone never sinks the whole load.
-    private func albumFromZone(_ zone: CKRecordZone,
+    private func albumFromZone(_ zoneID: CKRecordZone.ID,
                                in database: CKDatabase,
                                ownedByMe: Bool) async -> SharedAlbum? {
         let rootID = CKRecord.ID(recordName: SharedAlbum.RecordType.albumRootRecordName,
-                                 zoneID: zone.zoneID)
+                                 zoneID: zoneID)
         // Best-effort: the zone-wide share carries the album title + owner and is
         // needed for the invite sheet later. Tolerate its absence.
         var share: CKShare?
-        let shareID = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zone.zoneID)
+        let shareID = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zoneID)
         if let fetched = try? await cloud.fetchRecord(shareID, from: database) as? CKShare {
             share = fetched
         }
-        let cached = albums.first { $0.id == zone.zoneID.zoneName }
+        let cached = albums.first { $0.id == zoneID.zoneName }
         let count = cached?.photoCount ?? 0
 
         // Preferred: full metadata from the album-root record.
@@ -376,77 +507,274 @@ final class SharedAlbumStore: ObservableObject {
         // appeared). Synthesize it from the zone + the share's title; it fills in
         // with the real record on the next refresh once the root is reachable.
         SharedAlbumLog.logger.info(
-            "loadAlbums: album-root not fetchable for zone \(zone.zoneID.zoneName, privacy: .public) db=\(ownedByMe ? "private" : "shared", privacy: .public) — showing fallback")
+            "loadAlbums: album-root not fetchable for zone \(zoneID.zoneName, privacy: .public) db=\(ownedByMe ? "private" : "shared", privacy: .public) — showing fallback")
         let title = share?[CKShare.SystemFieldKey.title] as? String
         let ownerName = share?.owner.userIdentity.nameComponents
             .map { PersonNameComponentsFormatter().string(from: $0) }
         return SharedAlbum(
-            id: zone.zoneID.zoneName,
+            id: zoneID.zoneName,
             name: cached?.name ?? (title?.isEmpty == false ? title! : "Shared Album"),
             ownerName: ownedByMe ? nil : (cached?.ownerName ?? ownerName),
             isOwnedByMe: ownedByMe,
             recordName: SharedAlbum.RecordType.albumRootRecordName,
-            zoneName: zone.zoneID.zoneName,
-            zoneOwnerName: zone.zoneID.ownerName,
+            zoneName: zoneID.zoneName,
+            zoneOwnerName: zoneID.ownerName,
             shareRecordName: share?.recordID.recordName,
             photoCount: count)
     }
 
     // MARK: - Accept share
 
-    /// Accept an incoming share (driven by the app-delegate hook). After accept,
-    /// reload so the newly shared-in album appears. Guards on availability.
+    /// Accept an incoming share (driven by the scene-delegate hook or the in-app
+    /// invitation inbox). After accept, reload so the newly shared-in album
+    /// appears, register the sync subscriptions (the user may never visit the
+    /// Shared Albums screen this launch), and set a confirmation toast.
+    ///
+    /// Cold-launch resilience: right after launch the account status often reads
+    /// `.couldNotDetermine`/`.temporarilyUnavailable` for a moment even though
+    /// the user IS signed in — and iOS never redelivers share metadata. So we
+    /// retry the availability check briefly, and if it still fails we PARK the
+    /// metadata; `refreshAvailability()` retries it the moment iCloud recovers.
     func acceptShare(_ metadata: CKShare.Metadata) async {
-        await cloud.accountStatus()
+        var status = await cloud.accountStatus()
+        var attempt = 0
+        while !cloud.isAvailable, status != .noAccount, status != .restricted, attempt < 4 {
+            attempt += 1
+            try? await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+            status = await cloud.accountStatus()
+        }
         guard cloud.isAvailable else {
+            pendingAcceptMetadatas.append(metadata)
             state = .unavailable(reason: "Sign in to iCloud to use Shared Albums")
+            SharedAlbumLog.logger.error(
+                "acceptShare: iCloud unavailable (status \(status.rawValue)) — parked metadata for retry (\(self.pendingAcceptMetadatas.count) pending)")
             return
         }
         do {
             try await cloud.acceptShare(metadata)
-            SharedAlbumLog.logger.notice("acceptShare: accepted, reloading albums")
-            await loadAlbums()
-            // The accepted zone can take a moment to surface in the shared DB;
-            // reload once more after a short delay so the new album appears
-            // without the user needing to pull-to-refresh.
+        } catch {
+            // Tolerate an ALREADY-ACCEPTED share (the user re-tapped an old
+            // link): if the share's zone is reachable in our shared DB, the
+            // acceptance is a fact — treat it as success instead of erroring.
+            let target = metadata.share.recordID.zoneID
+            let zones = (try? await cloud.fetchAllSharedZones()) ?? []
+            let alreadyJoined = zones.contains {
+                $0.zoneID.zoneName == target.zoneName && $0.zoneID.ownerName == target.ownerName
+            }
+            guard alreadyJoined else {
+                let msg = cloud.map(error).localizedDescription
+                SharedAlbumLog.logger.error("acceptShare: FAILED — \(msg, privacy: .public)")
+                state = .error(message: msg)
+                return
+            }
+        }
+        SharedAlbumLog.logger.notice("acceptShare: accepted, reloading albums")
+        acceptedShareToast = (metadata.share[CKShare.SystemFieldKey.title] as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "Shared album"
+        await reloadAfterAccept()
+        // Make sure sync pushes flow even if the user never opens the
+        // Shared Albums screen this launch. Idempotent + internally gated.
+        await registerSubscriptionsIfNeeded()
+    }
+
+    /// Reload albums, then reload once more after a short delay: a just-accepted
+    /// zone can lag before it surfaces in the shared DB's zone list, and this
+    /// spares the user a manual pull-to-refresh. Used by BOTH accept paths (link
+    /// tap and in-app invitation). The delayed pass runs in an unstructured task
+    /// so the caller's UI (e.g. the Accept button spinner) isn't held hostage
+    /// for 3 extra seconds; the loadAlbums epoch guard makes it race-safe.
+    func reloadAfterAccept() async {
+        await loadAlbums()
+        Task { @MainActor in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             await loadAlbums()
-        } catch {
-            let msg = cloud.map(error).localizedDescription
-            SharedAlbumLog.logger.error("acceptShare: FAILED — \(msg, privacy: .public)")
-            state = .error(message: msg)
+        }
+    }
+
+    // MARK: - Delete / leave
+
+    /// Delete an album we OWN (removes it for everyone — the zone, its photos,
+    /// and the share), or LEAVE an album shared with us (deletes the zone from
+    /// OUR shared database, which removes only our participation; the owner's
+    /// copy is untouched). Cleans every local trace either way. Throws a
+    /// `SharedAlbumError` the view surfaces.
+    func deleteAlbum(_ album: SharedAlbum) async throws {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else {
+            let reason = "Sign in to iCloud to use Shared Albums"
+            state = .unavailable(reason: reason)
+            throw SharedAlbumError.unavailable(reason: reason)
+        }
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        do {
+            try await cloud.deleteZone(album.zoneID, in: database)
+        } catch SharedAlbumError.zoneNotFound {
+            // Already gone server-side — proceed to clean up locally.
+        }
+        // Bump the load epoch so an in-flight loadAlbums (started before the
+        // delete) can't publish a stale snapshot that resurrects this album.
+        loadEpoch += 1
+        albums.removeAll { $0.id == album.id }
+        photosByAlbum[album.id] = nil
+        fullyLoadedAlbums.remove(album.id)
+        tokenCache.removeZone(album.zoneID)
+        persistTokenCache()
+        let linkedFolders = folderAlbumLinks.filter { $0.value == album.id }.map(\.key)
+        if !linkedFolders.isEmpty {
+            for key in linkedFolders { folderAlbumLinks[key] = nil }
+            persistFolderLinks()
+        }
+        persistCache()
+    }
+
+    // MARK: - Participants (People sheet + sender's acceptance feedback)
+
+    /// The people on an album's share, as displayable value types. Fetches the
+    /// LIVE zone-wide CKShare from the album's home database, so the sender can
+    /// see who has actually JOINED (CloudKit's acceptance status) — the in-app
+    /// invite path's only feedback loop. Returns nil when the share isn't
+    /// fetchable (unavailable, or the album was never shared).
+    func participants(for album: SharedAlbum) async -> [AlbumParticipant]? {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return nil }
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        let shareID = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: album.zoneID)
+        guard let share = try? await cloud.fetchRecord(shareID, from: database) as? CKShare else {
+            return nil
+        }
+        let me = share.currentUserParticipant
+        return share.participants.map { p in
+            let recordName = p.userIdentity.userRecordID?.recordName
+            var name: String
+            if let components = p.userIdentity.nameComponents {
+                name = PersonNameComponentsFormatter().string(from: components)
+            } else {
+                name = ""
+            }
+            if name.isEmpty {
+                name = p.userIdentity.lookupInfo?.emailAddress
+                    ?? p.userIdentity.lookupInfo?.phoneNumber
+                    ?? "Member"
+            }
+            let status: String
+            switch p.acceptanceStatus {
+            case .accepted: status = "Joined"
+            case .pending:  status = "Invited"
+            case .removed:  status = "Removed"
+            default:        status = ""
+            }
+            return AlbumParticipant(
+                id: recordName ?? UUID().uuidString,
+                displayName: name,
+                userRecordID: recordName,
+                isOwner: p.role == .owner,
+                isMe: p == me,
+                status: status,
+                canWrite: p.permission == .readWrite)
+        }
+    }
+
+    // MARK: - App-activation refresh
+
+    /// Called when the app becomes active. If the user actually USES shared
+    /// albums (there is local evidence: cached albums or folder links), register
+    /// the push subscriptions and run a delta sync — so invitations and new
+    /// photos arrive even when the user hasn't visited the Shared Albums screen
+    /// this launch. Internally gated (tests, availability), so it stays inert in
+    /// the regression gate and on the simulator.
+    func onAppActivate() async {
+        guard !Self.runningTests else { return }
+        // Hydrate from disk only when nothing is loaded yet — never clobber a
+        // fresher in-memory server view with the stale cache.
+        if albums.isEmpty && folderAlbumLinks.isEmpty { loadLocalCache() }
+        // Parked share accepts retry as soon as iCloud recovers — even for a
+        // user with no albums yet (a first-ever incoming share lands here).
+        if !pendingAcceptMetadatas.isEmpty {
+            await cloud.accountStatus()
+            if cloud.isAvailable { await retryParkedAccepts() }
+        }
+        guard !albums.isEmpty || !folderAlbumLinks.isEmpty else { return }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return }
+        await registerSubscriptionsIfNeeded()
+        await syncChanges()
+        // Pick up any upload the last session didn't finish (dedupe-safe),
+        // then recompute the local auto-share suggestions.
+        await resumePendingUploads()
+        refreshSuggestions()
+    }
+
+    /// Drain the parked share-accept queue (metadata iOS delivered while
+    /// iCloud was transiently unavailable — it is never redelivered).
+    private func retryParkedAccepts() async {
+        guard !pendingAcceptMetadatas.isEmpty else { return }
+        let parked = pendingAcceptMetadatas
+        pendingAcceptMetadatas = []
+        for metadata in parked {
+            await acceptShare(metadata)
         }
     }
 
     // MARK: - Contribute photos (Phase 3)
 
+    /// What actually happened to one "add photos" request: how many photos newly
+    /// saved, how many were skipped because their bytes are ALREADY in the album
+    /// (contentHash dedupe — retries and re-shares never duplicate), and how many
+    /// couldn't be read off the library (iCloud-optimized originals that failed
+    /// to materialize). `saved == 0` with `duplicates > 0` means "everything was
+    /// already there" — success, nothing new.
+    struct AddPhotosOutcome: Equatable {
+        var saved: Int = 0
+        var duplicates: Int = 0
+        var unreadable: Int = 0
+    }
+
     /// Upload local library assets (by `localIdentifier`) into a shared album.
     /// For each asset we fetch full-res JPEG bytes + a ~256px thumbnail via
     /// PhotoLibraryModel, write them to temp files, then hand the batch to
     /// CloudKitService.uploadPhotos. Progress is published per-album; partial
-    /// failures are tolerated (some photos may upload while others fail). The
-    /// album's `photoCount` is bumped optimistically by the number that saved.
+    /// failures are tolerated (some photos may upload while others fail).
     ///
-    /// Guards on availability up front, so it is inert on the simulator / in
-    /// tests. Always clears `uploadProgress` for the album on exit.
-    func addPhotos(localAssetIDs: [String], toAlbum album: SharedAlbum) async {
-        _ = try? await addPhotosReportingCount(localAssetIDs: localAssetIDs, toAlbum: album)
-    }
-
-    /// Like `addPhotos`, but RETURNS the number of photos that actually saved and
-    /// THROWS on a hard upload failure. This is the variant share-back uses so it
-    /// can gate the invite + "Shared N photos" message + markFulfilled on a
-    /// verified non-zero upload — never reporting success for an empty/failed
+    /// RETURNS the outcome (saved / duplicate / unreadable
+    /// counts) and THROWS on a hard upload failure. This is the variant share-back
+    /// uses so it can gate the invite + "Shared N photos" message + markFulfilled
+    /// on a verified non-zero upload — never reporting success for an empty/failed
     /// album (the original `addPhotos` swallowed all errors, so a friend could be
     /// told "Shared 5 photos" while the requester got an EMPTY album and the
     /// request was gone forever).
     ///
+    /// Dedupe: before uploading we fetch the album's existing contentHashes (a
+    /// cheap, asset-free zone enumeration) and skip photos whose bytes are
+    /// already there — so a retried upload, a re-shared folder, or the same photo
+    /// picked twice never produces duplicates.
+    ///
     /// Throws `SharedAlbumError` on unavailability, unreadable inputs, or a CK
-    /// upload failure. Returns 0 only when there were no inputs (callers should
-    /// treat 0 as "nothing shared"). Still updates published progress/cache state.
+    /// upload failure. Still updates published progress/cache state.
     @discardableResult
-    func addPhotosReportingCount(localAssetIDs: [String], toAlbum album: SharedAlbum) async throws -> Int {
-        guard !localAssetIDs.isEmpty else { return 0 }
+    func addPhotosReportingCount(localAssetIDs: [String], toAlbum album: SharedAlbum) async throws -> AddPhotosOutcome {
+        guard !localAssetIDs.isEmpty else { return AddPhotosOutcome() }
+        // Per-album in-flight guard: two concurrent adds into the same album
+        // would race the contentHash dedupe (both read the hash set before
+        // either finishes writing → duplicates) and fight over one progress
+        // slot. Reachable by re-opening ShareFolderView mid-upload or adding
+        // from the detail view while a folder share is still uploading.
+        guard !uploadsInFlight.contains(album.id) else {
+            throw SharedAlbumError.uploadAlreadyInProgress
+        }
+        uploadsInFlight.insert(album.id)
+        defer { uploadsInFlight.remove(album.id) }
+
+        // Background resilience (#7): ask iOS for extra time so leaving the app
+        // mid-upload finishes the current work instead of freezing it, and
+        // persist the intent so an interrupted upload RESUMES on next activate
+        // (contentHash dedupe makes the resume re-add only what's missing).
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "shared-album-upload")
+        defer {
+            if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+        }
+        notePendingUpload(albumID: album.id, assetIDs: localAssetIDs)
+        var uploadCompleted = false
+        defer { if uploadCompleted { clearPendingUpload(albumID: album.id) } }
         await cloud.accountStatus()
         guard cloud.isAvailable else {
             let reason = "Sign in to iCloud to use Shared Albums"
@@ -479,6 +807,7 @@ final class SharedAlbumStore: ObservableObject {
                 payloads.append(payload)
             }
         }
+        let unreadable = phAssets.count - payloads.count
         SharedAlbumLog.logger.info(
             "addPhotos: built \(payloads.count)/\(phAssets.count) payload(s)")
 
@@ -491,7 +820,43 @@ final class SharedAlbumStore: ObservableObject {
             state = .error(message: msg)
             setAlbumAlert(album.id, title: "Couldn't Add Photos", message: msg)
             SharedAlbumLog.logger.error("addPhotos: no payloads (phAssets=\(phAssets.count))")
+            // Terminal for auto-resume: the inputs themselves are unreadable —
+            // retrying on every activation wouldn't change that.
+            uploadCompleted = true
             throw SharedAlbumError.cloudKit(msg)
+        }
+
+        // 1a. Dedupe against what's ALREADY in the album (by contentHash), so a
+        //     retry / re-share / double-pick never duplicates a photo. Best
+        //     effort: if the hash fetch fails we upload everything (the old
+        //     behavior) rather than failing the add.
+        var duplicates = 0
+        let existingHashes = (try? await cloud.existingContentHashes(
+            inZone: album.zoneID, database: database)) ?? []
+        if !existingHashes.isEmpty {
+            var kept: [SharedPhotoUploadPayload] = []
+            for payload in payloads {
+                if let hash = payload.contentHash, existingHashes.contains(hash) {
+                    duplicates += 1
+                    // The uploader never sees these payloads, so their temp
+                    // files are ours to clean up.
+                    try? FileManager.default.removeItem(at: payload.fullImageURL)
+                    try? FileManager.default.removeItem(at: payload.thumbnailURL)
+                } else {
+                    kept.append(payload)
+                }
+            }
+            payloads = kept
+            if duplicates > 0 {
+                SharedAlbumLog.logger.info("addPhotos: skipped \(duplicates) duplicate(s) by contentHash")
+            }
+        }
+
+        // Everything requested is already in the album — success, nothing to do.
+        guard !payloads.isEmpty else {
+            albumAlert[album.id] = nil
+            uploadCompleted = true
+            return AddPhotosOutcome(saved: 0, duplicates: duplicates, unreadable: unreadable)
         }
 
         // 2. Verify the album-root parent target exists in the TARGET database
@@ -551,17 +916,25 @@ final class SharedAlbumStore: ObservableObject {
                              recentThumbnails: result.savedThumbnails)
 
             // 3d. Report a partial failure (some saved, some rejected) with the
-            //     concrete reason; otherwise clear any stale alert.
+            //     concrete reason; otherwise clear any stale alert. An unreadable
+            //     shortfall (assets whose bytes never materialized) is reported
+            //     too — silently missing photos looked like success to BOTH users.
             if result.savedCount < payloads.count {
                 let detail = result.firstError.map { cloud.map($0).localizedDescription }
                 let msg = detail.map { "Some photos couldn't be added: \($0)" }
                     ?? "Some photos couldn't be added."
                 state = .error(message: msg)
                 setAlbumAlert(album.id, title: "Some Photos Not Added", message: msg)
+            } else if unreadable > 0 {
+                let msg = "\(unreadable) photo\(unreadable == 1 ? "" : "s") couldn't be read from your library (possibly still downloading from iCloud) and \(unreadable == 1 ? "wasn't" : "weren't") added. Try adding \(unreadable == 1 ? "it" : "them") again in a moment."
+                setAlbumAlert(album.id, title: "Some Photos Skipped", message: msg)
             } else {
                 albumAlert[album.id] = nil
             }
-            return result.savedCount
+            uploadCompleted = true
+            return AddPhotosOutcome(saved: result.savedCount,
+                                    duplicates: duplicates,
+                                    unreadable: unreadable)
         } catch {
             let mapped = cloud.map(error)
             state = .error(message: mapped.localizedDescription)
@@ -588,9 +961,20 @@ final class SharedAlbumStore: ObservableObject {
             current.append(photo)
         }
         current.sort(by: Self.newestFirst)
+        let insertedCount = current.count - (photosByAlbum[album.id]?.count ?? 0)
         photosByAlbum[album.id] = current
+        updateCover(albumID: album.id, photos: current)
         if let idx = albums.firstIndex(where: { $0.id == album.id }) {
-            albums[idx].photoCount = current.count
+            // Same rule as the delta-sync path: only trust `current.count` when
+            // we hold a FULL view of the album. When we don't (e.g. uploading
+            // into a reused folder album that was never opened this launch),
+            // BUMP the cached count instead of clobbering it with the partial
+            // local view ("52 photos" must not become "3 photos").
+            if fullyLoadedAlbums.contains(album.id) {
+                albums[idx].photoCount = current.count
+            } else {
+                albums[idx].photoCount += max(0, insertedCount)
+            }
             persistCache()
         }
     }
@@ -624,6 +1008,11 @@ final class SharedAlbumStore: ObservableObject {
     /// uploader, which deletes them after the upload completes.
     private func makePayload(for asset: PHAsset,
                             contributor: String?) async -> SharedPhotoUploadPayload? {
+        // Videos take the file-based path: original movie via PHAssetResource
+        // (never loaded whole into memory), streamed hash, poster-frame thumb.
+        if asset.mediaType == .video {
+            return await makeVideoPayload(for: asset, contributor: contributor)
+        }
         let library = PhotoLibraryModel.uploadHelper
         guard let fullData = await library.fullImageData(for: asset) else {
             // Most likely an iCloud-optimized original that couldn't be
@@ -635,34 +1024,138 @@ final class SharedAlbumStore: ObservableObject {
         let thumbData = await library.thumbnailData(for: asset, maxPixel: 256)
             ?? fullData   // fall back to full bytes if a separate thumb fails
 
-        let tmp = FileManager.default.temporaryDirectory
-        let stem = UUID().uuidString
-        let fullURL = tmp.appendingPathComponent("\(stem)-full.jpg")
-        let thumbURL = tmp.appendingPathComponent("\(stem)-thumb.jpg")
-        do {
-            try fullData.write(to: fullURL, options: .atomic)
-            try thumbData.write(to: thumbURL, options: .atomic)
-        } catch {
+        // Gather metadata on the main actor (cheap), then do the heavy work —
+        // temp-file writes + SHA-256 over multi-MB bytes — OFF the main actor so
+        // a large batch doesn't freeze the UI mid-upload.
+        let assetID = asset.localIdentifier
+        let captureDate = asset.creationDate
+        let latitude = asset.location?.coordinate.latitude
+        let longitude = asset.location?.coordinate.longitude
+        // Original filename via the public PHAssetResource API (no private KVC).
+        let filename = PHAssetResource.assetResources(for: asset).first?.originalFilename
+
+        return await Task.detached(priority: .userInitiated) {
+            let tmp = FileManager.default.temporaryDirectory
+            let stem = UUID().uuidString
+            let fullURL = tmp.appendingPathComponent("\(stem)-full.jpg")
+            let thumbURL = tmp.appendingPathComponent("\(stem)-thumb.jpg")
+            do {
+                try fullData.write(to: fullURL, options: .atomic)
+                try thumbData.write(to: thumbURL, options: .atomic)
+            } catch {
+                SharedAlbumLog.logger.error(
+                    "makePayload: temp-file write failed for asset \(assetID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                try? FileManager.default.removeItem(at: fullURL)
+                try? FileManager.default.removeItem(at: thumbURL)
+                return nil
+            }
+
+            let hash = SHA256.hash(data: fullData).map { String(format: "%02x", $0) }.joined()
+            return SharedPhotoUploadPayload(
+                fullImageURL: fullURL,
+                thumbnailURL: thumbURL,
+                contributorID: contributor,
+                captureDate: captureDate,
+                latitude: latitude,
+                longitude: longitude,
+                originalFilename: filename,
+                contentHash: hash)
+        }.value
+    }
+
+    /// Build an upload payload for a VIDEO asset: the ORIGINAL movie file is
+    /// written straight to a temp file via PHAssetResourceManager (no whole-file
+    /// memory load), hashed by streaming, with a poster-frame JPEG thumbnail.
+    private func makeVideoPayload(for asset: PHAsset,
+                                  contributor: String?) async -> SharedPhotoUploadPayload? {
+        // Resolve the original video resource (fall back to any video-ish one).
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard let resource = resources.first(where: { $0.type == .video })
+            ?? resources.first(where: { $0.type == .fullSizeVideo }) else {
             SharedAlbumLog.logger.error(
-                "makePayload: temp-file write failed for asset \(asset.localIdentifier, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            try? FileManager.default.removeItem(at: fullURL)
-            try? FileManager.default.removeItem(at: thumbURL)
+                "makeVideoPayload: no video resource for \(asset.localIdentifier, privacy: .public)")
             return nil
         }
 
-        let hash = SHA256.hash(data: fullData).map { String(format: "%02x", $0) }.joined()
-        let loc = asset.location
-        // Original filename via the public PHAssetResource API (no private KVC).
-        let filename = PHAssetResource.assetResources(for: asset).first?.originalFilename
-        return SharedPhotoUploadPayload(
-            fullImageURL: fullURL,
-            thumbnailURL: thumbURL,
-            contributorID: contributor,
-            captureDate: asset.creationDate,
-            latitude: loc?.coordinate.latitude,
-            longitude: loc?.coordinate.longitude,
-            originalFilename: filename,
-            contentHash: hash)
+        let tmp = FileManager.default.temporaryDirectory
+        let stem = UUID().uuidString
+        let ext = (resource.originalFilename as NSString).pathExtension.lowercased()
+        let videoURL = tmp.appendingPathComponent("\(stem)-full.\(ext.isEmpty ? "mov" : ext)")
+        let thumbURL = tmp.appendingPathComponent("\(stem)-thumb.jpg")
+
+        // 1. Write the original movie to disk (network allowed for iCloud
+        //    originals). Completion-handler API bridged to async.
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        let wrote: Bool = await withCheckedContinuation { cont in
+            PHAssetResourceManager.default().writeData(
+                for: resource, toFile: videoURL, options: options
+            ) { error in
+                cont.resume(returning: error == nil)
+            }
+        }
+        guard wrote else {
+            SharedAlbumLog.logger.error(
+                "makeVideoPayload: resource write failed for \(asset.localIdentifier, privacy: .public)")
+            try? FileManager.default.removeItem(at: videoURL)
+            return nil
+        }
+
+        // 2. Poster-frame thumbnail (requestImage works for videos).
+        guard let thumbData = await PhotoLibraryModel.uploadHelper
+            .thumbnailData(for: asset, maxPixel: 256) else {
+            try? FileManager.default.removeItem(at: videoURL)
+            return nil
+        }
+
+        let contributorID = contributor
+        let captureDate = asset.creationDate
+        let latitude = asset.location?.coordinate.latitude
+        let longitude = asset.location?.coordinate.longitude
+        let filename = resource.originalFilename
+        let duration = asset.duration
+
+        // 3. Streamed SHA-256 (videos can be huge — never load them whole) +
+        //    thumbnail write, off the main actor.
+        return await Task.detached(priority: .userInitiated) {
+            do {
+                try thumbData.write(to: thumbURL, options: .atomic)
+            } catch {
+                try? FileManager.default.removeItem(at: videoURL)
+                return nil
+            }
+            guard let hash = Self.streamedSHA256(of: videoURL) else {
+                try? FileManager.default.removeItem(at: videoURL)
+                try? FileManager.default.removeItem(at: thumbURL)
+                return nil
+            }
+            return SharedPhotoUploadPayload(
+                fullImageURL: videoURL,
+                thumbnailURL: thumbURL,
+                contributorID: contributorID,
+                captureDate: captureDate,
+                latitude: latitude,
+                longitude: longitude,
+                originalFilename: filename,
+                contentHash: hash,
+                isVideo: true,
+                duration: duration)
+        }.value
+    }
+
+    /// SHA-256 of a file computed in 1 MB chunks — constant memory regardless
+    /// of file size. Returns nil on read failure.
+    private nonisolated static func streamedSHA256(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk: Data?
+            do { chunk = try handle.read(upToCount: 1_048_576) } catch { return nil }
+            guard let chunk, !chunk.isEmpty else { break }   // nil/empty = EOF
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Load + view photos (Phase 4)
@@ -694,7 +1187,8 @@ final class SharedAlbumStore: ObservableObject {
         let scope = album.isOwnedByMe ? "private" : "shared"
         let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
         do {
-            let loaded = try await cloud.loadPhotos(inZone: album.zoneID, database: database)
+            let load = try await cloud.loadPhotos(inZone: album.zoneID, database: database)
+            let loaded = load.photos
             SharedAlbumLog.logger.info(
                 "loadPhotos: fetched \(loaded.count) photo(s) album=\(album.id, privacy: .public) db=\(scope, privacy: .public) token=full recentToPreserve=\(recent.count)")
             // Accumulate thumbnails into a local dict and merge into the
@@ -709,6 +1203,9 @@ final class SharedAlbumStore: ObservableObject {
                 serverIDs.insert(photo.id)
                 if let thumb { newThumbs[photo.id] = thumb }
             }
+            // Reactions + comments ride the same zone fetch — REPLACE this
+            // album's social state wholesale (it's a full enumeration).
+            applySocialRecords(load.socialRecords, resetForPhotoIDs: serverIDs)
             // Read-after-write guard: re-add just-saved photos the server hasn't
             // surfaced yet (custom-zone propagation lag), so the optimistic
             // entries aren't clobbered by a short/empty re-fetch.
@@ -723,6 +1220,10 @@ final class SharedAlbumStore: ObservableObject {
                 thumbnailCache.merge(newThumbs) { _, new in new }
             }
             photosByAlbum[album.id] = photos
+            updateCover(albumID: album.id, photos: photos)
+            // This was a WHOLE-zone fetch, so the count bookkeeping (here and in
+            // the delta-sync path) may trust `photos.count` as authoritative.
+            fullyLoadedAlbums.insert(album.id)
             // Keep the album card's count honest with what we actually have.
             if let idx = albums.firstIndex(where: { $0.id == album.id }),
                albums[idx].photoCount != photos.count {
@@ -800,29 +1301,39 @@ final class SharedAlbumStore: ObservableObject {
         }
     }
 
+    /// What a delta sync brought in — drives both the `.newData` fetch result
+    /// and the local "N new photos in X" notification after a background wake.
+    struct SyncNews {
+        var changed = false
+        /// Photos newly INSERTED (not updated) by this sync, per album name.
+        var newPhotosByAlbumName: [String: Int] = [:]
+        var totalNewPhotos: Int { newPhotosByAlbumName.values.reduce(0, +) }
+    }
+
     /// Delta-sync both databases since their last server change token. Applies
     /// changed/deleted SharedPhoto records to `photosByAlbum`, drops deleted
     /// albums, and persists the new tokens. Driven by the remote-notification
     /// app-delegate hook (and reusable for manual refresh). Gated in tests and
-    /// inert when iCloud is unavailable. Returns true if anything changed (so
-    /// the app delegate can report `.newData`).
+    /// inert when iCloud is unavailable. Returns what changed (so the app
+    /// delegate can report `.newData` and post a visible notification).
     @discardableResult
-    func syncChanges() async -> Bool {
-        guard !Self.runningTests else { return false }
+    func syncChanges() async -> SyncNews {
+        guard !Self.runningTests else { return SyncNews() }
         await cloud.accountStatus()
-        guard cloud.isAvailable else { return false }
+        guard cloud.isAvailable else { return SyncNews() }
 
         loadTokenCacheIfNeeded()
-        var changed = false
-        changed = await syncDatabase(cloud.sharedDB, scope: .shared) || changed
-        changed = await syncDatabase(cloud.privateDB, scope: .private) || changed
-        if changed { persistTokenCache() }
-        return changed
+        var news = SyncNews()
+        await syncDatabase(cloud.sharedDB, scope: .shared, news: &news)
+        await syncDatabase(cloud.privateDB, scope: .private, news: &news)
+        if news.changed { persistTokenCache() }
+        return news
     }
 
-    /// Delta-sync one database. Returns true if any record/zone changed.
+    /// Delta-sync one database, accumulating into `news`.
     private func syncDatabase(_ database: CKDatabase,
-                             scope: CKDatabase.Scope) async -> Bool {
+                             scope: CKDatabase.Scope,
+                             news: inout SyncNews) async {
         let result: DatabaseChangeResult
         do {
             result = try await fetchDatabaseChangesRecoveringExpiry(database, scope: scope)
@@ -830,18 +1341,24 @@ final class SharedAlbumStore: ObservableObject {
             #if DEBUG
             print("[SharedAlbums] syncDatabase(\(scope)) failed: \(error)")
             #endif
-            return false
+            return
         }
 
         var anyChange = false
 
-        // Deleted zones → drop the album + its photos + tokens.
+        // Deleted zones → drop the album + its photos + tokens + folder links.
         for zoneID in result.deletedZoneIDs {
             let albumID = zoneID.zoneName
             if albums.contains(where: { $0.id == albumID }) {
                 albums.removeAll { $0.id == albumID }
                 photosByAlbum[albumID] = nil
+                fullyLoadedAlbums.remove(albumID)
                 anyChange = true
+            }
+            let linkedFolders = folderAlbumLinks.filter { $0.value == albumID }.map(\.key)
+            if !linkedFolders.isEmpty {
+                for key in linkedFolders { folderAlbumLinks[key] = nil }
+                persistFolderLinks()
             }
             tokenCache.removeZone(zoneID)
         }
@@ -849,19 +1366,58 @@ final class SharedAlbumStore: ObservableObject {
         // Per-zone record changes.
         for zc in result.zoneChanges {
             let albumID = zc.zoneID.zoneName
+            // This delta was fetched with a nil zone token (brand-new zone) →
+            // it is a FULL enumeration, so the photo-count bookkeeping may
+            // trust it. Must be read BEFORE the new token is stored below.
+            if tokenCache.zoneToken(zc.zoneID) == nil,
+               albumID.hasPrefix(CloudKitService.albumZonePrefix) {
+                fullyLoadedAlbums.insert(albumID)
+            }
+            // A change in an ALBUM zone we don't know yet — a brand-new album
+            // shared with us (or created on another of our devices). Without
+            // this, a pushed-in album never appears until the next manual
+            // loadAlbums (the old bug: an accepted invite showed up for the
+            // receiver only after force-quitting or pull-to-refresh).
+            if albumID.hasPrefix(CloudKitService.albumZonePrefix),
+               !albums.contains(where: { $0.id == albumID }) {
+                let ownedByMe = scope == .private
+                if let album = await albumFromZone(zc.zoneID, in: database, ownedByMe: ownedByMe) {
+                    upsertAlbum(album)
+                    anyChange = true
+                }
+            }
             // Decode CKAsset thumbnail bytes OFF the main actor first (a large
             // delta shouldn't jank the UI), then apply the (already-decoded)
             // changes synchronously on the main actor.
             let thumbs = await Self.decodeThumbnails(for: zc.changedRecords)
-            if applyZoneChanges(zc, albumID: albumID, decodedThumbnails: thumbs) {
-                anyChange = true
+            let applied = applyZoneChanges(zc, albumID: albumID, decodedThumbnails: thumbs)
+            if applied.changed { anyChange = true }
+            // Count only photos contributed by OTHERS toward the visible
+            // notification — the user's own uploads syncing across their
+            // devices shouldn't ping them.
+            if applied.insertedByOthers > 0 {
+                let name = albums.first(where: { $0.id == albumID })?.name ?? "Shared album"
+                news.newPhotosByAlbumName[name, default: 0] += applied.insertedByOthers
             }
             tokenCache.setZoneToken(zc.newToken, for: zc.zoneID)
         }
 
-        tokenCache.setDatabaseToken(result.newDatabaseToken, scope: scope)
-        if anyChange { persistCache() }
-        return anyChange
+        // Advance the database token ONLY when every changed zone was fetched.
+        // The DB-changes op re-reports a zone only for changes AFTER the token
+        // we hand it — persisting the new token past a failed zone would drop
+        // that zone's delta forever (stale grid until some future write).
+        // Keeping the old token means the next sync re-reports everything since
+        // it; already-synced zones no-op via their own advanced zone tokens.
+        if result.failedZoneIDs.isEmpty {
+            tokenCache.setDatabaseToken(result.newDatabaseToken, scope: scope)
+        } else {
+            SharedAlbumLog.logger.error(
+                "syncDatabase(\(String(describing: scope), privacy: .public)): \(result.failedZoneIDs.count) zone fetch(es) failed — database token NOT advanced")
+        }
+        if anyChange {
+            persistCache()
+            news.changed = true
+        }
     }
 
     /// Fetch database changes for a scope, recovering from a database-level
@@ -915,33 +1471,50 @@ final class SharedAlbumStore: ObservableObject {
     /// changed.
     private func applyZoneChanges(_ zc: ZoneChangeResult,
                                   albumID: String,
-                                  decodedThumbnails: [String: Data]) -> Bool {
+                                  decodedThumbnails: [String: Data]) -> (changed: Bool, insertedByOthers: Int) {
         var photos = photosByAlbum[albumID] ?? []
         var changed = false
+        var insertedByOthers = 0
         var thumbInserts: [String: Data] = [:]
         var thumbRemovals: [String] = []
+        var social: [CKRecord] = []
 
         // Upserts.
         for record in zc.changedRecords {
-            guard record.recordType == SharedAlbum.RecordType.photo,
-                  let photo = SharedPhoto(record: record) else { continue }
-            if let thumb = decodedThumbnails[photo.id] {
-                thumbInserts[photo.id] = thumb
+            switch record.recordType {
+            case SharedAlbum.RecordType.photo:
+                guard let photo = SharedPhoto(record: record) else { continue }
+                if let thumb = decodedThumbnails[photo.id] {
+                    thumbInserts[photo.id] = thumb
+                }
+                if let idx = photos.firstIndex(where: { $0.id == photo.id }) {
+                    photos[idx] = photo
+                } else {
+                    photos.append(photo)
+                    if let contributor = photo.contributorID,
+                       contributor != myRecordName {
+                        insertedByOthers += 1
+                    }
+                }
+                changed = true
+            case SharedSocial.RecordType.reaction, SharedSocial.RecordType.comment:
+                social.append(record)
+                changed = true
+            default:
+                break
             }
-            if let idx = photos.firstIndex(where: { $0.id == photo.id }) {
-                photos[idx] = photo
-            } else {
-                photos.append(photo)
-            }
-            changed = true
         }
+        applySocialRecords(social, resetForPhotoIDs: nil)
 
-        // Deletions.
+        // Deletions (photos + social, distinguished by record-name prefix).
         for id in zc.deletedRecordIDs {
             let name = id.recordName
             if let idx = photos.firstIndex(where: { $0.id == name }) {
                 photos.remove(at: idx)
                 thumbRemovals.append(name)
+                changed = true
+            } else if name.hasPrefix("reaction-") || name.hasPrefix("comment-") {
+                removeSocialRecord(named: name)
                 changed = true
             }
         }
@@ -953,13 +1526,19 @@ final class SharedAlbumStore: ObservableObject {
         for name in thumbRemovals { thumbnailCache[name] = nil }
 
         if changed {
+            photos.sort(by: Self.newestFirst)
             photosByAlbum[albumID] = photos
-            // Keep the album card count in step with the live photo list.
-            if let idx = albums.firstIndex(where: { $0.id == albumID }) {
+            updateCover(albumID: albumID, photos: photos)
+            // Keep the album card count in step with the live photo list — but
+            // ONLY when we hold a full view of the album. A delta into an album
+            // never fully loaded this launch would clobber the cached count with
+            // the delta's size (e.g. "2 photos" on a 50-photo album).
+            if fullyLoadedAlbums.contains(albumID),
+               let idx = albums.firstIndex(where: { $0.id == albumID }) {
                 albums[idx].photoCount = photos.count
             }
         }
-        return changed
+        return (changed, insertedByOthers)
     }
 
     // MARK: - Change-token cache persistence
@@ -1003,10 +1582,535 @@ final class SharedAlbumStore: ObservableObject {
         albums.first { $0.id == id }
     }
 
-    /// Record that an album was shared with these participant user record names,
-    /// for the "same people again" affordance. Exposed for the invite flow.
-    func noteShared(with participantIDs: [String]) {
-        rememberParticipants(participantIDs)
+    // MARK: - Covers (#6)
+
+    private static func coverURL(for albumID: String) -> URL {
+        storeDir.appendingPathComponent("cover-\(albumID).jpg")
+    }
+
+    /// The album's cover thumbnail bytes: memory → disk → nil.
+    func coverThumbnail(for albumID: String) -> Data? {
+        if let data = coverCache[albumID] { return data }
+        if let data = try? Data(contentsOf: Self.coverURL(for: albumID)) {
+            coverCache[albumID] = data
+            return data
+        }
+        return nil
+    }
+
+    /// Record the newest photo's thumbnail as the album cover (memory + disk).
+    /// Called wherever the photo list changes; cheap no-op when unchanged.
+    private func updateCover(albumID: String, photos: [SharedPhoto]) {
+        guard let newest = photos.first,           // photos are newest-first
+              let thumb = thumbnailCache[newest.id] else { return }
+        if coverCache[albumID] == thumb { return }
+        coverCache[albumID] = thumb
+        try? thumb.write(to: Self.coverURL(for: albumID), options: .atomic)
+    }
+
+    // MARK: - Attribution (#6)
+
+    /// Resolve who contributed a photo, for display: "you", a friend's
+    /// @username, a share participant's name, or nil (unknown).
+    func contributorDisplayName(for photo: SharedPhoto) -> String? {
+        guard let contributor = photo.contributorID else { return nil }
+        if contributor == myRecordName { return "you" }
+        if let friend = InvitationStore.shared.friends.first(where: { $0.userRecordID == contributor }) {
+            return "@\(friend.username)"
+        }
+        return participantNames[contributor]
+    }
+
+    /// Lazily resolve participant display names for an album (one live-share
+    /// fetch) so attribution/comments can name non-friend members. Idempotent
+    /// per launch once names are known; inert when unavailable.
+    func loadParticipantNamesIfNeeded(for album: SharedAlbum) async {
+        if myRecordName == nil {
+            myRecordName = try? await cloud.currentUserRecordID().recordName
+        }
+        // If every current photo's contributor already resolves, skip the fetch.
+        let unresolved = (photosByAlbum[album.id] ?? []).contains { photo in
+            guard let c = photo.contributorID else { return false }
+            return c != myRecordName
+                && participantNames[c] == nil
+                && !InvitationStore.shared.friends.contains(where: { $0.userRecordID == c })
+        }
+        guard unresolved else { return }
+        guard let people = await participants(for: album) else { return }
+        for p in people {
+            if let record = p.userRecordID, participantNames[record] == nil {
+                participantNames[record] = p.displayName
+            }
+        }
+    }
+
+    // MARK: - Resumable uploads (#7)
+
+    /// albumID → asset IDs of an upload that may not have finished. Persisted
+    /// so an app kill / hard failure mid-upload resumes on the next activation
+    /// (dedupe re-adds only what's missing). Cleared on verified completion.
+    private var pendingUploads: [String: [String]] = [:]
+    private var pendingUploadsLoaded = false
+    private static var pendingUploadsURL: URL {
+        storeDir.appendingPathComponent("pending_uploads.json")
+    }
+
+    private func loadPendingUploadsIfNeeded() {
+        guard !pendingUploadsLoaded else { return }
+        pendingUploadsLoaded = true
+        if let data = try? Data(contentsOf: Self.pendingUploadsURL),
+           let decoded = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            pendingUploads = decoded
+        }
+    }
+
+    private func persistPendingUploads() {
+        try? JSONEncoder().encode(pendingUploads).write(to: Self.pendingUploadsURL, options: .atomic)
+    }
+
+    private func notePendingUpload(albumID: String, assetIDs: [String]) {
+        loadPendingUploadsIfNeeded()
+        // Union with anything already pending for this album so an interrupted
+        // resume that itself gets interrupted never loses IDs.
+        var ids = Set(pendingUploads[albumID] ?? [])
+        ids.formUnion(assetIDs)
+        pendingUploads[albumID] = Array(ids)
+        persistPendingUploads()
+    }
+
+    private func clearPendingUpload(albumID: String) {
+        loadPendingUploadsIfNeeded()
+        guard pendingUploads[albumID] != nil else { return }
+        pendingUploads[albumID] = nil
+        persistPendingUploads()
+    }
+
+    /// Resume uploads interrupted by an app kill / failure. One attempt per
+    /// activation; the in-flight guard + dedupe make it safe and cheap.
+    func resumePendingUploads() async {
+        guard !Self.runningTests else { return }
+        loadPendingUploadsIfNeeded()
+        guard !pendingUploads.isEmpty else { return }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return }
+        for (albumID, assetIDs) in pendingUploads {
+            guard let album = album(withID: albumID) else {
+                // Album is gone (deleted/left) — drop the orphaned intent.
+                clearPendingUpload(albumID: albumID)
+                continue
+            }
+            SharedAlbumLog.logger.notice(
+                "resumePendingUploads: resuming \(assetIDs.count) item(s) into \(albumID, privacy: .public)")
+            _ = try? await addPhotosReportingCount(localAssetIDs: assetIDs, toAlbum: album)
+        }
+    }
+
+    // MARK: - Auto-share suggestions (#8)
+
+    /// "N new photos of <person> — add to <album>?" One suggestion per
+    /// folder-linked owned album whose folder members are dominated by known
+    /// face clusters, when NEWER photos of those people exist outside it.
+    struct ShareSuggestion: Identifiable, Equatable {
+        let id: String            // album id
+        let albumID: String
+        let folderID: String
+        let albumName: String
+        let peopleLabel: String   // "Mom", "Mom & Dad", "3 people"
+        let assetIDs: [String]
+        let newestDate: Date
+    }
+
+    @Published private(set) var suggestions: [ShareSuggestion] = []
+
+    /// albumID → newest candidate date at dismissal; a suggestion re-appears
+    /// only when strictly newer candidates exist. Persisted.
+    private var dismissedSuggestions: [String: Date] = [:]
+    private static var dismissedSuggestionsURL: URL {
+        storeDir.appendingPathComponent("dismissed_share_suggestions.json")
+    }
+
+    /// Recompute suggestions from purely LOCAL state (PhotoStore's index +
+    /// folder links) — no CloudKit. Cheap enough to run on album-screen entry.
+    func refreshSuggestions() {
+        loadFolderLinksIfNeeded()
+        if dismissedSuggestions.isEmpty,
+           let data = try? Data(contentsOf: Self.dismissedSuggestionsURL),
+           let decoded = try? JSONDecoder().decode([String: Date].self, from: data) {
+            dismissedSuggestions = decoded
+        }
+
+        let photoStore = PhotoStore.shared
+        var fresh: [ShareSuggestion] = []
+
+        for (folderID, albumID) in folderAlbumLinks {
+            guard let album = album(withID: albumID), album.isOwnedByMe,
+                  let folder = photoStore.folders.first(where: { $0.id == folderID }),
+                  !folder.isSmart else { continue }
+
+            let memberIDs = Set(photoStore.activeMemberAssetIDs(in: folder))
+            guard memberIDs.count >= 4 else { continue }   // too small to profile
+
+            // Index member photos + find the dominant face clusters.
+            var clusterCounts: [Int: Int] = [:]
+            var latestMemberDate = Date.distantPast
+            for photo in photoStore.photos where memberIDs.contains(photo.assetID) {
+                for cluster in Set(photo.personClusterIDs) {
+                    clusterCounts[cluster, default: 0] += 1
+                }
+                if let d = photo.createdAt, d > latestMemberDate { latestMemberDate = d }
+            }
+            let threshold = max(3, Int(Double(memberIDs.count) * 0.25))
+            let dominant = Set(clusterCounts.filter { $0.value >= threshold }.map(\.key))
+            guard !dominant.isEmpty else { continue }
+
+            // Newer photos of those people, not already in the folder.
+            var candidates: [(id: String, date: Date)] = []
+            for photo in photoStore.photos {
+                guard !photo.isDeleted,
+                      !memberIDs.contains(photo.assetID),
+                      let date = photo.createdAt, date > latestMemberDate,
+                      !Set(photo.personClusterIDs).isDisjoint(with: dominant) else { continue }
+                candidates.append((photo.assetID, date))
+            }
+            guard !candidates.isEmpty else { continue }
+            candidates.sort { $0.date > $1.date }
+            let capped = Array(candidates.prefix(24))
+            let newest = capped[0].date
+
+            // Respect a dismissal until strictly newer candidates appear.
+            if let dismissedAt = dismissedSuggestions[albumID], newest <= dismissedAt { continue }
+
+            // Label from the dominant clusters' names.
+            let names = dominant
+                .compactMap { id in photoStore.clusters.first(where: { $0.id == id })?.name }
+                .filter { !$0.isEmpty }
+                .sorted()
+            let people: String
+            switch names.count {
+            case 0:  people = "people in this album"
+            case 1:  people = names[0]
+            case 2:  people = "\(names[0]) & \(names[1])"
+            default: people = "\(names[0]) & \(names.count - 1) others"
+            }
+
+            fresh.append(ShareSuggestion(
+                id: albumID, albumID: albumID, folderID: folderID,
+                albumName: album.name, peopleLabel: people,
+                assetIDs: capped.map(\.id), newestDate: newest))
+        }
+
+        suggestions = fresh.sorted { $0.newestDate > $1.newestDate }
+    }
+
+    /// Accept a suggestion: add the photos to the linked folder (keeps the
+    /// folder ⇄ album pairing coherent) and upload them (deduped).
+    func acceptSuggestion(_ suggestion: ShareSuggestion) async {
+        guard let album = album(withID: suggestion.albumID) else { return }
+        PhotoStore.shared.addPhotos(suggestion.assetIDs, toFolder: suggestion.folderID)
+        dismissSuggestion(suggestion)   // consume it either way
+        _ = try? await addPhotosReportingCount(localAssetIDs: suggestion.assetIDs, toAlbum: album)
+    }
+
+    func dismissSuggestion(_ suggestion: ShareSuggestion) {
+        dismissedSuggestions[suggestion.albumID] = suggestion.newestDate
+        try? JSONEncoder().encode(dismissedSuggestions)
+            .write(to: Self.dismissedSuggestionsURL, options: .atomic)
+        suggestions.removeAll { $0.id == suggestion.id }
+    }
+
+    // MARK: - Search inside shared albums (#9)
+
+    /// CLIP embeddings for shared photos, keyed by contentHash (stable across
+    /// devices and re-uploads). Computed on demand from the ~256px thumbnails
+    /// — CLIP's input is 224px, so thumbnail quality is exactly right — and
+    /// persisted so an album is only ever embedded once.
+    private var sharedEmbeddings: [String: [Float]] = [:]
+    private var sharedEmbeddingsLoaded = false
+    private static var sharedEmbeddingsURL: URL {
+        storeDir.appendingPathComponent("shared_clip_embeddings.json")
+    }
+
+    /// True when on-device search of shared albums can work here (models load
+    /// on device only — the simulator hides the search UI).
+    nonisolated var sharedSearchAvailable: Bool { OnDeviceMLEngine.shared.isAvailable }
+
+    private func loadSharedEmbeddingsIfNeeded() {
+        guard !sharedEmbeddingsLoaded else { return }
+        sharedEmbeddingsLoaded = true
+        if let data = try? Data(contentsOf: Self.sharedEmbeddingsURL),
+           let decoded = try? JSONDecoder().decode([String: [Float]].self, from: data) {
+            sharedEmbeddings = decoded
+        }
+    }
+
+    private func persistSharedEmbeddings() {
+        if let data = try? JSONEncoder().encode(sharedEmbeddings) {
+            try? data.write(to: Self.sharedEmbeddingsURL, options: .atomic)
+        }
+    }
+
+    /// Rank an album's photos against a natural-language query, on device.
+    /// Missing embeddings are computed from cached thumbnails first (off the
+    /// main actor). Returns nil when the ML engine isn't available (simulator)
+    /// or the query is empty; [] when nothing clears the floor.
+    func searchShared(album: SharedAlbum, query: String) async -> [SharedPhoto]? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, sharedSearchAvailable else { return nil }
+        guard let queryEmb = try? OnDeviceMLEngine.shared.encodeText(trimmed) else { return nil }
+        loadSharedEmbeddingsIfNeeded()
+
+        let photos = photosByAlbum[album.id] ?? []
+        // 1. Compute any missing embeddings from cached thumbnail bytes.
+        var toCompute: [(hash: String, data: Data)] = []
+        for photo in photos {
+            guard let hash = photo.contentHash, sharedEmbeddings[hash] == nil,
+                  let thumb = thumbnailCache[photo.id] else { continue }
+            toCompute.append((hash, thumb))
+        }
+        if !toCompute.isEmpty {
+            let computed: [String: [Float]] = await Task.detached(priority: .userInitiated) {
+                var out: [String: [Float]] = [:]
+                for entry in toCompute {
+                    guard let image = UIImage(data: entry.data)?.cgImage else { continue }
+                    if let emb = try? OnDeviceMLEngine.shared.encodeImage(image) {
+                        out[entry.hash] = emb
+                    }
+                }
+                return out
+            }.value
+            if !computed.isEmpty {
+                sharedEmbeddings.merge(computed) { _, new in new }
+                persistSharedEmbeddings()
+            }
+        }
+
+        // 2. Rank by cosine (embeddings are L2-normalized → dot product).
+        let floor: Float = 0.2
+        let scored: [(SharedPhoto, Float)] = photos.compactMap { photo in
+            guard let hash = photo.contentHash, let emb = sharedEmbeddings[hash] else { return nil }
+            var dot: Float = 0
+            for i in 0..<min(emb.count, queryEmb.count) { dot += emb[i] * queryEmb[i] }
+            return dot >= floor ? (photo, dot) : nil
+        }
+        return scored.sorted { $0.1 > $1.1 }.map(\.0)
+    }
+
+    // MARK: - Reactions + comments (#10)
+
+    /// Replace/merge parsed social records. `resetForPhotoIDs` non-nil means a
+    /// FULL zone load: wipe existing entries for those photos first so deleted
+    /// reactions don't linger.
+    private func applySocialRecords(_ records: [CKRecord], resetForPhotoIDs: Set<String>?) {
+        if let ids = resetForPhotoIDs {
+            for id in ids {
+                reactionsByPhoto[id] = nil
+                commentsByPhoto[id] = nil
+            }
+        }
+        guard !records.isEmpty else { return }
+        for record in records {
+            if let reaction = SharedReaction(record: record) {
+                var list = reactionsByPhoto[reaction.photoID] ?? []
+                list.removeAll { $0.id == reaction.id }
+                list.append(reaction)
+                reactionsByPhoto[reaction.photoID] = list
+            } else if let comment = SharedComment(record: record) {
+                var list = commentsByPhoto[comment.photoID] ?? []
+                list.removeAll { $0.id == comment.id }
+                list.append(comment)
+                list.sort { $0.createdAt < $1.createdAt }
+                commentsByPhoto[comment.photoID] = list
+            }
+        }
+    }
+
+    /// Remove a deleted social record from local state (delta sync). The
+    /// record type is recoverable from the record-name prefix.
+    private func removeSocialRecord(named recordName: String) {
+        if recordName.hasPrefix("reaction-") {
+            for (photoID, list) in reactionsByPhoto where list.contains(where: { $0.id == recordName }) {
+                reactionsByPhoto[photoID] = list.filter { $0.id != recordName }
+            }
+        } else if recordName.hasPrefix("comment-") {
+            for (photoID, list) in commentsByPhoto where list.contains(where: { $0.id == recordName }) {
+                commentsByPhoto[photoID] = list.filter { $0.id != recordName }
+            }
+        }
+    }
+
+    /// True when the current user has hearted this photo.
+    func myReaction(to photo: SharedPhoto) -> SharedReaction? {
+        guard let me = myRecordName else { return nil }
+        return reactionsByPhoto[photo.id]?.first { $0.authorID == me }
+    }
+
+    /// Toggle the current user's ❤️ on a photo. Optimistic local update; the
+    /// server write follows (and delta sync reconciles everyone else).
+    func toggleReaction(on photo: SharedPhoto, in album: SharedAlbum) async {
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return }
+        if myRecordName == nil {
+            myRecordName = try? await cloud.currentUserRecordID().recordName
+        }
+        guard let me = myRecordName else { return }
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+
+        if let existing = myReaction(to: photo) {
+            // Un-heart: optimistic remove, then delete server-side.
+            reactionsByPhoto[photo.id] = (reactionsByPhoto[photo.id] ?? [])
+                .filter { $0.id != existing.id }
+            let recordID = CKRecord.ID(recordName: existing.id, zoneID: album.zoneID)
+            do {
+                try await cloud.deleteRecord(recordID, from: database)
+            } catch {
+                // Revert the optimistic remove on failure.
+                var list = reactionsByPhoto[photo.id] ?? []
+                list.append(existing)
+                reactionsByPhoto[photo.id] = list
+            }
+        } else {
+            let reaction = SharedReaction(
+                id: SharedSocial.reactionRecordName(photoID: photo.id, authorID: me),
+                photoID: photo.id,
+                emoji: "\u{2764}\u{FE0F}",
+                authorID: me,
+                createdAt: Date())
+            var list = reactionsByPhoto[photo.id] ?? []
+            list.append(reaction)
+            reactionsByPhoto[photo.id] = list
+            do {
+                _ = try await cloud.save([reaction.toRecord(inZone: album.zoneID)], to: database)
+            } catch {
+                reactionsByPhoto[photo.id] = (reactionsByPhoto[photo.id] ?? [])
+                    .filter { $0.id != reaction.id }
+            }
+        }
+    }
+
+    /// Post a comment on a photo. Returns false (and surfaces nothing fatal)
+    /// on failure so the sheet can keep the draft text.
+    @discardableResult
+    func addComment(_ text: String, on photo: SharedPhoto, in album: SharedAlbum) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return false }
+        if myRecordName == nil {
+            myRecordName = try? await cloud.currentUserRecordID().recordName
+        }
+        guard let me = myRecordName else { return false }
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        let comment = SharedComment(
+            id: SharedSocial.commentRecordName(),
+            photoID: photo.id,
+            text: trimmed,
+            authorID: me,
+            authorName: InvitationStore.shared.myProfile.map { "@\($0.username)" },
+            createdAt: Date())
+        var list = commentsByPhoto[photo.id] ?? []
+        list.append(comment)
+        commentsByPhoto[photo.id] = list
+        do {
+            _ = try await cloud.save([comment.toRecord(inZone: album.zoneID)], to: database)
+            return true
+        } catch {
+            commentsByPhoto[photo.id] = (commentsByPhoto[photo.id] ?? [])
+                .filter { $0.id != comment.id }
+            return false
+        }
+    }
+
+    /// Author display for a social item: "you", @username, participant name.
+    func authorDisplayName(_ authorID: String, fallback: String? = nil) -> String {
+        if authorID == myRecordName { return "you" }
+        if let friend = InvitationStore.shared.friends.first(where: { $0.userRecordID == authorID }) {
+            return "@\(friend.username)"
+        }
+        return fallback ?? participantNames[authorID] ?? "Member"
+    }
+
+    // MARK: - Save to Library (#4)
+
+    /// Copy shared photos into the user's own photo library. Fetches each
+    /// full-resolution asset lazily, then creates a library asset; the app's
+    /// existing library observer picks the new assets up and indexes them
+    /// (CLIP + faces) automatically — so saved photos become searchable like
+    /// any other. Returns (saved, failed). Progress publishes per album.
+    @discardableResult
+    func saveToLibrary(_ photos: [SharedPhoto], from album: SharedAlbum) async -> (saved: Int, failed: Int) {
+        guard !photos.isEmpty else { return (0, 0) }
+        await cloud.accountStatus()
+        guard cloud.isAvailable else { return (0, photos.count) }
+
+        savingToLibrary[album.id] = 0
+        defer { savingToLibrary[album.id] = nil }
+
+        var saved = 0, failed = 0
+        for (idx, photo) in photos.enumerated() {
+            let ok: Bool
+            if photo.isVideo {
+                ok = await saveVideoToLibrary(photo, album: album)
+            } else {
+                ok = await savePhotoToLibrary(photo, album: album)
+            }
+            if ok { saved += 1 } else { failed += 1 }
+            savingToLibrary[album.id] = Double(idx + 1) / Double(photos.count)
+        }
+        if failed > 0 {
+            setAlbumAlert(album.id, title: "Some Items Not Saved",
+                          message: "\(failed) of \(photos.count) couldn't be saved. Check your connection and try again.")
+        }
+        return (saved, failed)
+    }
+
+    private func savePhotoToLibrary(_ photo: SharedPhoto, album: SharedAlbum) async -> Bool {
+        guard let data = await fullImage(for: photo, in: album) else { return false }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: data, options: nil)
+                if let date = photo.captureDate { request.creationDate = date }
+                if let lat = photo.latitude, let lon = photo.longitude {
+                    request.location = CLLocation(latitude: lat, longitude: lon)
+                }
+            }
+            return true
+        } catch {
+            SharedAlbumLog.logger.error("saveToLibrary(photo): \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    private func saveVideoToLibrary(_ photo: SharedPhoto, album: SharedAlbum) async -> Bool {
+        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
+        guard let url = try? await cloud.fullAssetFileURL(for: photo, database: database) else {
+            return false
+        }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.shouldMoveFile = true   // temp copy — hand it over
+                request.addResource(with: .video, fileURL: url, options: options)
+                if let date = photo.captureDate { request.creationDate = date }
+                if let lat = photo.latitude, let lon = photo.longitude {
+                    request.location = CLLocation(latitude: lat, longitude: lon)
+                }
+            }
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            SharedAlbumLog.logger.error("saveToLibrary(video): \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    /// The album id a folder was previously shared as, if a link is on record.
+    /// (ShareFolderView uses this to decide whether an empty folder may still
+    /// open its existing shared album.) Hydrates the links from disk if needed.
+    func linkedAlbumID(forFolder folderID: String) -> String? {
+        loadFolderLinksIfNeeded()
+        return folderAlbumLinks[folderID]
     }
 }
 
@@ -1071,12 +2175,8 @@ struct ChangeTokenCache: Codable {
         zoneTokens[Self.key(for: zoneID)] = data
     }
 
-    /// Explicitly clear a single zone's token so its next fetch refetches from
-    /// scratch (zone-level `changeTokenExpired` recovery).
-    mutating func removeZoneToken(_ zoneID: CKRecordZone.ID) {
-        zoneTokens[Self.key(for: zoneID)] = nil
-    }
-
+    /// Drop a zone's token (album deleted/left, or zone-level
+    /// `changeTokenExpired` recovery) so any next fetch starts from scratch.
     mutating func removeZone(_ zoneID: CKRecordZone.ID) {
         zoneTokens[Self.key(for: zoneID)] = nil
     }

@@ -295,6 +295,10 @@ struct AddToFolderSheet: View {
 /// long-press to rename/delete, "+" card to create.
 struct FoldersGrid: View {
     @ObservedObject private var store = PhotoStore.shared
+    /// Observed so the Shared Albums entry card can badge pending invitations /
+    /// photo requests (pure @Published reads; no CloudKit at body time).
+    @ObservedObject private var invitations = InvitationStore.shared
+    @ObservedObject private var requests = RequestStore.shared
 
     @State private var showCreateChoice = false
     @State private var showCreate = false
@@ -348,7 +352,15 @@ struct FoldersGrid: View {
                     NavigationLink {
                         SharedAlbumsView()
                     } label: {
-                        SharedAlbumsEntryCard()
+                        SharedAlbumsEntryCard(
+                            pendingCount: invitations.pendingInvitations.count
+                                + requests.pendingRequests.count)
+                    }
+                    .buttonStyle(.plain)
+                    NavigationLink {
+                        SlideshowsHubView()
+                    } label: {
+                        SlideshowsEntryCard()
                     }
                     .buttonStyle(.plain)
                 }
@@ -472,15 +484,31 @@ struct FoldersGrid: View {
         }
         // Share a folder as a CloudKit shared album (create + upload + invite).
         // We pass the folder's ACTIVE (non-soft-deleted) members so we never try
-        // to upload photos the user has hidden.
+        // to upload photos the user has hidden. The folder id keys the persisted
+        // folder→album link so re-sharing reuses the SAME album.
         .sheet(item: $sharingFolder) { folder in
-            ShareFolderView(folderName: folder.name,
+            ShareFolderView(folderID: folder.id,
+                            folderName: folder.name,
                             assetIDs: store.activeMemberAssetIDs(in: folder))
         }
         .task {
             // Zero-shot CLIP categorization over stored embeddings — cached
             // in the store until the photo count changes.
             categories = await store.autoCategories()
+        }
+        .task {
+            // Keep the Shared Albums entry-card badge honest: hydrate the local
+            // caches and (only when the user actually uses the social layer —
+            // a LOCAL profile exists) refresh the invitation inbox. Internally
+            // gated on runningTests + isAvailable, so tests/simulator stay
+            // inert; no profile recovery here (CloudKit only for onboarded
+            // users — the grid can appear right after launch).
+            invitations.loadLocalCache()
+            requests.loadLocalCache()
+            if invitations.myProfile != nil {
+                await invitations.refreshPendingInvitations()
+                await requests.refreshPendingRequests()
+            }
         }
     }
 }
@@ -717,9 +745,11 @@ struct FolderPhotosView: View {
         }
         // Share this folder as a CloudKit shared album. The visible grid is the
         // folder's active (non-deleted) membership, so its asset IDs are exactly
-        // what should be uploaded.
+        // what should be uploaded. The folder id keys the persisted folder→album
+        // link so re-sharing reuses the SAME album.
         .sheet(isPresented: $showShare) {
-            ShareFolderView(folderName: folder?.name ?? "Shared Album",
+            ShareFolderView(folderID: folderID,
+                            folderName: folder?.name ?? "Shared Album",
                             assetIDs: photos.map(\.assetID))
         }
         .confirmationDialog(

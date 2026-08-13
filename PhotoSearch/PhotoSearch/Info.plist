@@ -7,6 +7,19 @@
 	     app can't handle the share and offers to update it from the App Store. -->
 	<key>CKSharingSupported</key>
 	<true/>
+	<!-- Deep-link scheme for the widget ("photovault://shared" opens the
+	     Shared Albums screen via ContentView's onOpenURL). -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.jakelulla.PhotoSearch</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>photovault</string>
+			</array>
+		</dict>
+	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.photosearch.index</string>

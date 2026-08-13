@@ -91,11 +91,16 @@ final class DirectoryService {
     /// The PUBLIC database — our serverless directory + invitation inbox.
     private var publicDB: CKDatabase { cloud.container.publicCloudDatabase }
 
-    /// Subscription id for the invitation-inbox push. Idempotent registration.
-    static let invitationSubscriptionID = "public-invitations-for-me"
+    /// Subscription id for the invitation-inbox push. "v2" carries a VISIBLE
+    /// alert (the v1 subscription was silent-only); changing a subscription's
+    /// notificationInfo requires a new id, so v2 registers fresh and v1 is
+    /// best-effort deleted. Idempotent registration.
+    static let invitationSubscriptionID = "public-invitations-for-me-v2"
+    static let legacyInvitationSubscriptionID = "public-invitations-for-me"
 
-    /// Subscription id for the photo-request-inbox push. Idempotent registration.
-    static let requestSubscriptionID = "public-photo-requests-for-me"
+    /// Subscription id for the photo-request-inbox push (same v2 story).
+    static let requestSubscriptionID = "public-photo-requests-for-me-v2"
+    static let legacyRequestSubscriptionID = "public-photo-requests-for-me"
 
     private init() {}
 
@@ -227,6 +232,49 @@ final class DirectoryService {
         return profile
     }
 
+    // MARK: - Cross-device profile recovery (private-DB pointer)
+
+    /// Record type/name of the tiny private-DB pointer that remembers WHICH
+    /// username this iCloud account claimed. The public directory is addressed
+    /// by deterministic username record names (no index exists to query by
+    /// userRecordID), so without this pointer a reinstall or second device could
+    /// never recover its own identity — it would demand a NEW username and never
+    /// register the invitation subscription. Default zone, private DB: synced to
+    /// every device on the account, readable with zero schema/index needs.
+    private static let usernamePointerRecordType = "MyProfilePointer"
+    private static let usernamePointerRecordName = "my-username-pointer"
+
+    /// Persist the claimed username to the private DB. Best-effort — the claim
+    /// already succeeded; a pointer failure only degrades multi-device recovery.
+    func saveUsernamePointer(_ username: String) async {
+        guard (try? await requireAvailable()) != nil else { return }
+        let id = CKRecord.ID(recordName: Self.usernamePointerRecordName)
+        let record: CKRecord
+        if let existing = try? await cloud.privateDB.record(for: id) {
+            record = existing
+        } else {
+            record = CKRecord(recordType: Self.usernamePointerRecordType, recordID: id)
+        }
+        record["username"] = username as CKRecordValue
+        _ = try? await save(record, to: cloud.privateDB)
+    }
+
+    /// Recover the username this iCloud account claimed (via the private-DB
+    /// pointer) and resolve its full public profile. Returns nil when this
+    /// account never claimed one, or the pointer's username no longer resolves
+    /// to THIS account (e.g. it was reclaimed by someone else after deletion).
+    func recoverMyProfile() async -> UserProfile? {
+        guard (try? await requireAvailable()) != nil else { return nil }
+        let id = CKRecord.ID(recordName: Self.usernamePointerRecordName)
+        guard let record = try? await cloud.privateDB.record(for: id),
+              let username = record["username"] as? String,
+              !username.isEmpty else { return nil }
+        guard let profile = try? await findProfile(username: username) else { return nil }
+        guard let myID = try? await myUserRecordID(),
+              profile.userRecordID == myID else { return nil }
+        return profile
+    }
+
     // MARK: - Invitations
 
     /// Write an Invitation into the public DB so the recipient's inbox can show
@@ -275,26 +323,32 @@ final class DirectoryService {
     /// the album appears in the shared DB. Reuses CloudKitService.acceptShare for
     /// the actual CKAcceptSharesOperation. The caller marks the invitation handled
     /// locally and triggers an album refresh.
+    ///
+    /// Tolerates an ALREADY-ACCEPTED share (a re-invite, a reinstall that lost
+    /// the handled-set, a link tapped earlier): re-accepting can throw, but if
+    /// the share's zone is already reachable in our shared DB the acceptance is
+    /// a fact — swallow the error and report success. Mirrors acceptFaceShare.
     func acceptInvitation(_ invitation: Invitation) async throws {
         try await requireAvailable()
         guard let url = invitation.shareURL else {
             throw SharedAlbumError.malformedRecord("invitation share URL")
         }
         let metadata = try await fetchShareMetadata(for: url)
-        try await cloud.acceptShare(metadata)
+        do {
+            try await cloud.acceptShare(metadata)
+        } catch {
+            let target = metadata.share.recordID.zoneID
+            let zones = (try? await cloud.fetchAllSharedZones()) ?? []
+            let alreadyJoined = zones.contains {
+                $0.zoneID.zoneName == target.zoneName
+                    && $0.zoneID.ownerName == target.ownerName
+            }
+            guard alreadyJoined else { throw error }
+        }
         // Best-effort: as the RECIPIENT we generally can't delete the sender's
         // public record, so cleanup is the sender's job. We rely on the local
         // handled-invitations set (owned by InvitationStore) to keep it from
         // re-showing.
-    }
-
-    /// Best-effort: the SENDER deletes its own Invitation record after the
-    /// recipient has joined. Low priority — failures are swallowed because the
-    /// recipient's local handled-set already prevents re-display. Never throws.
-    func deleteSentInvitation(id: String) async {
-        guard (try? await requireAvailable()) != nil else { return }
-        let recordID = CKRecord.ID(recordName: id)
-        _ = try? await publicDB.deleteRecord(withID: recordID)
     }
 
     // MARK: - Programmatic sharing (no share sheet)
@@ -523,7 +577,9 @@ final class DirectoryService {
             // that yields a decodable payload IS the requester's. Prefer the zone
             // whose ownerName matches the accepted share's owner when present, but
             // fall back to scanning all shared zones (robust on first accept).
-            let zones = try await cloud.fetchSharedAlbumZones()
+            // NOTE: must be the UNFILTERED fetch — face zones are "facereq-",
+            // which fetchSharedAlbumZones deliberately excludes.
+            let zones = try await cloud.fetchAllSharedZones()
             let preferredOwner = metadata.share.recordID.zoneID.ownerName
             let ordered = zones.sorted { a, b in
                 (a.zoneID.ownerName == preferredOwner ? 0 : 1)
@@ -576,11 +632,19 @@ final class DirectoryService {
             predicate: predicate,
             subscriptionID: Self.requestSubscriptionID,
             options: [.firesOnRecordCreation])
+        // VISIBLE alert + silent content-available: the user sees "photo
+        // request" without the app running, and the app still wakes to
+        // refresh the inbox. Tap routing lives in NotificationManager.
         let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true   // silent — no alert/badge
+        info.shouldSendContentAvailable = true
+        info.alertBody = "You received a photo request in PhotoVault."
+        info.soundName = "default"
         subscription.notificationInfo = info
         do {
             _ = try await publicDB.save(subscription)
+            // Best-effort: retire the silent v1 subscription so one event
+            // doesn't fan out twice.
+            _ = try? await publicDB.deleteSubscription(withID: Self.legacyRequestSubscriptionID)
         } catch let error as CKError {
             // IDEMPOTENCY TRAP (documented, deliberately accepted): CloudKit
             // returns .serverRejectedRequest for BOTH cases we cannot cleanly
@@ -714,11 +778,16 @@ final class DirectoryService {
             predicate: predicate,
             subscriptionID: Self.invitationSubscriptionID,
             options: [.firesOnRecordCreation])
+        // VISIBLE alert + silent content-available (see the request twin).
         let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true   // silent — no alert/badge
+        info.shouldSendContentAvailable = true
+        info.alertBody = "You were invited to a shared album in PhotoVault."
+        info.soundName = "default"
         subscription.notificationInfo = info
         do {
             _ = try await publicDB.save(subscription)
+            // Best-effort: retire the silent v1 subscription.
+            _ = try? await publicDB.deleteSubscription(withID: Self.legacyInvitationSubscriptionID)
         } catch let error as CKError {
             // A duplicate CKQuerySubscription (same subscriptionID, every launch
             // after the first) is rejected with .serverRejectedRequest — NOT

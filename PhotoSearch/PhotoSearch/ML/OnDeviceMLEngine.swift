@@ -99,7 +99,16 @@ final class OnDeviceMLEngine {
         return l2Normalize(floats(arr))
     }
 
-    // MARK: - CLIP
+    // MARK: - CLIP (image-only entry point)
+
+    /// Encode ONE image into a 512-dim L2-normalized CLIP embedding, without
+    /// running face detection (unlike `process`). Used for shared-album photo
+    /// thumbnails, where only caption search is needed and faces must never be
+    /// computed on other people's photos implicitly.
+    func encodeImage(_ cgImage: CGImage) throws -> [Float] {
+        guard modelsLoaded, let clip = clipModel else { throw MLEngineError.notLoaded }
+        return try encodeCLIP(cgImage, model: clip)
+    }
 
     private func encodeCLIP(_ cgImage: CGImage, model: MLModel) throws -> [Float] {
         let tensor = try clipPreprocess(cgImage)
@@ -252,7 +261,6 @@ final class OnDeviceMLEngine {
             let stride   = strides[s]
             let featH    = inputSize / stride
             let featW    = inputSize / stride
-            let numPos   = featH * featW * numAnchors
 
             guard
                 let scoreArr = output.featureValue(for: scoreNames[s].name)?.multiArrayValue,
@@ -400,7 +408,7 @@ final class OnDeviceMLEngine {
     // MARK: - NMS
 
     private func nms(_ scores: [Float], _ boxes: [[Float]], iouThresh: Float) -> [Int] {
-        var order = (0..<scores.count).sorted { scores[$0] > scores[$1] }
+        let order = (0..<scores.count).sorted { scores[$0] > scores[$1] }
         var suppressed = [Bool](repeating: false, count: scores.count)
         var keep: [Int] = []
         for i in 0..<order.count {

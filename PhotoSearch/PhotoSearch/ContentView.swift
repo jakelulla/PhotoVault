@@ -54,6 +54,12 @@ struct ContentView: View {
 private struct MainTabs: View {
     @EnvironmentObject private var indexer: Indexer
     @State private var selectedTab = 0
+    /// Observed for the share-accepted confirmation only: a tapped iCloud share
+    /// link can land on ANY tab, so the toast lives at the tab-root level. The
+    /// property is only ever set by real device share flows — inert in tests.
+    @ObservedObject private var sharedAlbums = SharedAlbumStore.shared
+    /// Cross-tab navigation intents (notification taps, widget deep links).
+    @ObservedObject private var router = AppRouter.shared
 
     private var showProgress: Bool {
         indexer.enqueueing || (indexer.total > 0 && indexer.processed < indexer.total)
@@ -101,6 +107,27 @@ private struct MainTabs: View {
             }
         }
         .animation(.easeInOut(duration: 0.3), value: showProgress)
+        // Confirmation that a shared album was just joined (link tap or in-app
+        // invite accept). Lives at the tab root: the link path can fire while
+        // ANY tab is frontmost, and this is the only place the user is
+        // guaranteed to see it.
+        .alert("Joined \u{201C}\(sharedAlbums.acceptedShareToast ?? "")\u{201D}",
+               isPresented: Binding(get: { sharedAlbums.acceptedShareToast != nil },
+                                    set: { if !$0 { sharedAlbums.acceptedShareToast = nil } })) {
+            Button("OK", role: .cancel) { sharedAlbums.acceptedShareToast = nil }
+        } message: {
+            Text("Find it under Photos → Shared Albums. It may take a moment to fill in.")
+        }
+        // Notification tap / widget deep link → straight to Shared Albums,
+        // regardless of which tab is frontmost.
+        .sheet(isPresented: $router.showSharedAlbums) {
+            NavigationStack { SharedAlbumsView() }
+        }
+        .onOpenURL { url in
+            if url.scheme == "photovault", url.host == "shared" {
+                router.showSharedAlbums = true
+            }
+        }
     }
 }
 

@@ -6,6 +6,7 @@ struct PersonPhotosView: View {
     @State private var showTogetherPicker = false
     @State private var togetherSelection: TogetherSelection?
     @State private var showGrowth = false
+    @State private var slideshow: Slideshow?
 
     var body: some View {
         Group {
@@ -34,6 +35,12 @@ struct PersonPhotosView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
+                // Their story as a slideshow: chronological, with music.
+                Button { slideshow = SlideshowBuilder.person(cluster) } label: {
+                    Image(systemName: "play.circle")
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
                 // Watch Them Grow: one best face per year, scrubbable.
                 Button { showGrowth = true } label: {
                     Image(systemName: "sparkles")
@@ -42,6 +49,10 @@ struct PersonPhotosView: View {
         }
         .navigationDestination(isPresented: $showGrowth) {
             GrowthTimelineView(cluster: cluster)
+        }
+        // Full-screen "their story" slideshow (chronological, with music).
+        .fullScreenCover(item: $slideshow) { show in
+            SlideshowPlayerView(slideshow: show)
         }
         .navigationDestination(item: $togetherSelection) { selection in
             TogetherView(clusters: selection.clusters)
