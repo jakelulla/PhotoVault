@@ -139,7 +139,7 @@ private struct ShareRootView: View {
                     ContentUnavailableView {
                         Label("No shared albums yet", systemImage: "person.2.crop.square.stack")
                     } description: {
-                        Text("Open PhotoVault and create or join a shared album first.")
+                        Text("Open PhotoTrove and create or join a shared album first.")
                     }
                 }
             }

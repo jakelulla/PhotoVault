@@ -23,6 +23,10 @@ struct ContentView: View {
                     .task {
                         guard !Self.runningTests else { return }
                         await indexer.indexNewPhotos(from: library)
+                        // Memory notifications are scheduled from the index, so
+                        // refresh the window once this pass has added whatever
+                        // it found. Internally a no-op when opted out.
+                        await NotificationManager.shared.rescheduleMemoryNotifications()
                     }
                     // Belt-and-braces backfill trigger: the indexer fires one
                     // after each pass, but a pass over a big library can take
@@ -65,9 +69,27 @@ private struct MainTabs: View {
         indexer.enqueueing || (indexer.total > 0 && indexer.processed < indexer.total)
     }
 
+    /// Bumped each time the ALREADY-SELECTED Search tab is tapped again.
+    /// SearchView watches it and clears back to its pre-search state — the
+    /// standard iOS "tap the current tab to get back to the top" gesture.
+    @State private var searchResetToken = 0
+
+    /// Wraps the plain selection binding so a re-tap is observable. SwiftUI
+    /// still calls the setter when the tapped tab equals the current one,
+    /// which is the only hook for this gesture.
+    private var tabSelection: Binding<Int> {
+        Binding(
+            get: { selectedTab },
+            set: { newValue in
+                if newValue == 0 && selectedTab == 0 { searchResetToken += 1 }
+                selectedTab = newValue
+            }
+        )
+    }
+
     private var tabs: some View {
-        TabView(selection: $selectedTab) {
-            SearchView()
+        TabView(selection: tabSelection) {
+            SearchView(resetToken: searchResetToken)
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
                 .tag(0)
             PeopleView()
@@ -122,6 +144,11 @@ private struct MainTabs: View {
         // regardless of which tab is frontmost.
         .sheet(isPresented: $router.showSharedAlbums) {
             NavigationStack { SharedAlbumsView() }
+        }
+        // A tapped memory notification plays that day's story straight away —
+        // the notification promised the memory, so don't make them go find it.
+        .fullScreenCover(isPresented: $router.showOnThisDay) {
+            OnThisDayCover()
         }
         .onOpenURL { url in
             if url.scheme == "photovault", url.host == "shared" {
@@ -192,6 +219,38 @@ private struct IndexingProgressBar: View {
     }
 }
 
+/// Destination for a memory-notification tap. Builds today's story on
+/// appearance; if the photos behind it are gone (deleted since the
+/// notification was scheduled), it says so instead of showing a blank player.
+private struct OnThisDayCover: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var slideshow: Slideshow?
+    @State private var built = false
+
+    var body: some View {
+        Group {
+            if let slideshow {
+                SlideshowPlayerView(slideshow: slideshow)
+            } else if built {
+                ContentUnavailableView {
+                    Label("Nothing to show", systemImage: "calendar")
+                } description: {
+                    Text("Those photos are no longer in your library.")
+                } actions: {
+                    Button("Close") { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                }
+            } else {
+                ProgressView()
+            }
+        }
+        .onAppear {
+            slideshow = SlideshowBuilder.onThisDay()
+            built = true
+        }
+    }
+}
+
 private struct RequestAccessView: View {
     @ObservedObject var library: PhotoLibraryModel
 
@@ -199,7 +258,7 @@ private struct RequestAccessView: View {
         ContentUnavailableView {
             Label("Search Your Photos", systemImage: "photo.on.rectangle.angled")
         } description: {
-            Text("Grant access to your photo library. Your photos appear right away, and PhotoSearch indexes them in the background so you can search by person, caption, date, and place.")
+            Text("Grant access to your photo library. Your photos appear right away, and PhotoTrove indexes them in the background so you can search by person, caption, date, and place. Everything happens on your device — nothing is uploaded.")
         } actions: {
             Button("Allow Access") { library.requestAccess() }
                 .buttonStyle(.borderedProminent)
@@ -212,7 +271,7 @@ private struct AccessDeniedView: View {
         ContentUnavailableView {
             Label("No Photo Access", systemImage: "lock.fill")
         } description: {
-            Text("Enable photo access for PhotoSearch in Settings to browse and search your library.")
+            Text("Enable photo access for PhotoTrove in Settings to browse and search your library.")
         } actions: {
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 Button("Open Settings") { UIApplication.shared.open(url) }

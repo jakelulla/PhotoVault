@@ -754,6 +754,158 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertEqual(show.name, "Summer")
         XCTAssertEqual(show.mood, .warm)
     }
+
+    // MARK: - Relative dates
+
+    private var cal: Calendar { Calendar.current }
+
+    /// Bare season/month words must NOT become date filters — they are common
+    /// caption terms and common people names (Summer, May, June).
+    func testBareSeasonIsNotADateFilter() {
+        XCTAssertNil(store.parseRelativeDate("summer", now: date(2026, 3, 15)))
+        XCTAssertNil(store.parseRelativeDate("summer beach", now: date(2026, 3, 15)))
+        XCTAssertNil(store.parseRelativeDate("beach", now: date(2026, 3, 15)))
+    }
+
+    /// "last summer" means the most recently COMPLETED summer, which flips
+    /// depending on where in the year you ask.
+    func testLastSummerDependsOnWhetherItHasEnded() {
+        // March 2026: summer 2026 hasn't happened yet → last summer is 2025.
+        let march = store.parseRelativeDate("last summer", now: date(2026, 3, 15))!
+        XCTAssertEqual(cal.component(.year, from: march.start), 2025)
+        XCTAssertEqual(cal.component(.month, from: march.start), 6)
+        // December 2026: summer 2026 is over → that's last summer.
+        let dec = store.parseRelativeDate("last summer", now: date(2026, 12, 15))!
+        XCTAssertEqual(cal.component(.year, from: dec.start), 2026)
+    }
+
+    func testNYearsAgoCoversTheWholeYear() {
+        let r = store.parseRelativeDate("3 years ago", now: date(2026, 8, 14))!
+        XCTAssertEqual(cal.component(.year, from: r.start), 2023)
+        XCTAssertEqual(cal.component(.month, from: r.start), 1)
+        XCTAssertEqual(cal.component(.year, from: r.end), 2023)
+        XCTAssertEqual(cal.component(.month, from: r.end), 12)
+        XCTAssertTrue(r.contains(date(2023, 6, 1)))
+        XCTAssertFalse(r.contains(date(2024, 1, 1)))
+    }
+
+    func testYesterdayIsASingleDay() {
+        let r = store.parseRelativeDate("yesterday", now: date(2026, 8, 14))!
+        XCTAssertTrue(r.contains(date(2026, 8, 13)))
+        XCTAssertFalse(r.contains(date(2026, 8, 14)))
+        XCTAssertFalse(r.contains(date(2026, 8, 12)))
+    }
+
+    func testLastMonthWindow() {
+        let r = store.parseRelativeDate("last month", now: date(2026, 1, 10))!
+        // Crosses the year boundary correctly.
+        XCTAssertEqual(cal.component(.year, from: r.start), 2025)
+        XCTAssertEqual(cal.component(.month, from: r.start), 12)
+        XCTAssertTrue(r.contains(date(2025, 12, 31)))
+        XCTAssertFalse(r.contains(date(2026, 1, 1)))
+    }
+
+    /// "last weekend" must not be swallowed by the "last week" branch.
+    func testLastWeekendIsTwoDaysNotSeven() {
+        let r = store.parseRelativeDate("last weekend", now: date(2026, 8, 14))!
+        let span = r.end.timeIntervalSince(r.start)
+        XCTAssertEqual(span, 2 * 86400 - 1, accuracy: 3600)
+    }
+
+    /// The phrase's words are reported so they can be stripped from the CLIP
+    /// caption — otherwise "beach last summer" would rank on "last summer" too.
+    func testRelativeTokensAreReported() {
+        XCTAssertEqual(store.parseRelativeDate("beach last summer", now: date(2026, 12, 1))!.tokens,
+                       ["last", "summer"])
+        XCTAssertEqual(store.parseRelativeDate("yesterday", now: date(2026, 8, 14))!.tokens,
+                       ["yesterday"])
+    }
+
+    /// End to end: the window actually filters search candidates.
+    func testRelativeDateFiltersSearchCandidates() {
+        let now = Date()
+        let yesterday = cal.date(byAdding: .day, value: -1, to: now)!
+        let longAgo = cal.date(byAdding: .year, value: -3, to: now)!
+        indexPhoto("recent", emb: unitEmb(axis: 0), createdAt: yesterday)
+        indexPhoto("old", emb: unitEmb(axis: 1), createdAt: longAgo)
+        let (candidates, caption) = store.structuredSearchStage(query: "yesterday")
+        XCTAssertEqual(candidates.map(\.assetID), ["recent"])
+        // The date phrase is consumed, leaving nothing to rank on.
+        XCTAssertTrue(caption.isEmpty, "caption was \(caption)")
+    }
+
+    // MARK: - Recent searches
+
+    func testRecordSearchNewestFirstAndDedupes() {
+        store.recordSearch("beach")
+        store.recordSearch("mountains")
+        XCTAssertEqual(store.recentSearches, ["mountains", "beach"])
+        // Re-running an old query moves it to the front, not a second copy.
+        store.recordSearch("  BEACH ")
+        XCTAssertEqual(store.recentSearches, ["BEACH", "mountains"])
+    }
+
+    func testRecordSearchIgnoresBlank() {
+        store.recordSearch("   ")
+        XCTAssertTrue(store.recentSearches.isEmpty)
+    }
+
+    func testRecentSearchesAreCapped() {
+        for i in 0..<(PhotoStore.maxRecentSearches + 5) { store.recordSearch("q\(i)") }
+        XCTAssertEqual(store.recentSearches.count, PhotoStore.maxRecentSearches)
+        // The oldest fell off the end; the newest is at the front.
+        XCTAssertEqual(store.recentSearches.first, "q\(PhotoStore.maxRecentSearches + 4)")
+        XCTAssertFalse(store.recentSearches.contains("q0"))
+    }
+
+    func testRemoveAndClearRecentSearches() {
+        store.recordSearch("beach")
+        store.recordSearch("mountains")
+        store.removeRecentSearch("BEACH")          // case-insensitive
+        XCTAssertEqual(store.recentSearches, ["mountains"])
+        store.clearRecentSearches()
+        XCTAssertTrue(store.recentSearches.isEmpty)
+    }
+
+    func testRecentSearchesSurviveReload() {
+        store.recordSearch("beach")
+        store.recordSearch("mountains")
+        store.persist()
+        store.load()
+        XCTAssertEqual(store.recentSearches, ["mountains", "beach"])
+    }
+
+    // MARK: - Memory notification copy
+
+    /// The notification body names the day's protagonists, so the ranking must
+    /// be by frequency and must skip clusters nobody has named.
+    func testTopNamedPeopleRanksByFrequencyAndSkipsUnnamed() {
+        let fa = unitEmb(axis: 10), fb = unitEmb(axis: 11)
+        let r = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+        indexPhoto("p1", emb: unitEmb(axis: 0), faceEmbeddings: [fa, fb], faceRects: [r, r])
+        indexPhoto("p2", emb: unitEmb(axis: 1), faceEmbeddings: [fa], faceRects: [r])
+        indexPhoto("p3", emb: unitEmb(axis: 2), faceEmbeddings: [fa], faceRects: [r])
+
+        let a = clusterID(of: "p2")
+        let b = clusterID(of: "p1", faceIndex: 1)
+        store.setClusterName(id: a, name: "Emma")     // in 3 photos
+        store.setClusterName(id: b, name: "Jack")     // in 1
+
+        let photos = store.allPhotos()
+        XCTAssertEqual(store.topNamedPeople(in: photos), ["Emma", "Jack"])
+        XCTAssertEqual(store.topNamedPeople(in: photos, limit: 1), ["Emma"])
+
+        // Unnamed clusters contribute nothing — there's no way to say them.
+        store.setClusterName(id: b, name: "")
+        XCTAssertEqual(store.topNamedPeople(in: photos), ["Emma"])
+    }
+
+    func testTopNamedPeopleEmptyWhenNobodyNamed() {
+        indexPhoto("p1", emb: unitEmb(axis: 0),
+                   faceEmbeddings: [unitEmb(axis: 10)],
+                   faceRects: [CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)])
+        XCTAssertTrue(store.topNamedPeople(in: store.allPhotos()).isEmpty)
+    }
 }
 
 // Test-only convenience: the cluster id a single-face photo was assigned to.

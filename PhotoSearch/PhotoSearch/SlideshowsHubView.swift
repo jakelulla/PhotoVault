@@ -6,6 +6,7 @@ import SwiftUI
 /// on-device from the local index; nothing here touches the network.
 struct SlideshowsHubView: View {
     @ObservedObject private var store = PhotoStore.shared
+    @ObservedObject private var notifications = NotificationManager.shared
 
     @State private var active: Slideshow?
     @State private var customQuery = ""
@@ -74,6 +75,24 @@ struct SlideshowsHubView: View {
                     Text("People")
                 } footer: {
                     Text("A chronological story of each person, set to music.")
+                }
+            }
+
+            // Memory reminders. Opt-in and off by default: scheduling
+            // notifications someone didn't ask for is both rude and an App
+            // Review risk. The permission prompt happens on the toggle, not
+            // at launch.
+            Section {
+                Toggle(isOn: Binding(
+                    get: { notifications.memoriesEnabled },
+                    set: { on in Task { await notifications.setMemoriesEnabled(on) } }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Remind me about memories")
+                        Text("A daily nudge when this day has photos from past years.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 

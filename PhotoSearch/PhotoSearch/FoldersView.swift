@@ -363,6 +363,12 @@ struct FoldersGrid: View {
                         SlideshowsEntryCard()
                     }
                     .buttonStyle(.plain)
+                    NavigationLink {
+                        ReclaimSpaceView()
+                    } label: {
+                        ReclaimSpaceEntryCard()
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 16)
             }

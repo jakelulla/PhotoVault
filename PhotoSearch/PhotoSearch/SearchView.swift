@@ -1,6 +1,10 @@
 import SwiftUI
 
 struct SearchView: View {
+    /// Incremented by MainTabs when the Search tab is tapped while already
+    /// selected; each change clears the view back to the pre-search screen.
+    var resetToken: Int = 0
+
     @ObservedObject private var store = PhotoStore.shared
     @State private var query = ""
     /// The query as last submitted — chip re-ranks and the moments reel key
@@ -28,6 +32,10 @@ struct SearchView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 searchBar
+                // Recents (or, for a new user, worked examples) sit above the
+                // divider so the pre-search screen teaches the query grammar
+                // instead of showing an empty field.
+                if !hasSearched && query.isEmpty { suggestionsBar }
                 if hasSearched { refineBar }
                 Divider()
                 if hasSearched && !submittedQuery.isEmpty && !momentHits.isEmpty {
@@ -52,6 +60,24 @@ struct SearchView: View {
                 rerank()
             }
         }
+        .onChange(of: resetToken) { _, _ in resetToRoot() }
+    }
+
+    /// Back to the pre-search screen: empty field, no results, no refine chips,
+    /// no moments. The folder filter deliberately SURVIVES — it's a scope the
+    /// user set explicitly from the toolbar, and silently dropping it on a tab
+    /// tap would be the surprising behaviour.
+    private func resetToRoot() {
+        query = ""
+        submittedQuery = ""
+        results = []
+        hasSearched = false
+        plusTerms = []
+        minusTerms = []
+        mathUnavailable = false
+        showRefine = false
+        momentHits = []
+        showMoments = false
     }
 
     private var searchBar: some View {
@@ -74,6 +100,72 @@ struct SearchView: View {
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .padding()
+    }
+
+    // MARK: - Recents / suggestions
+
+    /// Worked examples for a library with no search history yet. Chosen to
+    /// demonstrate the three things that compose but aren't discoverable:
+    /// a person name, a relative date, and a place — each combined with a
+    /// free-form description.
+    private static let exampleQueries = [
+        "beach last summer",
+        "birthday cake",
+        "hiking 2 years ago",
+        "snow yesterday",
+    ]
+
+    private var suggestionsBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(store.recentSearches.isEmpty ? "Try" : "Recent")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !store.recentSearches.isEmpty {
+                    Button("Clear") { store.clearRecentSearches() }
+                        .font(.caption)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.tint)
+                }
+            }
+            .padding(.horizontal)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    let recents = store.recentSearches
+                    let items = recents.isEmpty ? Self.exampleQueries : recents
+                    ForEach(items, id: \.self) { item in
+                        Button {
+                            query = item
+                            runSearch()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: recents.isEmpty ? "sparkles" : "clock.arrow.circlepath")
+                                    .font(.caption2)
+                                Text(item).font(.subheadline)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color(.secondarySystemBackground))
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.primary)
+                        // Long-press to forget one entry without nuking the list.
+                        .contextMenu {
+                            if !recents.isEmpty {
+                                Button(role: .destructive) {
+                                    store.removeRecentSearch(item)
+                                } label: { Label("Remove", systemImage: "trash") }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+        .padding(.bottom, 10)
     }
 
     // MARK: - Search math (refine chips)
@@ -161,6 +253,7 @@ struct SearchView: View {
         guard !q.isEmpty else { return }
         hasSearched = true
         submittedQuery = q
+        store.recordSearch(q)
         // Chips refine one search; a fresh submit starts clean.
         plusTerms = []
         minusTerms = []

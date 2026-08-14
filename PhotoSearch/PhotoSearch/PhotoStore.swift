@@ -153,6 +153,17 @@ struct MomentHit: Identifiable {
     var id: String { assetID }
 }
 
+/// An inclusive date window parsed from a relative phrase ("last summer",
+/// "3 years ago"), plus the query words it consumed — those are stripped from
+/// the residual CLIP caption so "beach last summer" ranks on "beach" alone.
+struct RelativeDateRange: Equatable {
+    let start: Date
+    let end: Date
+    let tokens: [String]
+
+    func contains(_ date: Date) -> Bool { date >= start && date <= end }
+}
+
 // MARK: - PhotoStore
 
 @MainActor
@@ -165,6 +176,8 @@ final class PhotoStore: ObservableObject {
     @Published private(set) var locations: [LocalLocation]  = []
     @Published private(set) var folders:   [LocalFolder]    = []
     @Published private(set) var savedSlideshows: [SavedSlideshow] = []
+    /// Recently submitted searches, newest first, capped at `maxRecentSearches`.
+    @Published private(set) var recentSearches: [String] = []
 
     // CLIP embeddings stored separately (not in LocalPhoto) for efficiency
     private(set) var clipEmbeddings: [String: [Float]] = [:]
@@ -195,6 +208,7 @@ final class PhotoStore: ObservableObject {
     private static var locationsURL:  URL { storeDir.appendingPathComponent("locations.json") }
     private static var foldersURL:    URL { storeDir.appendingPathComponent("folders.json") }
     private static var slideshowsURL: URL { storeDir.appendingPathComponent("slideshows.json") }
+    private static var recentsURL:    URL { storeDir.appendingPathComponent("recent_searches.json") }
     private static var embeddingsURL: URL { storeDir.appendingPathComponent("embeddings.json") }      // legacy JSON
     private static var clipBinURL:    URL { storeDir.appendingPathComponent("clip_embeddings.bin") }
     private static var videoFramesURL: URL { storeDir.appendingPathComponent("videoframes.bin") }
@@ -257,6 +271,9 @@ final class PhotoStore: ObservableObject {
         }
         if let arr = loadStore(Self.slideshowsURL, { try? dec.decode([SavedSlideshow].self, from: $0) }) {
             savedSlideshows = arr
+        }
+        if let arr = loadStore(Self.recentsURL, { try? dec.decode([String].self, from: $0) }) {
+            recentSearches = arr
         }
         // CLIP embeddings: binary store, with one-time migration from the
         // legacy JSON file (JSON cost 100MB+ encodes and slow launches at
@@ -349,7 +366,8 @@ final class PhotoStore: ObservableObject {
         static let embeddings = DirtyStores(rawValue: 1 << 4)  // clip_embeddings.bin + videoframes.bin (always change together — both written at index time)
         static let geocode    = DirtyStores(rawValue: 1 << 5)  // geocode_cache.json + geocode_pending.json
         static let slideshows = DirtyStores(rawValue: 1 << 6)  // slideshows.json
-        static let all: DirtyStores = [.photos, .clusters, .locations, .folders, .embeddings, .geocode, .slideshows]
+        static let recents    = DirtyStores(rawValue: 1 << 7)  // recent_searches.json
+        static let all: DirtyStores = [.photos, .clusters, .locations, .folders, .embeddings, .geocode, .slideshows, .recents]
     }
 
     private var dirty: DirtyStores = []
@@ -395,6 +413,9 @@ final class PhotoStore: ObservableObject {
         if toWrite.contains(.slideshows) {
             try? enc.encode(savedSlideshows).write(to: Self.slideshowsURL, options: .atomic)
         }
+        if toWrite.contains(.recents) {
+            try? enc.encode(recentSearches).write(to: Self.recentsURL, options: .atomic)
+        }
         if toWrite.contains(.geocode) {
             try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
             try? JSONEncoder().encode(geocodePending).write(to: Self.geocodePendingURL, options: .atomic)
@@ -419,6 +440,7 @@ final class PhotoStore: ObservableObject {
         try? enc.encode(locations).write(to: Self.locationsURL, options: .atomic)
         try? enc.encode(folders).write(to: Self.foldersURL, options: .atomic)
         try? enc.encode(savedSlideshows).write(to: Self.slideshowsURL, options: .atomic)
+        try? enc.encode(recentSearches).write(to: Self.recentsURL, options: .atomic)
         try? BinaryEmbeddingCodec.encode(clipEmbeddings).write(to: Self.clipBinURL, options: .atomic)
         try? BinaryFrameEmbeddingCodec.encode(videoFrameEmbeddings).write(to: Self.videoFramesURL, options: .atomic)
         try? JSONEncoder().encode(geocodeCache).write(to: Self.geocodeCacheURL, options: .atomic)
@@ -1480,6 +1502,38 @@ final class PhotoStore: ObservableObject {
         schedulePersist(.slideshows)
     }
 
+    // MARK: - Recent searches
+
+    static let maxRecentSearches = 12
+
+    /// Record a submitted search. Re-running an old query MOVES it to the
+    /// front rather than adding a second copy (case-insensitively), so the
+    /// list stays a set of distinct phrasings ordered by recency.
+    func recordSearch(_ rawQuery: String) {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        let key = query.lowercased()
+        recentSearches.removeAll { $0.lowercased() == key }
+        recentSearches.insert(query, at: 0)
+        if recentSearches.count > Self.maxRecentSearches {
+            recentSearches.removeLast(recentSearches.count - Self.maxRecentSearches)
+        }
+        schedulePersist(.recents)
+    }
+
+    func removeRecentSearch(_ query: String) {
+        let key = query.lowercased()
+        guard recentSearches.contains(where: { $0.lowercased() == key }) else { return }
+        recentSearches.removeAll { $0.lowercased() == key }
+        schedulePersist(.recents)
+    }
+
+    func clearRecentSearches() {
+        guard !recentSearches.isEmpty else { return }
+        recentSearches = []
+        schedulePersist(.recents)
+    }
+
     /// Add photos to a folder. Static folders append to `photoAssetIDs` (their
     /// membership); SMART folders route to `manualIncludeAssetIDs` (a force-add
     /// layered over the query) and drop the id from `manualExcludeAssetIDs` so a
@@ -1724,6 +1778,27 @@ final class PhotoStore: ObservableObject {
             .map { OnThisDayGroup(year: $0.key, photos: $0.value) }
     }
 
+    /// The most-photographed NAMED people across a set of photos, most frequent
+    /// first. Unnamed clusters are skipped (there's nothing to call them), and
+    /// merged clusters resolve to their surviving id so one person counted
+    /// under two ids doesn't split their own tally.
+    func topNamedPeople(in photos: [LocalPhoto], limit: Int = 2) -> [String] {
+        var tally: [Int: Int] = [:]
+        for p in photos {
+            for cid in Set(p.personClusterIDs.map { resolvedClusterID($0) }) {
+                tally[cid, default: 0] += 1
+            }
+        }
+        return tally.sorted { $0.value > $1.value }
+            .compactMap { cid, _ in
+                guard let c = clusters.first(where: { $0.id == cid }),
+                      let name = c.name, !name.isEmpty else { return nil }
+                return name
+            }
+            .prefix(limit)
+            .map { $0 }
+    }
+
     /// Average coordinate of a place's photos — for map annotations.
     func coordinate(for location: LocalLocation) -> CLLocationCoordinate2D? {
         var lat = 0.0, lon = 0.0, n = 0.0
@@ -1903,6 +1978,17 @@ final class PhotoStore: ObservableObject {
             }
         }
 
+        // Relative dates e.g. "last summer", "3 years ago", "yesterday".
+        // Applied before month/year so an explicit "june 2023" still wins on
+        // its own terms; the two never both match a sane query.
+        let relative = parseRelativeDate(q)
+        if let relative {
+            results = results.filter { p in
+                guard let d = p.createdAt else { return false }
+                return relative.contains(d)
+            }
+        }
+
         // Month+year filter e.g. "june 2023" or "2023-06". Bare month words
         // with no year apply no filter (and stay in the caption below).
         let monthYear = parseMonthYear(q)
@@ -1944,7 +2030,8 @@ final class PhotoStore: ObservableObject {
         // Whatever the structured filters didn't consume is the CLIP caption.
         let caption = residualCaption(
             from: q, matchedLocations: matchingLocs, matchedClusters: matchingClusters,
-            monthYearMatched: monthYear != nil)
+            monthYearMatched: monthYear != nil,
+            relativeTokens: relative?.tokens ?? [])
         return (results, caption)
     }
 
@@ -2168,8 +2255,11 @@ final class PhotoStore: ObservableObject {
     private func residualCaption(from q: String,
                                  matchedLocations: [LocalLocation],
                                  matchedClusters: [PersonCluster],
-                                 monthYearMatched: Bool) -> String {
+                                 monthYearMatched: Bool,
+                                 relativeTokens: [String] = []) -> String {
         var consumed = Set<String>()
+        // Words a relative-date phrase ate ("last", "summer", "ago", "3").
+        relativeTokens.forEach { consumed.insert($0) }
         for loc in matchedLocations {
             // The filter matched on the city part / alias, so strip those
             // same tokens (the full stored name was never in the query).
@@ -2309,6 +2399,7 @@ final class PhotoStore: ObservableObject {
 
         photos = []; clusters = []; locations = []; folders = []
         savedSlideshows = []
+        recentSearches = []
         clipEmbeddings = [:]; videoFrameEmbeddings = [:]
         photoIndex = [:]; nextPhotoID = 0; nextClusterID = 0
         // The cluster ID space is gone; a SharpnessBackfill mid-run matched
@@ -2355,6 +2446,148 @@ final class PhotoStore: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// Parse a relative date phrase into an inclusive day window.
+    ///
+    /// Deliberately conservative: every phrase requires an explicit qualifier
+    /// ("last summer", never a bare "summer"), because bare season and month
+    /// words are common caption terms — and, worse, common PEOPLE names
+    /// (Summer, May, June). A bare word stays in the CLIP caption where it can
+    /// do no harm. Northern-hemisphere seasons.
+    ///
+    /// `now` is injectable so tests don't depend on the wall clock.
+    /// Internal rather than private so the test target can drive it directly.
+    func parseRelativeDate(_ q: String, now: Date = Date()) -> RelativeDateRange? {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+
+        /// [start, endExclusive) → inclusive window ending 1s before endExclusive.
+        func win(_ start: Date, _ endExclusive: Date, _ tokens: [String]) -> RelativeDateRange {
+            RelativeDateRange(start: start,
+                              end: cal.date(byAdding: .second, value: -1, to: endExclusive) ?? endExclusive,
+                              tokens: tokens)
+        }
+        func day(_ n: Int, from d: Date) -> Date { cal.date(byAdding: .day, value: n, to: d)! }
+        func startOfMonth(_ d: Date) -> Date {
+            cal.date(from: cal.dateComponents([.year, .month], from: d))!
+        }
+        func startOfYear(_ y: Int) -> Date {
+            cal.date(from: DateComponents(year: y, month: 1, day: 1))!
+        }
+        /// First day of the given season in the given year, and its length.
+        func season(_ name: String, year: Int) -> (start: Date, endExclusive: Date) {
+            switch name {
+            case "spring": return (cal.date(from: DateComponents(year: year, month: 3, day: 1))!,
+                                   cal.date(from: DateComponents(year: year, month: 6, day: 1))!)
+            case "summer": return (cal.date(from: DateComponents(year: year, month: 6, day: 1))!,
+                                   cal.date(from: DateComponents(year: year, month: 9, day: 1))!)
+            case "fall", "autumn":
+                return (cal.date(from: DateComponents(year: year, month: 9, day: 1))!,
+                        cal.date(from: DateComponents(year: year, month: 12, day: 1))!)
+            default:  // winter straddles the new year: Dec (y-1) through Feb (y)
+                return (cal.date(from: DateComponents(year: year - 1, month: 12, day: 1))!,
+                        cal.date(from: DateComponents(year: year, month: 3, day: 1))!)
+            }
+        }
+
+        let thisYear = cal.component(.year, from: today)
+        let monthNow = cal.component(.month, from: today)
+
+        // "N days/weeks/months/years ago" — the whole unit that far back, so
+        // "3 years ago" is that entire year, not one instant.
+        if let m = q.range(of: #"\b(\d{1,2})\s+(day|week|month|year)s?\s+ago\b"#,
+                           options: .regularExpression) {
+            let phrase = String(q[m])
+            let parts = phrase.split(separator: " ").map(String.init)
+            if let n = Int(parts[0]) {
+                let unit = parts[1].hasSuffix("s") ? String(parts[1].dropLast()) : parts[1]
+                let tokens = parts
+                switch unit {
+                case "day":
+                    let d = day(-n, from: today)
+                    return win(d, day(1, from: d), tokens)
+                case "week":
+                    let anchor = day(-7 * n, from: today)
+                    let s = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: anchor))!
+                    return win(s, day(7, from: s), tokens)
+                case "month":
+                    let s = startOfMonth(cal.date(byAdding: .month, value: -n, to: today)!)
+                    return win(s, cal.date(byAdding: .month, value: 1, to: s)!, tokens)
+                default:
+                    let s = startOfYear(thisYear - n)
+                    return win(s, startOfYear(thisYear - n + 1), tokens)
+                }
+            }
+        }
+
+        // "last N days" — a rolling window ending today (inclusive).
+        if let m = q.range(of: #"\blast\s+(\d{1,3})\s+days?\b"#, options: .regularExpression) {
+            let parts = String(q[m]).split(separator: " ").map(String.init)
+            if let n = Int(parts[1]), n > 0 {
+                return win(day(-(n - 1), from: today), day(1, from: today), parts)
+            }
+        }
+
+        // Seasons, qualified only.
+        for name in ["summer", "winter", "spring", "fall", "autumn"] {
+            for qualifier in ["last", "this"] {
+                guard matchesWord("\(qualifier) \(name)", in: q) else { continue }
+                let year: Int
+                if qualifier == "last" {
+                    // The most recently COMPLETED occurrence: this year's if it
+                    // has already ended, otherwise the one before it. (In
+                    // December, "last summer" is this year's; in March, it is
+                    // last year's.)
+                    year = today >= season(name, year: thisYear).endExclusive ? thisYear : thisYear - 1
+                } else {
+                    // "this winter" in December means the one just starting,
+                    // which by the Dec–Feb convention is labelled next year.
+                    year = (name == "winter" && monthNow == 12) ? thisYear + 1 : thisYear
+                }
+                let s = season(name, year: year)
+                return win(s.start, s.endExclusive, [qualifier, name])
+            }
+        }
+
+        // Fixed phrases, longest first so "last weekend" wins over "last week".
+        if matchesWord("last weekend", in: q) {
+            // The most recent Saturday strictly before today, plus Sunday.
+            let weekday = cal.component(.weekday, from: today)   // 1 = Sunday
+            let back = weekday == 7 ? 7 : weekday                // Sat → previous Sat
+            let sat = day(-back, from: today)
+            return win(sat, day(2, from: sat), ["last", "weekend"])
+        }
+        if matchesWord("this weekend", in: q) {
+            let weekday = cal.component(.weekday, from: today)   // 1 = Sun … 7 = Sat
+            // Sunday belongs to the weekend that started yesterday; any other
+            // day looks forward to the coming Saturday (today, if it is one).
+            let sat = weekday == 1 ? day(-1, from: today) : day(7 - weekday, from: today)
+            return win(sat, day(2, from: sat), ["this", "weekend"])
+        }
+        if matchesWord("today", in: q) { return win(today, day(1, from: today), ["today"]) }
+        if matchesWord("yesterday", in: q) {
+            let y = day(-1, from: today)
+            return win(y, today, ["yesterday"])
+        }
+        if matchesWord("last week", in: q) || matchesWord("this week", in: q) {
+            let isLast = matchesWord("last week", in: q)
+            let thisWeek = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: today))!
+            let s = isLast ? day(-7, from: thisWeek) : thisWeek
+            return win(s, day(7, from: s), [isLast ? "last" : "this", "week"])
+        }
+        if matchesWord("last month", in: q) || matchesWord("this month", in: q) {
+            let isLast = matchesWord("last month", in: q)
+            let s = isLast ? startOfMonth(cal.date(byAdding: .month, value: -1, to: today)!)
+                           : startOfMonth(today)
+            return win(s, cal.date(byAdding: .month, value: 1, to: s)!, [isLast ? "last" : "this", "month"])
+        }
+        if matchesWord("last year", in: q) || matchesWord("this year", in: q) {
+            let isLast = matchesWord("last year", in: q)
+            let y = isLast ? thisYear - 1 : thisYear
+            return win(startOfYear(y), startOfYear(y + 1), [isLast ? "last" : "this", "year"])
+        }
+        return nil
+    }
 
     private func parseMonthYear(_ q: String) -> (year: Int, month: Int)? {
         let months = ["january":1,"february":2,"march":3,"april":4,"may":5,"june":6,

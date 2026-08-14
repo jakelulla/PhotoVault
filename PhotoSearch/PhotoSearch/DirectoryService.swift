@@ -637,7 +637,7 @@ final class DirectoryService {
         // refresh the inbox. Tap routing lives in NotificationManager.
         let info = CKSubscription.NotificationInfo()
         info.shouldSendContentAvailable = true
-        info.alertBody = "You received a photo request in PhotoVault."
+        info.alertBody = "You received a photo request in PhotoTrove."
         info.soundName = "default"
         subscription.notificationInfo = info
         do {
@@ -781,7 +781,7 @@ final class DirectoryService {
         // VISIBLE alert + silent content-available (see the request twin).
         let info = CKSubscription.NotificationInfo()
         info.shouldSendContentAvailable = true
-        info.alertBody = "You were invited to a shared album in PhotoVault."
+        info.alertBody = "You were invited to a shared album in PhotoTrove."
         info.soundName = "default"
         subscription.notificationInfo = info
         do {
