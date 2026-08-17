@@ -163,12 +163,14 @@ struct SlideshowPlayerView: View {
                         .padding(.horizontal, 6)
                 }
                 .buttonStyle(.borderedProminent)
+                .fixedSize(horizontal: true, vertical: false)
                 Button {
                     dismiss()
                 } label: {
                     Text("Done").padding(.horizontal, 6)
                 }
                 .buttonStyle(.bordered)
+                .fixedSize(horizontal: true, vertical: false)
                 .tint(.white)
             }
         }

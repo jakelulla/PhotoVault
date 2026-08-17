@@ -23,6 +23,7 @@ struct SharedAlbumDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showPicker = false
+    @State private var showQuerySearch = false
     @State private var opened: SharedPhoto?
     @State private var showPeople = false
     @State private var friendInviteAlbum: SharedAlbum?
@@ -55,11 +56,20 @@ struct SharedAlbumDetailView: View {
                     Text("Tap + to add photos to this album. Everyone you've invited can add their own.")
                 } actions: {
                     Button {
-                        showPicker = true
+                        showQuerySearch = true
                     } label: {
-                        Label("Add Photos", systemImage: "plus")
+                        Text("Add by Search")
                     }
                     .buttonStyle(.borderedProminent)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(uploadFraction != nil)
+                    Button {
+                        showPicker = true
+                    } label: {
+                        Text("Choose Photos")
+                    }
+                    .buttonStyle(.bordered)
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(uploadFraction != nil)
                 }
             } else {
@@ -70,8 +80,20 @@ struct SharedAlbumDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showPicker = true
+                // Two ways to contribute: pick specific photos by hand, or
+                // describe what belongs here. The second is the same gesture
+                // that produced the request this album came from.
+                Menu {
+                    Button {
+                        showQuerySearch = true
+                    } label: {
+                        Label("Add by Search", systemImage: "text.magnifyingglass")
+                    }
+                    Button {
+                        showPicker = true
+                    } label: {
+                        Label("Choose Photos…", systemImage: "photo.on.rectangle")
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -209,6 +231,16 @@ struct SharedAlbumDetailView: View {
         }
         .refreshable {
             await store.loadPhotos(forAlbum: album)
+        }
+        .sheet(isPresented: $showQuerySearch) {
+            PhotoQuerySearchView(
+                destinationName: album.name,
+                // No exclusion list: addPhotosReportingCount dedupes against
+                // what is already uploaded and reports the alreadyShared count.
+                footerNote: "Selected photos upload to \u{201C}\(album.name)\u{201D}. Anything already there is skipped."
+            ) { ids in
+                _ = try await store.addPhotosReportingCount(localAssetIDs: ids, toAlbum: album)
+            }
         }
         .sheet(isPresented: $showPicker) {
             SharedAlbumPhotoPicker { localIDs in
@@ -364,6 +396,7 @@ struct AlbumPeopleView: View {
                     } actions: {
                         Button("Retry") { Task { await load() } }
                             .buttonStyle(.borderedProminent)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
             }

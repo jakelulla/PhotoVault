@@ -68,6 +68,7 @@ private struct MemberRow: View {
             if member.mergedInto != nil {
                 Button("Unmerge", action: onUnmerge)
                     .buttonStyle(.bordered).tint(.red)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
         .padding(.vertical, 4)

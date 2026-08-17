@@ -269,12 +269,14 @@ private struct RequestRow: View {
             HStack {
                 Button(role: .destructive) { onDismiss() } label: { Text("Dismiss") }
                     .buttonStyle(.bordered)
+                    .fixedSize(horizontal: true, vertical: false)
                     .disabled(busy)
                 Spacer()
                 Button { onBuild() } label: {
                     if busy { ProgressView() } else { Label("Build & Share", systemImage: "wand.and.stars") }
                 }
                 .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                 .disabled(busy)
             }
         }
@@ -385,6 +387,7 @@ struct RequestReviewView: View {
                 }
             }
             .buttonStyle(.bordered)
+            .fixedSize(horizontal: true, vertical: false)
             .disabled(retrying || sharing)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -551,9 +554,10 @@ struct FacePhotoPickerView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal)
                 PhotosPicker(selection: $item, matching: .images) {
-                    Label("Choose Photo", systemImage: "photo")
+                    Text("Choose Photo")
                 }
                 .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                 if let errorMessage {
                     Label(errorMessage, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.red).font(.callout)

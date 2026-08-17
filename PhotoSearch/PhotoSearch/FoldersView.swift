@@ -624,6 +624,7 @@ struct FolderPhotosView: View {
     @State private var showEditor = false
     @State private var confirmDelete = false
     @State private var showShare = false
+    @State private var showAddBySearch = false
     @State private var photos: [LocalPhoto] = []
 
     private var folder: LocalFolder? { store.folders.first { $0.id == folderID } }
@@ -673,11 +674,23 @@ struct FolderPhotosView: View {
         let isSmart = folder?.isSmart ?? false
         Group {
             if photos.isEmpty {
-                ContentUnavailableView(
-                    isSmart ? "No Matches" : "Empty Folder", systemImage: "folder",
-                    description: Text(isSmart
-                        ? smartEmptyDescription
-                        : "Select photos anywhere in the app and tap the folder button to add them here."))
+                ContentUnavailableView {
+                    Label(isSmart ? "No Matches" : "Empty Folder", systemImage: "folder")
+                } description: {
+                    Text(isSmart
+                         ? smartEmptyDescription
+                         : "Describe what belongs here, or select photos anywhere in the app and tap the folder button.")
+                } actions: {
+                    // The empty state used to only tell the user to go somewhere
+                    // else. Now it can fill the folder from here.
+                    if !isSmart {
+                        Button { showAddBySearch = true } label: {
+                            Text("Add by Search")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
             } else if isSmart {
                 // Smart folders now support manual remove: Remove routes to the
                 // folder's manual-exclude set (a force-remove over the query).
@@ -712,6 +725,14 @@ struct FolderPhotosView: View {
                         } label: {
                             Label("Share Album", systemImage: "person.2.badge.plus")
                         }
+                    }
+                    // Fill the folder by describing what belongs in it —
+                    // the same shape of question as a photo request, pointed
+                    // at your own library.
+                    Button {
+                        showAddBySearch = true
+                    } label: {
+                        Label("Add by Search", systemImage: "text.magnifyingglass")
                     }
                     Button {
                         renameText = folder?.name ?? ""
@@ -753,6 +774,18 @@ struct FolderPhotosView: View {
         // folder's active (non-deleted) membership, so its asset IDs are exactly
         // what should be uploaded. The folder id keys the persisted folder→album
         // link so re-sharing reuses the SAME album.
+        .sheet(isPresented: $showAddBySearch) {
+            PhotoQuerySearchView(
+                destinationName: folder?.name ?? "this folder",
+                excluding: Set(photos.map(\.assetID)),
+                footerNote: folder?.isSmart == true
+                    ? "Adding to a smart folder force-includes these photos on top of its saved search."
+                    : nil
+            ) { ids in
+                store.addPhotos(ids, toFolder: folderID)
+                photos = folder.map { store.photosForFolder($0) } ?? []
+            }
+        }
         .sheet(isPresented: $showShare) {
             ShareFolderView(folderID: folderID,
                             folderName: folder?.name ?? "Shared Album",

@@ -305,7 +305,10 @@ final class RequestStore: ObservableObject {
         defer { isWorking = false }
         do {
             let fetched = try await directory.fetchPendingRequests()
-            pendingRequests = handled.unhandled(fetched)
+            // Same blocklist filter as the invitation inbox: a blocked person
+            // cannot ask you for photos.
+            pendingRequests = SafetyStore.shared.filterBlocked(
+                handled.unhandled(fetched), senderID: \.fromUserRecordID)
         } catch {
             #if DEBUG
             print("[Requests] fetch failed: \(error)")

@@ -619,6 +619,78 @@ final class DirectoryService {
         _ = try? await publicDB.deleteRecord(withID: recordID)
     }
 
+    // MARK: - Account deletion
+
+    /// Erase this user's presence from the PUBLIC database — App Store
+    /// Guideline 5.1.1(v) requires in-app account deletion, and the public
+    /// profile record is what makes this an "account" at all.
+    ///
+    /// Removes, in this order: the username pointer, the profile record, and
+    /// every Invitation / PhotoRequest naming this user as sender OR recipient.
+    /// Private and shared album zones are NOT touched here — those live in the
+    /// user's own iCloud, are invisible to anyone else once the directory entry
+    /// is gone, and deleting other people's copies of a shared album is not
+    /// ours to do. The caller clears local caches.
+    ///
+    /// Best-effort per record rather than transactional: a partial failure must
+    /// still remove as much as it can, and the profile record — the only one
+    /// that makes a user findable — is deleted before the inbox sweeps.
+    /// Returns the number of public records deleted.
+    @discardableResult
+    func deleteAccount() async throws -> Int {
+        try await requireAvailable()
+        let myID = try await myUserRecordID()
+        var deleted = 0
+
+        // 1. Resolve the profile BEFORE deleting the pointer — recoverMyProfile
+        // reads the pointer to find which username is ours.
+        let profile = await recoverMyProfile()
+
+        // 2. Profile record — the public directory entry. Deleting this first
+        // means a later failure still leaves the user unfindable.
+        if let profile {
+            let id = CKRecord.ID(recordName: UserProfile.recordName(for: profile.username))
+            if (try? await publicDB.deleteRecord(withID: id)) != nil { deleted += 1 }
+        }
+
+        // 3. Username pointer. Lives in the PRIVATE database (see
+        // saveUsernamePointer), not the public one.
+        let pointerID = CKRecord.ID(recordName: Self.usernamePointerRecordName)
+        if (try? await cloud.privateDB.deleteRecord(withID: pointerID)) != nil {
+            deleted += 1
+        }
+
+        // 4. Invitations and photo requests in both directions.
+        for (type, fields) in [
+            (Invitation.RecordType.invitation,
+             [Invitation.Field.toUserRecordID, Invitation.Field.fromUserRecordID]),
+            (PhotoRequest.RecordType.request,
+             [PhotoRequest.Field.toUserRecordID, PhotoRequest.Field.fromUserRecordID]),
+        ] {
+            for field in fields {
+                deleted += await deleteRecords(ofType: type, where: field, equals: myID)
+            }
+        }
+        return deleted
+    }
+
+    /// Delete every public record of `type` whose `field` equals `value`.
+    /// Swallows per-record failures; returns how many actually went away.
+    private func deleteRecords(ofType type: String, where field: String,
+                               equals value: String) async -> Int {
+        let predicate = NSPredicate(format: "%K == %@", field, value)
+        let query = CKQuery(recordType: type, predicate: predicate)
+        guard let (matches, _) = try? await publicDB.records(
+            matching: query, desiredKeys: [], resultsLimit: CKQueryOperation.maximumResults)
+        else { return 0 }
+        var n = 0
+        for (recordID, result) in matches {
+            guard case .success = result else { continue }
+            if (try? await publicDB.deleteRecord(withID: recordID)) != nil { n += 1 }
+        }
+        return n
+    }
+
     /// Register a silent CKQuerySubscription on the public "PhotoRequest" record
     /// type, filtered to requests addressed to me. Idempotent (a duplicate is
     /// rejected with `.serverRejectedRequest`, treated as success). Caller gates

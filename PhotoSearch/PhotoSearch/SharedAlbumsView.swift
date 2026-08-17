@@ -53,6 +53,7 @@ struct SharedAlbumsView: View {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
                         Button("Open Settings") { UIApplication.shared.open(url) }
                             .buttonStyle(.borderedProminent)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
             case .loading where store.albums.isEmpty:
@@ -337,9 +338,10 @@ struct SharedAlbumsView: View {
                     newName = ""
                     showCreate = true
                 } label: {
-                    Label("Create Shared Album", systemImage: "plus")
+                    Text("Create Shared Album")
                 }
                 .buttonStyle(.borderedProminent)
+                .fixedSize(horizontal: true, vertical: false)
                 .disabled(creating)
                 // The empty state must be refreshable too — a just-accepted
                 // album otherwise required leaving and re-entering the screen.
@@ -349,6 +351,7 @@ struct SharedAlbumsView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
+                .fixedSize(horizontal: true, vertical: false)
             }
         } else {
             List {
@@ -490,6 +493,7 @@ private struct SuggestionRow: View {
             } else {
                 Button("Add") { confirmAdd = true }
                     .buttonStyle(.borderedProminent)
+                    .fixedSize(horizontal: true, vertical: false)
                     .controlSize(.small)
                 Button {
                     store.dismissSuggestion(suggestion)

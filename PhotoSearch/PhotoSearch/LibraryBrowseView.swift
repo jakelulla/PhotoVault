@@ -39,6 +39,12 @@ struct LibraryBrowseView: View {
             }
             .navigationTitle("Photos")
             .toolbar {
+                // Leading, so it doesn't crowd the three action icons opposite.
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink { SettingsView() } label: {
+                        Image(systemName: "gearshape")
+                    }
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     // Add photos from the camera roll: new ones index, ones
                     // deleted in-app are restored, already-present are no-ops.

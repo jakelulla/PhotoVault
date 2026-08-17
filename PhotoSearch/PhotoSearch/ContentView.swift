@@ -239,6 +239,7 @@ private struct OnThisDayCover: View {
                 } actions: {
                     Button("Close") { dismiss() }
                         .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             } else {
                 ProgressView()
@@ -262,6 +263,7 @@ private struct RequestAccessView: View {
         } actions: {
             Button("Allow Access") { library.requestAccess() }
                 .buttonStyle(.borderedProminent)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 }
@@ -276,6 +278,7 @@ private struct AccessDeniedView: View {
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 Button("Open Settings") { UIApplication.shared.open(url) }
                     .buttonStyle(.borderedProminent)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
     }

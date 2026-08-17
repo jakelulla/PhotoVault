@@ -2,16 +2,60 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Fully on-device app: no tracking, no data collection, nothing
-	     leaves the device. No required-reason APIs are used (no
-	     UserDefaults, no file timestamp or disk space APIs). -->
 	<key>NSPrivacyTracking</key>
 	<false/>
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
-	<key>NSPrivacyCollectedDataTypes</key>
-	<array/>
+
+	<!-- NSPrivacyAccessedAPITypes is intentionally EMPTY, and that has been
+	     verified rather than assumed. The app uses no required-reason APIs:
+	     no UserDefaults (opt-in markers are files in Documents), no file
+	     timestamp APIs (every `.creationDate` is PHAsset.creationDate, a
+	     Photos API), no disk-space, system-boot-time, or active-keyboard
+	     APIs. There are also zero third-party SDKs, so no vendor manifests
+	     or signatures are required. Re-check this list if any of that
+	     changes. -->
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array/>
+
+	<!-- Indexing, search, face grouping, and every ML model run entirely on
+	     device, so none of that is "collected" in Apple's sense.
+
+	     What IS collected: claiming a username writes a public CloudKit
+	     record holding the username, an optional display name, and the
+	     iCloud user record ID. That database is readable by the developer,
+	     so it counts — and it is linked to the user, since the record IS
+	     their identity in the directory. It exists only to let friends find
+	     each other, and it is deleted by Settings -> Delete Account.
+
+	     Photos in shared albums are NOT declared: they live in the user's
+	     own private/shared iCloud zones, which the developer cannot read. -->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeUserID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeName</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

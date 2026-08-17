@@ -169,6 +169,38 @@ final class CloudKitService {
         }
     }
 
+    /// LEAVE a share we participate in but do not own.
+    ///
+    /// The operation is deleting the zone-wide CKShare record from OUR shared
+    /// database, which removes only this user's participation — the owner's
+    /// zone, photos and other participants are untouched. Zone deletion is the
+    /// OWNER's operation; CloudKit rejects it against the shared database,
+    /// which surfaced as "error deleting record zone" when Leave used it.
+    ///
+    /// Falls back to a zone delete if the share record is missing (an older
+    /// album that never recorded one, or a share already torn down), so a
+    /// half-migrated album can still be left.
+    func leaveShare(zoneID: CKRecordZone.ID) async throws {
+        try await requireAvailable()
+        let shareID = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zoneID)
+        do {
+            _ = try await sharedDB.deleteRecord(withID: shareID)
+            return
+        } catch {
+            let mapped = map(error)
+            // Already gone — nothing left to leave.
+            if case .zoneNotFound = mapped { return }
+            if let ck = error as? CKError, ck.code == .unknownItem { return }
+            // Anything else: try the zone path before giving up, so we don't
+            // strand the user if this share predates zone-wide sharing.
+            do {
+                _ = try await sharedDB.deleteRecordZone(withID: zoneID)
+            } catch {
+                throw map(error)
+            }
+        }
+    }
+
     // MARK: - Sharing
 
     /// Fetch the existing zone-wide CKShare for a zone, or create one.
@@ -1005,7 +1037,12 @@ final class CloudKitService {
                 // failure.
                 return .zoneNotFound
             default:
-                return .cloudKit(ck.localizedDescription)
+                // Unhandled CKError codes previously surfaced only Apple's
+                // generic sentence ("error deleting record zone"), which names
+                // the operation but not the cause and is undebuggable from a
+                // user report. Append the numeric code so a screenshot is
+                // actionable.
+                return .cloudKit("\(ck.localizedDescription) (CloudKit error \(ck.errorCode))")
             }
         }
         return .cloudKit(error.localizedDescription)

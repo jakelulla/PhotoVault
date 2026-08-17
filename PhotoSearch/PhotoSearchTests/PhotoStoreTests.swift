@@ -900,6 +900,64 @@ final class PhotoStoreTests: XCTestCase {
         XCTAssertEqual(store.topNamedPeople(in: photos), ["Emma"])
     }
 
+    // MARK: - Safety (blocking)
+
+    /// Blocking is what App Store Guideline 1.2 requires, so its filtering has
+    /// to actually hold. SafetyStore is a singleton on disk; clear it per test.
+    private func freshSafety() -> SafetyStore {
+        let s = SafetyStore.shared
+        s.clearAll()
+        return s
+    }
+
+    func testBlockIsIdempotentAndRefreshesUsername() {
+        let safety = freshSafety()
+        safety.block(userRecordID: "u1", username: "ann")
+        safety.block(userRecordID: "u1", username: "ann_renamed")
+        XCTAssertEqual(safety.blocked.count, 1)
+        XCTAssertEqual(safety.blocked[0].username, "ann_renamed")
+        XCTAssertTrue(safety.isBlocked(userRecordID: "u1"))
+        safety.clearAll()
+    }
+
+    func testBlockIgnoresEmptyIDAndUnblockWorks() {
+        let safety = freshSafety()
+        safety.block(userRecordID: "", username: "nobody")
+        XCTAssertTrue(safety.blocked.isEmpty)
+        XCTAssertFalse(safety.isBlocked(userRecordID: ""))
+
+        safety.block(userRecordID: "u1", username: "ann")
+        safety.unblock(userRecordID: "u1")
+        XCTAssertFalse(safety.isBlocked(userRecordID: "u1"))
+        safety.clearAll()
+    }
+
+    /// The inbox filter is the mechanism that actually protects the user —
+    /// blocked senders must not survive it.
+    func testFilterBlockedDropsBlockedSenders() {
+        let safety = freshSafety()
+        struct Msg { let from: String }
+        let msgs = [Msg(from: "u1"), Msg(from: "u2"), Msg(from: "u3")]
+
+        // Nothing blocked → everything passes.
+        XCTAssertEqual(safety.filterBlocked(msgs, senderID: \.from).count, 3)
+
+        safety.block(userRecordID: "u2", username: "spammer")
+        let kept = safety.filterBlocked(msgs, senderID: \.from).map(\.from)
+        XCTAssertEqual(kept, ["u1", "u3"])
+        safety.clearAll()
+    }
+
+    func testBlocklistSurvivesReload() {
+        let safety = freshSafety()
+        safety.block(userRecordID: "u1", username: "ann")
+        safety.load()                       // re-read from disk
+        XCTAssertTrue(safety.isBlocked(userRecordID: "u1"))
+        safety.clearAll()
+        safety.load()
+        XCTAssertTrue(safety.blocked.isEmpty)
+    }
+
     func testTopNamedPeopleEmptyWhenNobodyNamed() {
         indexPhoto("p1", emb: unitEmb(axis: 0),
                    faceEmbeddings: [unitEmb(axis: 10)],

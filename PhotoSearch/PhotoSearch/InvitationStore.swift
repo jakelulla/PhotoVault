@@ -114,6 +114,38 @@ final class InvitationStore: ObservableObject {
         try? JSONEncoder().encode(handled).write(to: Self.handledURL, options: .atomic)
     }
 
+    // MARK: - Account deletion
+
+    /// Delete this user's account: erase the public directory presence, then
+    /// wipe every local trace of it. Required by App Store Guideline 5.1.1(v).
+    ///
+    /// The user's PHOTOS are never touched — they were always local, and the
+    /// account is only the username other people can find you by. Shared albums
+    /// already accepted by others stay in those people's iCloud, which we can
+    /// neither reach nor revoke; the confirmation copy says so plainly rather
+    /// than implying a reach we don't have.
+    func deleteAccount() async throws {
+        guard !Self.runningTests else { return }
+        isWorking = true
+        defer { isWorking = false }
+
+        // Remote first: if this throws, local state is untouched and the user
+        // can retry rather than being left with a half-deleted account they
+        // can no longer see or manage.
+        try await directory.deleteAccount()
+
+        myProfile = nil
+        friends = []
+        pendingInvitations = []
+        handled = HandledInvitations()
+        inboxError = nil
+        for url in [Self.friendsURL, Self.profileURL, Self.handledURL] {
+            try? FileManager.default.removeItem(at: url)
+        }
+        SafetyStore.shared.clearAll()
+        AppGroupSummaryWriter.refresh()
+    }
+
     // MARK: - Profile / onboarding
 
     /// True when the user has not yet claimed a username. The UI uses this to
@@ -279,7 +311,11 @@ final class InvitationStore: ObservableObject {
         defer { isWorking = false }
         do {
             let fetched = try await directory.fetchPendingInvitations()
-            pendingInvitations = handled.unhandled(fetched)
+            // Blocked senders never reach the inbox. Filtering on the receiving
+            // device is what actually protects the user — a serverless design
+            // can't stop the send.
+            pendingInvitations = SafetyStore.shared.filterBlocked(
+                handled.unhandled(fetched), senderID: \.fromUserRecordID)
             inboxError = nil
             // Widget badge stays honest with the inbox.
             AppGroupSummaryWriter.refresh()

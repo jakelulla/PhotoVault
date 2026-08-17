@@ -301,6 +301,7 @@ struct ReelExportSheet: View {
                             Label("Share Video", systemImage: "square.and.arrow.up")
                         }
                         .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 case .failed:
                     // The alert below carries the message; this is just the

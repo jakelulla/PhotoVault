@@ -605,9 +605,17 @@ final class SharedAlbumStore: ObservableObject {
             state = .unavailable(reason: reason)
             throw SharedAlbumError.unavailable(reason: reason)
         }
-        let database = album.isOwnedByMe ? cloud.privateDB : cloud.sharedDB
         do {
-            try await cloud.deleteZone(album.zoneID, in: database)
+            if album.isOwnedByMe {
+                // Owner: delete the zone. That removes the album, its photos
+                // and the share for everyone.
+                try await cloud.deleteZone(album.zoneID, in: cloud.privateDB)
+            } else {
+                // Participant: LEAVING removes only our own participation, and
+                // that is a share-record delete, not a zone delete — CloudKit
+                // rejects zone deletion against the shared database.
+                try await cloud.leaveShare(zoneID: album.zoneID)
+            }
         } catch SharedAlbumError.zoneNotFound {
             // Already gone server-side — proceed to clean up locally.
         }

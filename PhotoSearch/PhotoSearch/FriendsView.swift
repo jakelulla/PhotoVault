@@ -19,6 +19,10 @@ struct FriendsView: View {
     @State private var showAvatarPicker = false
     @State private var showFacePhotoPicker = false
     @State private var showCompose = false
+    /// Non-nil while the report sheet is up for that friend.
+    @State private var reporting: Friend?
+    /// Brief confirmation after tapping the username to copy it.
+    @State private var copiedUsername = false
 
     var body: some View {
         Group {
@@ -55,6 +59,11 @@ struct FriendsView: View {
         }
         // Hydrate local cache for an instant view; no CloudKit at launch.
         .task { store.loadLocalCache(); requests.loadLocalCache() }
+        .sheet(item: $reporting) { friend in
+            ReportUserView(userRecordID: friend.userRecordID,
+                           username: friend.username,
+                           context: "Friends list")
+        }
         .sheet(isPresented: $showOnboarding) {
             UsernameOnboardingView()
         }
@@ -78,6 +87,41 @@ struct FriendsView: View {
     @ViewBuilder
     private var profileSection: some View {
         Section {
+            // Your own username, always visible while you have an account. It
+            // used to appear only as a header ABOVE the friends list, so a user
+            // with no friends yet — exactly the person who needs to tell someone
+            // their username — could never see it. Tapping copies it, since its
+            // whole purpose is being handed to another person.
+            if let me = store.myProfile {
+                Button {
+                    UIPasteboard.general.string = me.username
+                    copiedUsername = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        copiedUsername = false
+                    }
+                } label: {
+                    HStack {
+                        Image(systemName: "at")
+                            .font(.title2).foregroundStyle(.tint).frame(width: 40)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(me.username)
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Text(me.displayName == me.username
+                                 ? "Your username — friends search for this"
+                                 : me.displayName)
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Label(copiedUsername ? "Copied" : "Copy",
+                              systemImage: copiedUsername ? "checkmark" : "doc.on.doc")
+                            .font(.caption.weight(.medium))
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(copiedUsername ? Color.green : Color.accentColor)
+                    }
+                }
+            }
             Button {
                 showAvatarPicker = true
             } label: {
@@ -143,9 +187,10 @@ struct FriendsView: View {
             Button {
                 showOnboarding = true
             } label: {
-                Label("Choose Username", systemImage: "at")
+                Text("Choose Username")
             }
             .buttonStyle(.borderedProminent)
+            .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -163,23 +208,34 @@ struct FriendsView: View {
                         Button {
                             showAddFriend = true
                         } label: {
-                            Label("Add Friend", systemImage: "person.badge.plus")
+                            Text("Add Friend")
                         }
                         .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 }
             } else {
                 Section {
                     ForEach(store.friends) { friend in
                         FriendRow(friend: friend)
+                            // Block/report reachable wherever a person is —
+                            // App Review looks for exactly this.
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    SafetyStore.shared.block(userRecordID: friend.userRecordID,
+                                                             username: friend.username)
+                                    store.removeFriend(friend)
+                                } label: { Label("Block", systemImage: "hand.raised") }
+                                Button(role: .destructive) {
+                                    reporting = friend
+                                } label: { Label("Report", systemImage: "exclamationmark.bubble") }
+                            }
                     }
                     .onDelete { offsets in
                         for index in offsets { store.removeFriend(store.friends[index]) }
                     }
                 } header: {
-                    if let me = store.myProfile {
-                        Text("You are @\(me.username)")
-                    }
+                    Text("Friends")
                 }
             }
         }
@@ -372,9 +428,10 @@ struct InviteFriendView: View {
                         Button {
                             showOnboarding = true
                         } label: {
-                            Label("Choose Username", systemImage: "at")
+                            Text("Choose Username")
                         }
                         .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 } else if store.friends.isEmpty {
                     ContentUnavailableView {
@@ -385,9 +442,10 @@ struct InviteFriendView: View {
                         Button {
                             showAddFriend = true
                         } label: {
-                            Label("Add Friend", systemImage: "person.badge.plus")
+                            Text("Add Friend")
                         }
                         .buttonStyle(.borderedProminent)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 } else {
                     List {
@@ -521,6 +579,8 @@ struct InvitationInboxView: View {
 
     @State private var busy: String?           // invitation.id being accepted
     @State private var acceptError: String?
+    /// Non-nil while the report sheet is up for that invitation's sender.
+    @State private var reporting: Invitation?
 
     var body: some View {
         NavigationStack {
@@ -539,6 +599,21 @@ struct InvitationInboxView: View {
                                 busy: busy == invitation.id,
                                 onAccept: { Task { await accept(invitation) } },
                                 onDecline: { store.decline(invitation) })
+                                // An invitation is the one place a person who
+                                // is NOT already a friend can reach you, so
+                                // block/report has to be right here.
+                                .swipeActions(edge: .leading) {
+                                    Button {
+                                        reporting = invitation
+                                    } label: { Label("Report", systemImage: "exclamationmark.bubble") }
+                                        .tint(.orange)
+                                    Button(role: .destructive) {
+                                        SafetyStore.shared.block(
+                                            userRecordID: invitation.fromUserRecordID,
+                                            username: invitation.fromUsername)
+                                        store.decline(invitation)
+                                    } label: { Label("Block", systemImage: "hand.raised") }
+                                }
                         }
                     }
                 }
@@ -556,6 +631,11 @@ struct InvitationInboxView: View {
                 Button("OK", role: .cancel) { acceptError = nil }
             } message: {
                 Text(acceptError ?? "")
+            }
+            .sheet(item: $reporting) { invitation in
+                ReportUserView(userRecordID: invitation.fromUserRecordID,
+                               username: invitation.fromUsername,
+                               context: "Album invitation: \(invitation.albumName)")
             }
         }
     }
@@ -592,12 +672,14 @@ private struct InvitationRow: View {
                     Text("Decline")
                 }
                 .buttonStyle(.bordered)
+                .fixedSize(horizontal: true, vertical: false)
                 .disabled(busy)
                 Spacer()
                 Button { onAccept() } label: {
                     if busy { ProgressView() } else { Text("Accept") }
                 }
                 .buttonStyle(.borderedProminent)
+                .fixedSize(horizontal: true, vertical: false)
                 .disabled(busy)
             }
         }

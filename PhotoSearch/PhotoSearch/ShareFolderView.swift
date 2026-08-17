@@ -137,9 +137,10 @@ struct ShareFolderView: View {
                 Button {
                     friendInviteAlbum = album
                 } label: {
-                    Label("Invite Friend", systemImage: "person.badge.plus")
+                    Text("Invite Friend")
                 }
                 .buttonStyle(.borderedProminent)
+                .fixedSize(horizontal: true, vertical: false)
                 Button {
                     linkError = nil
                     Task { await presentLinkInvite(for: album) }
@@ -147,6 +148,7 @@ struct ShareFolderView: View {
                     Label("Share via Link", systemImage: "link")
                 }
                 .buttonStyle(.bordered)
+                .fixedSize(horizontal: true, vertical: false)
                 if case .failed = uploadState {
                     Button {
                         startUpload(into: album)
@@ -154,6 +156,7 @@ struct ShareFolderView: View {
                         Label("Retry Upload", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
                 if let linkError {
                     Label(linkError, systemImage: "exclamationmark.triangle")
@@ -218,6 +221,7 @@ struct ShareFolderView: View {
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 Button("Open Settings") { UIApplication.shared.open(url) }
                     .buttonStyle(.borderedProminent)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
     }
@@ -231,9 +235,10 @@ struct ShareFolderView: View {
             Button {
                 Task { await prepare() }
             } label: {
-                Label("Try Again", systemImage: "arrow.clockwise")
+                Text("Try Again")
             }
             .buttonStyle(.borderedProminent)
+            .fixedSize(horizontal: true, vertical: false)
         }
     }
 
